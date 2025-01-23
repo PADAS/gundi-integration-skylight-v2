@@ -70,6 +70,38 @@ async def send_event_attachments_to_gundi(event_id: str, attachments: List[tuple
 
 
 @stamina.retry(on=httpx.HTTPError, wait_initial=1.0, wait_jitter=5.0, wait_max=32.0)
+# TODO: ADD THIS TO THE TEMPLATE REPO!
+async def update_gundi_event(event: dict, **kwargs) -> dict:
+    """
+    Update an Event in Gundi using the REST API v2
+    :param event: An event in the following format:
+    {
+        "title": "Animal Sighting",
+        "event_type": "wildlife_sighting_rep",
+        "recorded_at":"2024-01-08 21:51:10-03:00",
+        "location":{
+            "lat":-51.688645,
+            "lon":-72.704421
+        },
+        "event_details":{
+            "site_name":"MM Spot",
+            "species":"lion"
+        }
+    }
+
+    :param kwargs: integration_id: The UUID of the related integration
+    :param kwargs: event_id: The UUID of the Gundi object_id to be updated
+    :return: A dict with the response from the API
+    """
+    integration_id = kwargs.get("integration_id")
+    assert integration_id, "integration_id is required"
+    event_id = kwargs.get("event_id")
+    assert event_id, "event_id is required"
+    sensors_api_client = await _get_sensors_api_client(integration_id=str(integration_id))
+    return await sensors_api_client.update_event(event_id=event_id, data=event)
+
+
+@stamina.retry(on=httpx.HTTPError, wait_initial=1.0, wait_jitter=5.0, wait_max=32.0)
 async def send_observations_to_gundi(observations: List[dict], **kwargs) -> dict:
     """
     Send Observations to Gundi using the REST API v2
