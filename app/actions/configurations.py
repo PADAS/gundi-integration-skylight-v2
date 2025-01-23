@@ -1,11 +1,11 @@
 from re import sub
-from .core import ActionConfiguration
+from .core import AuthActionConfiguration, PullActionConfiguration
 from app.services.utils import GlobalUISchemaOptions
 from typing import List
 from pydantic import Field, validator, SecretStr
 
 
-class AuthenticateConfig(ActionConfiguration):
+class AuthenticateConfig(AuthActionConfiguration):
     username: str
     password: SecretStr = Field(..., format="password")
 
@@ -17,7 +17,7 @@ class AuthenticateConfig(ActionConfiguration):
     )
 
 
-class PullEventsConfig(ActionConfiguration):
+class PullEventsConfig(PullActionConfiguration):
     aoi_ids: List[str] = Field(
         title='Area of Interest (AOI) IDs',
         description='IDs of the desired areas.',

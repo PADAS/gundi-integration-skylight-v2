@@ -10,7 +10,7 @@ import app.settings.integration as settings
 from copy import deepcopy
 from dateparser import parse as dp
 
-from app.actions.configurations import PullEventsConfig
+from app.actions.configurations import AuthenticateConfig, PullEventsConfig
 from app.services.activity_logger import activity_logger
 from app.services.state import IntegrationStateManager
 
@@ -89,6 +89,29 @@ def transform(config, data: dict) -> dict:
             },
             event_details=full_event_details
         )
+
+
+async def action_auth(integration, action_config: AuthenticateConfig):
+    logger.info(
+        f"Executing auth action with integration {integration} and action_config {action_config}..."
+    )
+    try:
+        # GraphQL Client
+        default_transport_dict = dict(
+            url=integration.base_url or client.DEFAULT_SKYLIGHT_API_URL,
+            verify=True,
+        )
+        gql_client = client.build_graphql_client(default_transport_dict)
+        token = await client.get_authentication_token(integration, action_config, gql_client)
+        if not token:
+            logger.error(f"Auth unsuccessful for integration '{integration.id}'.")
+            return {"valid_credentials": False}
+
+        logger.info(f"Auth successful for integration '{integration.id}'. Token: {token.access_token}")
+        return {"valid_credentials": True}
+    except Exception as e:
+        logger.info(f"An error occurred while fetching token for integration '{integration.id}'")
+        return {"valid_credentials": None, "error": str(e)}
 
 
 @activity_logger()
