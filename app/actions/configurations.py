@@ -1,11 +1,11 @@
 from re import sub
-from .core import AuthActionConfiguration, PullActionConfiguration
+from .core import AuthActionConfiguration, PullActionConfiguration, ExecutableActionMixin
 from app.services.utils import GlobalUISchemaOptions
 from typing import List
 from pydantic import Field, validator, SecretStr
 
 
-class AuthenticateConfig(AuthActionConfiguration):
+class AuthenticateConfig(AuthActionConfiguration, ExecutableActionMixin):
     username: str
     password: SecretStr = Field(..., format="password")
 
