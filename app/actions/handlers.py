@@ -11,8 +11,10 @@ from copy import deepcopy
 from dateparser import parse as dp
 
 from app.actions.configurations import AuthenticateConfig, PullEventsConfig
-from app.services.activity_logger import activity_logger
+from app.services.activity_logger import activity_logger, log_activity
 from app.services.state import IntegrationStateManager
+
+from gundi_core.schemas.v2 import LogLevel
 
 
 logger = logging.getLogger(__name__)
@@ -274,12 +276,24 @@ async def process_attachments(transformed_data, response, integration):
                     integration_id=integration.id
                 )
         except Exception as e:
-            message = f"Error while processing event attachments for event ID '{event_id['object_id']}'. Exception: {e}."
+            request = {
+                "event_id": event_id["object_id"],
+                "attachments": [(filename, img)],
+                "integration_id": integration.id
+            }
+            message = f"Error while processing event attachments for event ID '{event_id['object_id']}'. Exception: {e}. Request: {request}"
             logger.exception(message, extra={
                 "integration_id": str(integration.id),
                 "attention_needed": True
             })
-            raise e
+            await log_activity(
+                integration_id=integration.id,
+                action_id="pull_events",
+                level=LogLevel.WARNING,
+                title=message,
+                data={"message": message}
+            )
+            continue
 
 
 async def patch_events(events, updated_config_data, integration):
