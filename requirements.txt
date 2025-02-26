@@ -24,7 +24,8 @@ backoff==2.2.1
     # via
     #   gcloud-aio-auth
     #   gql
-backports-zoneinfo==0.2.1
+#FixMe: backports-zoneinfo shouln't be needed but it's due to dateparser
+#backports-zoneinfo==0.2.1
     # via tzlocal
 certifi==2024.2.2
     # via
