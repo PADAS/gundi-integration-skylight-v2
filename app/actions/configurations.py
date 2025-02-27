@@ -1,5 +1,5 @@
 from re import sub
-from app.actions.core import AuthActionConfiguration, PullActionConfiguration, ExecutableActionMixin
+from app.actions.core import AuthActionConfiguration, PullActionConfiguration, ExecutableActionMixin, InternalActionConfiguration
 from app.services.utils import GlobalUISchemaOptions
 from typing import List
 from pydantic import Field, validator, SecretStr
