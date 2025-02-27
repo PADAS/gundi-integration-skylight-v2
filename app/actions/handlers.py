@@ -220,7 +220,7 @@ async def action_process_events_per_aoi(integration, action_config: ProcessEvent
                     # Send images as attachments (if available)
                     await process_attachments(batch, response, integration)
                     # Process events to patch
-                await save_events_state(all_responses, action_config.events, integration)
+            await save_events_state(all_responses, action_config.events, integration)
         except (httpx.ConnectTimeout, httpx.ReadTimeout) as e:
             msg = (f'Timeout exception. AOI: {action_config.aoi}. Integration: {str(integration.id)}. '
                    f'Exception: {e}, Type: {str(type(e))}, Request: {str(e.request)}')
