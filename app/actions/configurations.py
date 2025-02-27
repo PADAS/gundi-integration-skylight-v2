@@ -17,7 +17,7 @@ class AuthenticateConfig(AuthActionConfiguration, ExecutableActionMixin):
     )
 
 
-class ProcessEventsPerAOIConfig(PullActionConfiguration):
+class ProcessEventsPerAOIConfig(InternalActionConfiguration):
     integration_id: str
     aoi: str
     events: List[dict]
