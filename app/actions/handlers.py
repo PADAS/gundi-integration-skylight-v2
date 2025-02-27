@@ -160,8 +160,7 @@ async def action_pull_events(integration, action_config: PullEventsConfig):
                 for event in events_list:
                     event_id = get_clean_event_id(event)
                     event_ids.append(event_id)
-                    saved_event = await state_manager.get_state(str(integration.id), "pull_events", event_id)
-                    if saved_event:
+                    if saved_event := await state_manager.get_state(str(integration.id), "pull_events", event_id)
                         # Event already exists, will patch it
                         patch_these_events.append((saved_event.get("object_id"), event))
                         events_list.remove(event)
