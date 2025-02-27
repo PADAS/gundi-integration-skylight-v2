@@ -160,7 +160,7 @@ async def action_pull_events(integration, action_config: PullEventsConfig):
                 for event in events_list:
                     event_id = get_clean_event_id(event)
                     event_ids.append(event_id)
-                    if saved_event := await state_manager.get_state(str(integration.id), "pull_events", event_id)
+                    if saved_event := await state_manager.get_state(str(integration.id), "pull_events", event_id):
                         # Event already exists, will patch it
                         patch_these_events.append((saved_event.get("object_id"), event))
                         events_list.remove(event)
@@ -233,18 +233,6 @@ async def action_process_events_per_aoi(integration, action_config: ProcessEvent
                 }
             )
             raise e
-        except httpx.HTTPError as e:
-            msg = f'Sensors API returned error. AOI: {action_config.aoi}. Integration: {str(integration.id)}. Exception: {e}'
-            logger.exception(
-                msg,
-                extra={
-                    'needs_attention': True,
-                    'integration_id': str(integration.id),
-                    "aoi": action_config.aoi,
-                    'action_id': "pull_events"
-                }
-            )
-            result["details"]["error"] = msg
         else:
             # Update states
             state = {
