@@ -93,6 +93,7 @@ async def test_execute_gql_query_does_not_retry_if_not_unauthorized_code(
 @pytest.mark.asyncio
 async def test_action_process_events_per_aoi_success(mocker, integration, process_events_config, mock_publish_event):
     mocker.patch("app.services.state.IntegrationStateManager.get_state", return_value=None)
+    mocker.patch("app.services.state.IntegrationStateManager.set_state", return_value=None)
     mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
     mocker.patch("app.services.action_runner.publish_event", mock_publish_event)
     mocker.patch("app.services.action_scheduler.publish_event", mock_publish_event)
