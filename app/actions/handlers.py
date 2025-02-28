@@ -200,7 +200,7 @@ async def action_process_events_per_aoi(integration, action_config: ProcessEvent
 
     transformed_data = sorted(
         [transform(action_config.updated_config_data, event) for event in action_config.events],
-        key=lambda x: x.get("recorded_at"), reverse=True
+        key=lambda x: x.get("recorded_at") or datetime.datetime.min, reverse=True
     )
 
     if transformed_data:
