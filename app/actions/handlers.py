@@ -85,7 +85,7 @@ def transform(config, data: dict) -> dict:
 
         return dict(
             title=event_config.get("event_title"),
-            event_type=event_config.get("event_type").value,
+            event_type=event_config.get("event_type"),
             recorded_at=dp(event_time_and_location.get('time')),
             location={
                 "lat": event_time_and_location["point"].get('lat'),

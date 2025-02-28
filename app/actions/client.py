@@ -115,6 +115,9 @@ class EventType(pydantic.BaseModel):
         title='Event Title',
     )
 
+    class Config:
+        use_enum_values = True
+
 
 # Endpoint call models (request/response)
 class SkylightRequestHeader(pydantic.BaseModel):
