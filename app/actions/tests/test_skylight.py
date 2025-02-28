@@ -91,7 +91,10 @@ async def test_execute_gql_query_does_not_retry_if_not_unauthorized_code(
 
 
 @pytest.mark.asyncio
-async def test_action_process_events_per_aoi_success(mocker, integration, process_events_config):
+async def test_action_process_events_per_aoi_success(mocker, integration, process_events_config, mock_publish_event):
+    mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
+    mocker.patch("app.services.action_runner.publish_event", mock_publish_event)
+    mocker.patch("app.services.action_scheduler.publish_event", mock_publish_event)
     mocker.patch("app.actions.handlers.transform", return_value={"event_id": "event1"})
     mocker.patch("app.actions.handlers.generate_batches", return_value=[[{"event_id": "event1"}]])
     mocker.patch("app.actions.handlers.gundi_tools.send_events_to_gundi", return_value=[{"object_id": "event1"}])
@@ -102,7 +105,10 @@ async def test_action_process_events_per_aoi_success(mocker, integration, proces
     assert result["events_processed"] == 1
 
 @pytest.mark.asyncio
-async def test_action_process_events_per_aoi_failure(mocker, integration, process_events_config):
+async def test_action_process_events_per_aoi_failure(mocker, integration, process_events_config, mock_publish_event):
+    mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
+    mocker.patch("app.services.action_runner.publish_event", mock_publish_event)
+    mocker.patch("app.services.action_scheduler.publish_event", mock_publish_event)
     mocker.patch("app.actions.handlers.transform", return_value={"event_id": "event1"})
     mocker.patch("app.actions.handlers.generate_batches", return_value=[[{"event_id": "event1"}]])
     mocker.patch("app.actions.handlers.gundi_tools.send_events_to_gundi", side_effect=httpx.HTTPError("Error"))
@@ -111,7 +117,10 @@ async def test_action_process_events_per_aoi_failure(mocker, integration, proces
         await action_process_events_per_aoi(integration, process_events_config)
 
 @pytest.mark.asyncio
-async def test_action_pull_events_triggers_process_events_per_aoi(mocker, integration, pull_events_config):
+async def test_action_pull_events_triggers_process_events_per_aoi(mocker, integration, pull_events_config, mock_publish_event):
+    mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
+    mocker.patch("app.services.action_runner.publish_event", mock_publish_event)
+    mocker.patch("app.services.action_scheduler.publish_event", mock_publish_event)
     mocker.patch("app.actions.client.get_skylight_events", return_value=({"aoi": [{"event_id": "event1"}]}, []))
     mocker.patch("app.actions.client.get_auth_config", return_value=None)
     mocker.patch("app.services.state.IntegrationStateManager.get_state", return_value=None)
