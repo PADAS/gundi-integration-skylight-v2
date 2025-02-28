@@ -33,6 +33,7 @@ from app.actions import (
     AuthActionConfiguration,
     ExecutableActionMixin, InternalActionConfiguration,
 )
+from app.actions.configurations import ProcessEventsPerAOIConfig, PullEventsConfig
 from app.services.utils import GlobalUISchemaOptions, FieldWithUIOptions, UIOptions
 from app.services.action_scheduler import CrontabSchedule
 from app.webhooks import (
@@ -52,6 +53,24 @@ def async_return(result):
     f = asyncio.Future()
     f.set_result(result)
     return f
+
+
+@pytest.fixture
+def process_events_config(mocker):
+    return ProcessEventsPerAOIConfig(
+        integration_id="integration_id",
+        aoi="aoi",
+        events=[{"event_id": "event1"}, {"event_id": "event2"}],
+        updated_config_data=[]
+    )
+
+
+@pytest.fixture
+def pull_events_config(mocker):
+    return PullEventsConfig(
+        aoi_ids=["aoi1", "aoi2"],
+        event_types=["event1", "event2"]
+    )
 
 
 @pytest.fixture

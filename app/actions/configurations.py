@@ -1,5 +1,5 @@
 from re import sub
-from .core import AuthActionConfiguration, PullActionConfiguration, ExecutableActionMixin
+from app.actions.core import AuthActionConfiguration, PullActionConfiguration, ExecutableActionMixin, InternalActionConfiguration
 from app.services.utils import GlobalUISchemaOptions
 from typing import List
 from pydantic import Field, validator, SecretStr
@@ -15,6 +15,13 @@ class AuthenticateConfig(AuthActionConfiguration, ExecutableActionMixin):
             "password",
         ],
     )
+
+
+class ProcessEventsPerAOIConfig(InternalActionConfiguration):
+    integration_id: str
+    aoi: str
+    events: List[dict]
+    updated_config_data: List[dict]
 
 
 class PullEventsConfig(PullActionConfiguration):

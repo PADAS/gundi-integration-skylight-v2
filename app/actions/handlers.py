@@ -10,9 +10,11 @@ import app.settings.integration as settings
 from copy import deepcopy
 from dateparser import parse as dp
 
-from app.actions.configurations import AuthenticateConfig, PullEventsConfig
+from app.actions.configurations import AuthenticateConfig, PullEventsConfig, ProcessEventsPerAOIConfig
+from app.services.action_scheduler import trigger_action
 from app.services.activity_logger import activity_logger, log_activity
 from app.services.state import IntegrationStateManager
+from app.services.utils import generate_batches
 
 from gundi_core.schemas.v2 import LogLevel
 
@@ -38,12 +40,12 @@ def transform(config, data: dict) -> dict:
 
     try:
         for conf in config:
-            if isinstance(conf.skylight_event_type, list):
-                if event_type in conf.skylight_event_type:
+            if isinstance(conf.get("skylight_event_type"), list):
+                if event_type in conf.get("skylight_event_type"):
                     event_config = conf
                     break
             else:
-                if event_type == conf.skylight_event_type:
+                if event_type == conf.get("skylight_event_type"):
                     event_config = conf
                     break
         if not event_config:
@@ -82,8 +84,8 @@ def transform(config, data: dict) -> dict:
         event_time_and_location = data.get('end') or data.get('start')
 
         return dict(
-            title=event_config.event_title,
-            event_type=event_config.event_type.value,
+            title=event_config.get("event_title"),
+            event_type=event_config.get("event_type").value,
             recorded_at=dp(event_time_and_location.get('time')),
             location={
                 "lat": event_time_and_location["point"].get('lat'),
@@ -121,9 +123,8 @@ async def action_pull_events(integration, action_config: PullEventsConfig):
     logger.info(
         f"Executing pull_events action with integration {integration} and action_config {action_config}..."
     )
+    result = {"events_extracted": 0, "process_events_per_aoi_action_triggered": 0, "details": {}}
     try:
-        result = {"events_extracted": 0, "details": {}}
-        response_per_aoi = []
         async for attempt in stamina.retry_context(
                 on=httpx.HTTPError,
                 attempts=3,
@@ -138,113 +139,113 @@ async def action_pull_events(integration, action_config: PullEventsConfig):
                     auth=client.get_auth_config(integration)
                 )
 
-                if all([len(items) == 0 for items in events.values()]):
-                    logger.info(f"No events were pulled for integration: '{str(integration.id)}'.")
-                    result["message"] = f"No events were pulled for integration: '{str(integration.id)}'."
-                    return result
-
-                async def get_skylight_events_to_patch():
-                    # Get through the events and check if state_manager has it recorded from a previous execution
-                    patch_these_events = []
-                    for aoi, events_list in events.items():
-                        for event in events_list:
-                            event_id = get_clean_event_id(event)
-                            saved_event = await state_manager.get_state(str(integration.id), "pull_events", event_id)
-                            if saved_event:
-                                # Event already exists, will patch it
-                                patch_these_events.append((saved_event.get("object_id"), event))
-                                events_list.remove(event)
-                        events[aoi] = events_list
-                    return events, patch_these_events
-
-                events, events_to_patch = await get_skylight_events_to_patch()
-
-        total_events = 0
-        for aoi, events in events.items():
-            if events:
-                logger.info(f"Events pulled with success. AOI: '{aoi}' len: '{len(events)}'")
-                transformed_data = sorted(
-                    [transform(updated_config_data, event) for event in events],
-                    key=lambda x: x.get("recorded_at"), reverse=True
-                )
-
-                if transformed_data:
-                    # Send transformed data to Sensors API V2
-                    async for attempt in stamina.retry_context(
-                            on=httpx.HTTPError,
-                            attempts=3,
-                            wait_initial=datetime.timedelta(seconds=10),
-                            wait_max=datetime.timedelta(seconds=30),
-                            wait_jitter=datetime.timedelta(seconds=3)
-                    ):
-                        with attempt:
-                            try:
-                                response = await gundi_tools.send_events_to_gundi(
-                                    events=transformed_data,
-                                    integration_id=integration.id
-                                )
-                                total_events += len(transformed_data)
-                                if response:
-                                    # Send images as attachments (if available)
-                                    await process_attachments(transformed_data, response, integration)
-                                    # Process events to patch
-                                    await save_events_state(response, events, integration)
-                            except (httpx.ConnectTimeout, httpx.ReadTimeout) as e:
-                                msg = (f'Timeout exception. AOI: {aoi}. Integration: {str(integration.id)}. '
-                                       f'Exception: {e}, Type: {str(type(e))}, Request: {str(e.request)}')
-                                logger.exception(
-                                    msg,
-                                    extra={
-                                        'needs_attention': True,
-                                        'integration_id': str(integration.id),
-                                        "aoi": aoi,
-                                        'action_id': "pull_events"
-                                    }
-                                )
-                                raise e
-                            except httpx.HTTPError as e:
-                                msg = f'Sensors API returned error. AOI: {aoi}. Integration: {str(integration.id)}. Exception: {e}'
-                                logger.exception(
-                                    msg,
-                                    extra={
-                                        'needs_attention': True,
-                                        'integration_id': str(integration.id),
-                                        "aoi": aoi,
-                                        'action_id': "pull_events"
-                                    }
-                                )
-                                response_per_aoi.append({"aoi": aoi, "response": []})
-                                continue
-                            else:
-                                # Update states
-                                state = {
-                                    "start_time": transformed_data[0].get("recorded_at")
-                                }
-                                await state_manager.set_state(
-                                    str(integration.id),
-                                    "pull_events",
-                                    state,
-                                    aoi
-                                )
-                                response_per_aoi.append({"aoi": aoi, "response": response})
-                else:
-                    response_per_aoi.append({"aoi": aoi, "response": []})
-
-            if events_to_patch:
-                # Process events to patch
-                response = await patch_events(events_to_patch, updated_config_data, integration)
-                result["events_updated"] = len(events_to_patch)
-                result["details"]["updated"] = response
     except httpx.HTTPError as e:
-        message = f"pull_observations action returned error. Integration: {str(integration.id)}. Exception: {e}"
-        logger.exception(message, extra={
+        msg = f"pull_observations action returned error. Integration: {str(integration.id)}. Exception: {e}"
+        logger.exception(msg, extra={
             "integration_id": str(integration.id),
             "attention_needed": True
         })
         raise e
     else:
-        result["events_extracted"] = total_events
-        result["details"]["created"] = response_per_aoi
+        if all([len(items) == 0 for items in events.values()]):
+            logger.info(f"No events were pulled for integration: '{str(integration.id)}'.")
+            result["message"] = f"No events were pulled for integration: '{str(integration.id)}'."
+            return result
+
+        event_ids = []
+        async def get_skylight_events_to_patch():
+            # Get through the events and check if state_manager has it recorded from a previous execution
+            patch_these_events = []
+            for aoi, events_list in events.items():
+                for event in events_list:
+                    event_id = get_clean_event_id(event)
+                    event_ids.append(event_id)
+                    if saved_event := await state_manager.get_state(str(integration.id), "pull_events", event_id):
+                        # Event already exists, will patch it
+                        patch_these_events.append((saved_event.get("object_id"), event))
+                        events_list.remove(event)
+                events[aoi] = events_list
+            return events, patch_these_events
+
+        events, events_to_patch = await get_skylight_events_to_patch()
+
+        # trigger "process_events_per_aoi" action for each AOI
+        for aoi, aoi_events in events.items():
+            if aoi_events:
+                result["events_extracted"] += len(aoi_events)
+                logger.info(f"Triggering 'process_events_per_aoi' action for AOI: '{aoi}' Events: '{len(aoi_events)}'")
+                parsed_config = ProcessEventsPerAOIConfig(
+                    integration_id=str(integration.id),
+                    aoi=aoi,
+                    events=aoi_events,
+                    updated_config_data=[config.dict() for config in updated_config_data]
+                )
+                await trigger_action(integration.id, "process_events_per_aoi", config=parsed_config)
+                result["process_events_per_aoi_action_triggered"] += 1
+                logger.info(f"Triggered 'process_events_per_aoi' action for AOI: '{aoi}'")
+
+        if events_to_patch:
+            # Process events to patch
+            response = await patch_events(events_to_patch, updated_config_data, integration)
+            result["events_updated"] = len(response)
+            result["details"]["updated"] = response
+
+        return result
+
+
+@activity_logger()
+async def action_process_events_per_aoi(integration, action_config: ProcessEventsPerAOIConfig):
+    result = {"events_processed": 0, "details": {}}
+    all_responses = []
+
+    transformed_data = sorted(
+        [transform(action_config.updated_config_data, event) for event in action_config.events],
+        key=lambda x: x.get("recorded_at") or datetime.datetime.min, reverse=True
+    )
+
+    if transformed_data:
+        # Send transformed data to Sensors API V2
+        try:
+            for i, batch in enumerate(generate_batches(transformed_data, 200)):
+                logger.info(f'Sending observations batch #{i}: {len(batch)} observations. AOI: {action_config.aoi}')
+                response = await gundi_tools.send_events_to_gundi(
+                    events=batch,
+                    integration_id=integration.id
+                )
+
+                if response:
+                    all_responses.extend(response)
+                    result["events_processed"] += len(response)
+                    # Send images as attachments (if available)
+                    await process_attachments(batch, response, integration)
+                    # Process events to patch
+            await save_events_state(all_responses, action_config.events, integration)
+        except (httpx.ConnectTimeout, httpx.ReadTimeout) as e:
+            msg = (f'Timeout exception. AOI: {action_config.aoi}. Integration: {str(integration.id)}. '
+                   f'Exception: {e}, Type: {str(type(e))}, Request: {str(e.request)}')
+            logger.exception(
+                msg,
+                extra={
+                    'needs_attention': True,
+                    'integration_id': str(integration.id),
+                    "aoi": action_config.aoi,
+                    'action_id': "pull_events"
+                }
+            )
+            raise e
+        else:
+            # Update states
+            state = {
+                "start_time": transformed_data[0].get("recorded_at")
+            }
+            await state_manager.set_state(
+                str(integration.id),
+                "pull_events",
+                state,
+                action_config.aoi
+            )
+            return result
+    else:
         return result
 
 
