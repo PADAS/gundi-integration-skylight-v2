@@ -186,7 +186,11 @@ async def action_pull_events(integration, action_config: PullEventsConfig):
 
         if events_to_patch:
             # Process events to patch
-            response = await patch_events(events_to_patch, updated_config_data, integration)
+            response = await patch_events(
+                events_to_patch,
+                [config.dict() for config in updated_config_data],
+                integration
+            )
             result["events_updated"] = len(response)
             result["details"]["updated"] = response
 
