@@ -12,7 +12,7 @@ from dateparser import parse as dp
 
 from app.actions.configurations import AuthenticateConfig, PullEventsConfig, ProcessEventsPerAOIConfig
 from app.services.action_scheduler import trigger_action
-from app.services.activity_logger import activity_logger, log_activity
+from app.services.activity_logger import activity_logger, log_action_activity
 from app.services.state import IntegrationStateManager
 from app.services.utils import generate_batches
 
@@ -276,21 +276,25 @@ async def process_attachments(transformed_data, response, integration):
                     attachments=[(filename, img)],
                     integration_id=integration.id
                 )
-        except Exception as e:
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 403:
+                message = f"HTTP 403 Forbidden response while reading event attachment for event ID '{event_id['object_id']}'. Exception: {e}"
+            else:
+                message = f"Error while processing event attachment for event ID '{event_id['object_id']}'. Exception: {e}"
+
             request = {
                 "event_id": event_id["object_id"],
-                "attachments": [(filename, img)],
+                "filename": filename,
                 "integration_id": integration.id
             }
-            message = f"Error while processing event attachments for event ID '{event_id['object_id']}'. Exception: {e}. Request: {request}"
             logger.exception(message, extra={
                 "integration_id": str(integration.id),
                 "attention_needed": True
             })
-            log_data = {"message": message}
+            log_data = {"message": message, "request": request}
             if server_response := getattr(e, "response", None):
                 log_data["server_response_body"] = server_response.text
-            await log_activity(
+            await log_action_activity(
                 integration_id=integration.id,
                 action_id="pull_events",
                 level=LogLevel.WARNING,
