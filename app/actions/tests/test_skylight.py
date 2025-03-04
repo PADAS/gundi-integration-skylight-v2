@@ -5,7 +5,7 @@ from gql.transport.exceptions import TransportQueryError
 
 from app.actions.client import execute_gql_query
 from app.actions.configurations import ProcessEventsPerAOIConfig
-from app.actions.handlers import action_pull_events, action_process_events_per_aoi
+from app.actions.handlers import action_pull_events, action_process_events_per_aoi, process_attachments
 from app.services.state import IntegrationStateManager
 
 @pytest.fixture
@@ -140,3 +140,35 @@ async def test_action_pull_events_triggers_process_events_per_aoi(mocker, integr
             updated_config_data=[]
         )
     )
+
+
+@pytest.mark.asyncio
+async def test_process_attachments_success(mocker, integration):
+    transformed_data = [{"event_details": {"image_url": "https://example.com/image.png"}}]
+    response = [{"object_id": "event1"}]
+    mock_image_content = b"image data"
+
+    mock_read_img = mocker.patch("httpx.AsyncClient.get", return_value=mocker.AsyncMock(status_code=200, aread=mocker.AsyncMock(return_value=mock_image_content)))
+    mock_send_event_attachments_to_gundi = mocker.patch("app.actions.handlers.gundi_tools.send_event_attachments_to_gundi", return_value=None)
+
+    await process_attachments(transformed_data, response, integration)
+
+    mock_read_img.assert_called_once_with("https://example.com/image.png")
+    mock_send_event_attachments_to_gundi.assert_called_once_with(
+        event_id="event1",
+        attachments=[("image.png", mock_image_content)],
+        integration_id=integration.id
+    )
+
+@pytest.mark.asyncio
+async def test_process_attachments_403_error(mocker, integration):
+    transformed_data = [{"event_details": {"image_url": "https://example.com/image.png"}}]
+    response = [{"object_id": "event1"}]
+
+    mock_read_img = mocker.patch("httpx.AsyncClient.get", side_effect=httpx.HTTPStatusError("403 Forbidden", request=mocker.Mock(), response=mocker.Mock(status_code=403)))
+    mock_log_action_activity = mocker.patch("app.actions.handlers.log_action_activity", return_value=None)
+
+    await process_attachments(transformed_data, response, integration)
+
+    mock_read_img.assert_called_once_with("https://example.com/image.png")
+    mock_log_action_activity.assert_called_once()

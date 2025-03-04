@@ -17,8 +17,6 @@ from gql import Client as GQLClient, gql
 from gql.transport.exceptions import TransportQueryError
 from gql.transport.httpx import HTTPXAsyncTransport, HTTPXTransport
 
-from gundi_core.events import LogLevel
-from app.services.activity_logger import log_activity
 from app.services.errors import ConfigurationNotFound
 from app.services.utils import find_config_for_action
 from app.services.state import IntegrationStateManager
@@ -238,13 +236,6 @@ async def get_authentication_token(integration, auth, gql_client):
                 "integration_id": str(integration.id),
                 "attention_needed": True
             }
-        )
-        await log_activity(
-            integration_id=integration.id,
-            action_id="pull_events",
-            level=LogLevel.ERROR,
-            title="Error executing 'get_authentication_token' GraphQL query (TransportQueryError)",
-            data={"message": message}
         )
         raise te
 
@@ -468,13 +459,6 @@ async def get_skylight_events(integration, config_data, auth):
                     "attention_needed": True
                 }
             )
-            await log_activity(
-                integration_id=integration.id,
-                action_id="pull_events",
-                level=LogLevel.WARNING,
-                title="Error executing 'get_skylight_events' GraphQL query (TransportQueryError)",
-                data={"message": message}
-            )
             continue
         except Exception as e:
             message = f"Unhandled exception occurred. Exception: {e}"
@@ -485,13 +469,6 @@ async def get_skylight_events(integration, config_data, auth):
                     "integration_id": str(integration.id),
                     "attention_needed": True
                 }
-            )
-            await log_activity(
-                integration_id=integration.id,
-                action_id="pull_events",
-                level=LogLevel.WARNING,
-                title="Unhandled error while executing 'get_skylight_events' GraphQL query",
-                data={"message": message}
             )
             continue
 
