@@ -10,6 +10,8 @@ import app.settings.integration as settings
 from copy import deepcopy
 from dateparser import parse as dp
 
+from gql.transport.exceptions import TransportQueryError
+
 from app.actions.configurations import AuthenticateConfig, PullEventsConfig, ProcessEventsPerAOIConfig
 from app.services.action_scheduler import trigger_action
 from app.services.activity_logger import activity_logger, log_action_activity
@@ -139,12 +141,39 @@ async def action_pull_events(integration, action_config: PullEventsConfig):
                     auth=client.get_auth_config(integration)
                 )
 
+    except TransportQueryError as te:
+        message = f"TransportQueryError. message: {te.errors[0].get('message')}"
+        await log_action_activity(
+            integration_id=integration.id,
+            action_id="pull_events",
+            level=LogLevel.WARNING,
+            title="Error executing 'get_skylight_events' GraphQL query (TransportQueryError)",
+            data={"message": message}
+        )
+        raise te
     except httpx.HTTPError as e:
         msg = f"pull_observations action returned error. Integration: {str(integration.id)}. Exception: {e}"
         logger.exception(msg, extra={
             "integration_id": str(integration.id),
             "attention_needed": True
         })
+        await log_action_activity(
+            integration_id=integration.id,
+            action_id="pull_events",
+            level=LogLevel.WARNING,
+            title=msg,
+            data={"message": msg}
+        )
+        raise e
+    except Exception as e:
+        message = f"Unhandled exception occurred. Exception: {e}"
+        await log_action_activity(
+            integration_id=integration.id,
+            action_id="pull_events",
+            level=LogLevel.WARNING,
+            title="Unhandled error while executing 'get_skylight_events' GraphQL query",
+            data={"message": message}
+        )
         raise e
     else:
         if all([len(items) == 0 for items in events.values()]):
