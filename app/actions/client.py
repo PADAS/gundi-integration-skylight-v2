@@ -31,14 +31,14 @@ DEFAULT_SKYLIGHT_API_URL = 'https://api.skylight.earth/graphql'
 
 # For use in case an event doesn't have a vessel dict
 EMPTY_VESSEL_DICT = {
-    "vessel_0_category": "N/A",
-    "vessel_0_class": "N/A",
-    "vessel_0_country_filter": "N/A",
-    "vessel_0_display_country": "N/A",
-    "vessel_0_mmsi": "N/A",
-    "vessel_0_name": "N/A",
-    "vessel_0_subcategory": "N/A",
-    "vessel_0_type": "N/A",
+    "category": "N/A",
+    "class": "N/A",
+    "country_filter": "N/A",
+    "display_country": "N/A",
+    "mmsi": "N/A",
+    "name": "N/A",
+    "subcategory": "N/A",
+    "type": "N/A",
 }
 
 # Default mapping values (for ER destinations)

@@ -70,7 +70,12 @@ def transform(config, data: dict) -> dict:
         # Get all available vessels info
         vessels = deepcopy(data.get("vessels", {}))
         if not vessels:
-            full_event_details.update(**client.EMPTY_VESSEL_DICT)
+            full_event_details.update(
+                {
+                    f"vessel_0_{key}": value
+                    for key, value in client.EMPTY_VESSEL_DICT.items()
+                }
+            )
         else:
             for vessel_name, vessel_detail in vessels.items():
                 if vessel_detail:
@@ -80,7 +85,7 @@ def transform(config, data: dict) -> dict:
                 else:
                     full_event_details.update(
                         {
-                            f"{vessel_name}_{key.split('_')[2]}": value
+                            f"{vessel_name}_{key}": value
                             for key, value in client.EMPTY_VESSEL_DICT.items()
                         }
                     )
