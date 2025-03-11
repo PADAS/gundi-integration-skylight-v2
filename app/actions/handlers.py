@@ -70,12 +70,25 @@ def transform(config, data: dict) -> dict:
         # Get all available vessels info
         vessels = deepcopy(data.get("vessels", {}))
         if not vessels:
-            full_event_details.update(**client.EMPTY_VESSEL_DICT)
+            full_event_details.update(
+                {
+                    f"vessel_0_{key}": value
+                    for key, value in client.EMPTY_VESSEL_DICT.items()
+                }
+            )
         else:
             for vessel_name, vessel_detail in vessels.items():
-                for key, detail in vessel_detail.items():
-                    if detail is not None:
-                        full_event_details.update({vessel_name + "_" + key: detail})
+                if vessel_detail:
+                    for key, detail in vessel_detail.items():
+                        if detail is not None:
+                            full_event_details.update({vessel_name + "_" + key: detail})
+                else:
+                    full_event_details.update(
+                        {
+                            f"{vessel_name}_{key}": value
+                            for key, value in client.EMPTY_VESSEL_DICT.items()
+                        }
+                    )
 
         full_event_details["event_id"] = data.get("event_id")
         full_event_details["entry_link"] = settings.ENTRY_LINK_URL.format(
