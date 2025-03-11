@@ -220,7 +220,7 @@ def test_transform_with_empty_vessel_detail(skylight_client):
             "vessel_0": None
         }
     }
-    skylight_client.EMPTY_VESSEL_DICT = {"vessel_0_id": "N/A", "vessel_0_name": "N/A"}
+    skylight_client.EMPTY_VESSEL_DICT = {"id": "N/A", "name": "N/A"}
     config = [{"skylight_event_type": "some_event_type", "event_title": "Test Event", "event_type": "test_event"}]
     result = transform(config, data)
     assert result["event_details"]["vessel_0_id"] == "N/A"
@@ -239,7 +239,7 @@ def test_transform_without_vessel_info(skylight_client):
             'time': '2025-02-28T02:46:18.489582Z'
         }
     }
-    skylight_client.EMPTY_VESSEL_DICT = {"vessel_0_id": "N/A", "vessel_0_name": "N/A"}
+    skylight_client.EMPTY_VESSEL_DICT = {"id": "N/A", "name": "N/A"}
     config = [{"skylight_event_type": "some_event_type", "event_title": "Test Event", "event_type": "test_event"}]
     result = transform(config, data)
     assert result["event_details"]["vessel_0_id"] == "N/A"
