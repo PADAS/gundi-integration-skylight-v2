@@ -43,37 +43,37 @@ EMPTY_VESSEL_DICT = {
 
 # Default mapping values (for ER destinations)
 DEFAULT_EVENT_MAPPING = {
-    "fishing_alert": {
+    "fishing": {
         "event_type": "fishing_alert_rep",
         "event_title": "Fishing",
         "skylight_event_type": "fishing_activity_history"
     },
-    "vessel_detection_alert": {
+    "vessel_detection": {
         "event_type": "detection_alert_rep",
         "event_title": "Vessel Detection",
         "skylight_event_type": ["viirs", "sar_sentinel1", "eo_sentinel2"]
     },
-    "speed_range_alert": {
+    "speed_range": {
         "event_type": "speed_range_alert_rep",
         "event_title": "Speed Range",
         "skylight_event_type": "speed_range"
     },
-    "marine_entry_alert": {
+    "marine_entry": {
         "event_type": "entry_alert_rep",
         "event_title": "Marine Entry",
         "skylight_event_type": "aoi_visit"
     },
-    "dark_activity_alert": {
+    "dark_activity": {
         "event_type": "dark_activity_alert_rep",
         "event_title": "Dark Activity",
         "skylight_event_type": "dark_activity"
     },
-    "dark_rendezvous_alert": {
+    "dark_rendezvous": {
         "event_type": "dark_rendezvous_alert_rep",
         "event_title": "Dark Rendezvous",
         "skylight_event_type": "dark_rendezvous"
     },
-    "standard_rendezvous_alert": {
+    "standard_rendezvous": {
         "event_type": "standard_rendezvous_alert_rep",
         "event_title": "Standard Rendezvous",
         "skylight_event_type": "standard_rendezvous"
