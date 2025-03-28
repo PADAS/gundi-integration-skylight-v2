@@ -51,7 +51,7 @@ DEFAULT_EVENT_MAPPING = {
     "vessel_detection": {
         "event_type": "detection_alert_rep",
         "event_title": "Vessel Detection",
-        "skylight_event_type": ["viirs", "sar_sentinel1", "eo_sentinel2"]
+        "skylight_event_type": ["viirs", "sar_sentinel1", "eo_sentinel2", "eo_landsat_8_9"]
     },
     "speed_range": {
         "event_type": "speed_range_alert_rep",
