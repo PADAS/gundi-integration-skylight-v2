@@ -61,8 +61,12 @@ def transform(config, data: dict, auto_resolve_entry_alerts: bool = False) -> di
 
         event_details = deepcopy(data.get("eventDetails", {}))
         for key, detail in event_details.items():
-            if detail is not None:
+            if detail is not None and key != "__typename":
                 full_event_details.update({key: detail})
+
+        for field in ("createdAt", "updatedAt"):
+            if data.get(field) is not None:
+                full_event_details[field] = data[field]
 
         vessels = deepcopy(data.get("vessels", {}))
         if not vessels:
@@ -94,9 +98,24 @@ def transform(config, data: dict, auto_resolve_entry_alerts: bool = False) -> di
                 end_point = end.get('point') or {}
                 full_event_details["end_lat"] = end_point.get('lat')
                 full_event_details["end_lon"] = end_point.get('lon')
+                start_dt = dp(event_time_and_location.get('time'))
+                end_dt = dp(end.get('time'))
+                if start_dt and end_dt:
+                    full_event_details["duration_hours"] = round((end_dt - start_dt).total_seconds() / 3600, 2)
         else:
             event_time_and_location = data.get('end') or data.get('start')
             end = None
+            start = data.get('start')
+            if start:
+                full_event_details["start_time"] = start.get('time')
+                start_point = start.get('point') or {}
+                full_event_details["start_lat"] = start_point.get('lat')
+                full_event_details["start_lon"] = start_point.get('lon')
+            if data.get('end') and start:
+                start_dt = dp(start.get('time'))
+                end_dt = dp(data['end'].get('time'))
+                if start_dt and end_dt:
+                    full_event_details["duration_hours"] = round((end_dt - start_dt).total_seconds() / 3600, 2)
 
         transformed = dict(
             title=event_config.get("event_title"),

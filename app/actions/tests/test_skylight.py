@@ -781,6 +781,41 @@ def test_transform_non_entry_event_unaffected_by_auto_resolve(skylight_fishing_e
     assert "state" not in result
 
 
+def test_transform_includes_created_at_and_updated_at(skylight_fishing_event):
+    result = transform(CONFIG, skylight_fishing_event)
+    assert result["event_details"]["createdAt"] == "2025-04-01T00:00:00Z"
+    assert result["event_details"]["updatedAt"] == "2025-04-01T01:00:00Z"
+
+
+def test_transform_excludes_typename_from_event_details(skylight_standard_rendezvous_event):
+    result = transform(CONFIG, skylight_standard_rendezvous_event)
+    assert "__typename" not in result["event_details"]
+
+
+def test_transform_non_entry_event_includes_start_time(skylight_fishing_event):
+    result = transform(CONFIG, skylight_fishing_event)
+    assert result["event_details"]["start_time"] == "2025-04-01T00:00:00Z"
+    assert result["event_details"]["start_lat"] == -40.0
+    assert result["event_details"]["start_lon"] == -65.0
+
+
+def test_transform_non_entry_event_includes_duration(skylight_dark_rendezvous_event):
+    result = transform(CONFIG, skylight_dark_rendezvous_event)
+    assert result["event_details"]["duration_hours"] == 2.0
+
+
+def test_transform_non_entry_event_no_duration_when_no_end():
+    data = {
+        "eventType": "fishing_activity_history",
+        "eventDetails": {"fishingScore": 0.5},
+        "start": {"point": {"lat": 10.0, "lon": 20.0}, "time": "2025-04-01T00:00:00Z"},
+        "end": None,
+        "vessels": {}
+    }
+    result = transform(CONFIG, data)
+    assert "duration_hours" not in result["event_details"]
+
+
 # ---------------------------------------------------------------------------
 # action_pull_events — cursor saved to state
 # ---------------------------------------------------------------------------
