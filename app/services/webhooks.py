@@ -1,16 +1,13 @@
 import asyncio
 import datetime
-import importlib
 import ipaddress
 import logging
-import traceback
 from urllib.parse import urlparse
 import httpx
 import stamina
 from fastapi import Request
 from app import settings
 from app.services.activity_logger import log_activity, publish_event
-from gundi_client_v2 import GundiClient
 from gundi_core.events import IntegrationWebhookFailed, WebhookExecutionFailed
 from app.services.utils import DyntamicFactory
 from app.webhooks.core import get_webhook_handler, DynamicSchemaConfig, HexStringConfig, GenericJsonPayload
@@ -95,7 +92,7 @@ async def forward_payload_to_diagnostic_url(
         await _validate_diagnostic_url(destination_url)
         metadata = {
             "integration_id": integration_id,
-            "received_at": datetime.datetime.now(datetime.UTC).isoformat() + "Z",
+            "received_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         }
         if isinstance(json_content, dict):
             body = {**json_content, "__gundi_diagnostic_metadata": metadata}
@@ -149,7 +146,7 @@ async def process_webhook(request: Request):
         # Try to relate the request to an integration
         integration = await get_integration(request=request)
         if not integration:
-            logger.warning(f"No integration found for webhook request: headers: {request.headers}, query_params: {request.query_params}")
+            logger.warning(f"No integration found for webhook request: path={request.url.path}")
             return {}
         # Look for the handler function in webhooks/handlers.py
         webhook_handler, payload_model, config_model = get_webhook_handler()
