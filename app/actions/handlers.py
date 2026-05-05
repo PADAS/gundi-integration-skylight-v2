@@ -28,7 +28,7 @@ state_manager = IntegrationStateManager()
 
 
 def get_clean_event_id(event):
-    event_id = ";".join([x for x in event.get("eventId").split(";")[:-1]])
+    event_id = ";".join([x for x in (event.get("eventId") or "").split(";")[:-1]])
     if not event_id:
         event_id = event.get("eventId")
     return event_id
@@ -125,10 +125,11 @@ def transform(config, data: dict) -> dict:
                 if start_dt and end_dt:
                     full_event_details["duration_hours"] = round((end_dt - start_dt).total_seconds() / 3600, 2)
 
+        time_str = event_time_and_location.get('time')
         transformed = dict(
             title=event_config.get("event_title"),
             event_type=event_config.get("event_type"),
-            recorded_at=dp(event_time_and_location.get('time')),
+            recorded_at=dp(time_str) if time_str else None,
             location={
                 "lat": (event_time_and_location.get('point') or {}).get('lat'),
                 "lon": (event_time_and_location.get('point') or {}).get('lon')
@@ -275,10 +276,15 @@ async def action_process_events_per_aoi(integration, action_config: ProcessEvent
     result = {"events_processed": 0, "details": {}}
     all_responses = []
 
-    transformed_data = sorted(
-        [transform(action_config.updated_config_data, event) for event in action_config.events],
-        key=lambda x: x.get("recorded_at") or datetime.datetime.min, reverse=True
-    )
+    _tz_min = datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)
+    pairs = [
+        (transform(action_config.updated_config_data, event), event)
+        for event in action_config.events
+    ]
+    pairs = [(t, e) for t, e in pairs if t]
+    pairs.sort(key=lambda x: x[0].get("recorded_at") or _tz_min, reverse=True)
+    transformed_data = [t for t, _ in pairs]
+    source_events = [e for _, e in pairs]
 
     if transformed_data:
         # Send transformed data to Sensors API V2
@@ -295,8 +301,7 @@ async def action_process_events_per_aoi(integration, action_config: ProcessEvent
                     result["events_processed"] += len(response)
                     # Send images as attachments (if available)
                     await process_attachments(batch, response, integration)
-                    # Process events to patch
-            await save_events_state(all_responses, action_config.events, integration)
+            await save_events_state(all_responses, source_events, integration)
         except (httpx.ConnectTimeout, httpx.ReadTimeout) as e:
             msg = (f'Timeout exception. AOI: {action_config.aoi}. Integration: {str(integration.id)}. '
                    f'Exception: {e}, Type: {str(type(e))}, Request: {str(e.request)}')

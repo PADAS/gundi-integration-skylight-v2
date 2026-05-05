@@ -807,3 +807,100 @@ async def test_action_pull_events_saves_cursor_to_state(mocker, integration, pul
         {"start_time": "2025-05-01T10:00:00+00:00"},
         "global"
     )
+
+
+# ---------------------------------------------------------------------------
+# Bug fixes
+# ---------------------------------------------------------------------------
+
+def test_get_clean_event_id_handles_none_event_id():
+    from app.actions.handlers import get_clean_event_id
+    event = {"eventId": None}
+    # Should not raise; falls back to None rather than crashing
+    result = get_clean_event_id(event)
+    assert result is None
+
+
+def test_get_clean_event_id_handles_missing_event_id():
+    from app.actions.handlers import get_clean_event_id
+    result = get_clean_event_id({})
+    assert result is None
+
+
+def test_action_process_events_sort_does_not_crash_with_null_timestamp(mocker, integration, mock_publish_event):
+    """Sort must not raise TypeError when an event has a null time field (naive vs aware datetime)."""
+    mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
+    event_with_null_time = {
+        "eventId": "evt-nulltime",
+        "eventType": "fishing_activity_history",
+        "eventDetails": {"fishingScore": 0.8},
+        "start": {"point": {"lat": 10.0, "lon": 20.0}, "time": None},
+        "end": None,
+        "vessels": {},
+    }
+    event_normal = {
+        "eventId": "evt-normal",
+        "eventType": "fishing_activity_history",
+        "eventDetails": {"fishingScore": 0.5},
+        "start": {"point": {"lat": 10.0, "lon": 20.0}, "time": "2025-04-01T00:00:00Z"},
+        "end": None,
+        "vessels": {},
+    }
+    config = ProcessEventsPerAOIConfig(
+        integration_id="integration_id",
+        aoi="global",
+        events=[event_with_null_time, event_normal],
+        updated_config_data=list(CONFIG),
+    )
+    mocker.patch("app.actions.handlers.gundi_tools.send_events_to_gundi", new_callable=AsyncMock, return_value=[{"object_id": "obj-1"}])
+    mocker.patch("app.actions.handlers.gundi_tools.send_event_attachments_to_gundi", new_callable=AsyncMock)
+    mocker.patch("app.actions.handlers.state_manager.set_state", new_callable=AsyncMock)
+
+    import asyncio
+    # Should not raise TypeError
+    asyncio.get_event_loop().run_until_complete(
+        action_process_events_per_aoi(integration=integration, action_config=config)
+    )
+
+
+@pytest.mark.asyncio
+async def test_action_process_events_state_saved_with_correct_event_ids(mocker, integration, mock_publish_event):
+    """State must be saved aligned with the sorted order, not the original event order."""
+    mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
+
+    older_event = {
+        "eventId": "evt-older;aoi1",
+        "eventType": "fishing_activity_history",
+        "eventDetails": {"fishingScore": 0.5},
+        "start": {"point": {"lat": 10.0, "lon": 20.0}, "time": "2025-01-01T00:00:00Z"},
+        "end": None,
+        "vessels": {},
+    }
+    newer_event = {
+        "eventId": "evt-newer;aoi1",
+        "eventType": "fishing_activity_history",
+        "eventDetails": {"fishingScore": 0.9},
+        "start": {"point": {"lat": 11.0, "lon": 21.0}, "time": "2025-06-01T00:00:00Z"},
+        "end": None,
+        "vessels": {},
+    }
+    config = ProcessEventsPerAOIConfig(
+        integration_id="integration_id",
+        aoi="global",
+        events=[older_event, newer_event],  # older first
+        updated_config_data=list(CONFIG),
+    )
+    # Gundi returns object IDs in the order events are sent (newer first after sort)
+    mocker.patch(
+        "app.actions.handlers.gundi_tools.send_events_to_gundi",
+        new_callable=AsyncMock,
+        return_value=[{"object_id": "obj-newer"}, {"object_id": "obj-older"}]
+    )
+    mocker.patch("app.actions.handlers.gundi_tools.send_event_attachments_to_gundi", new_callable=AsyncMock)
+    mock_set_state = mocker.patch("app.actions.handlers.state_manager.set_state", new_callable=AsyncMock)
+
+    await action_process_events_per_aoi(integration=integration, action_config=config)
+
+    saved_calls = {call.kwargs["source_id"]: call.kwargs["state"] for call in mock_set_state.call_args_list}
+    assert saved_calls["evt-newer"]["object_id"] == "obj-newer"
+    assert saved_calls["evt-older"]["object_id"] == "obj-older"
