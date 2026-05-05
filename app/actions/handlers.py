@@ -34,7 +34,7 @@ def get_clean_event_id(event):
     return event_id
 
 
-def transform(config, data: dict, auto_resolve_entry_alerts: bool = False) -> dict:
+def transform(config, data: dict) -> dict:
     event_type = data.get("eventType")
     event_config = None
 
@@ -135,9 +135,6 @@ def transform(config, data: dict, auto_resolve_entry_alerts: bool = False) -> di
             },
             event_details=full_event_details
         )
-
-        if is_entry_alert and auto_resolve_entry_alerts and end:
-            transformed["state"] = "resolved"
 
         return transformed
 
@@ -254,7 +251,6 @@ async def action_pull_events(integration, action_config: PullEventsConfig):
                     aoi=aoi,
                     events=aoi_events,
                     updated_config_data=[config.dict() for config in updated_config_data],
-                    auto_resolve_entry_alerts=action_config.auto_resolve_entry_alerts
                 )
                 await trigger_action(integration.id, "process_events_per_aoi", config=parsed_config)
                 result["process_events_per_aoi_action_triggered"] += 1
@@ -264,7 +260,6 @@ async def action_pull_events(integration, action_config: PullEventsConfig):
                 events_to_patch,
                 [config.dict() for config in updated_config_data],
                 integration,
-                action_config.auto_resolve_entry_alerts
             )
             result["events_updated"] = len(response)
             result["details"]["updated"] = response
@@ -281,7 +276,7 @@ async def action_process_events_per_aoi(integration, action_config: ProcessEvent
     all_responses = []
 
     transformed_data = sorted(
-        [transform(action_config.updated_config_data, event, action_config.auto_resolve_entry_alerts) for event in action_config.events],
+        [transform(action_config.updated_config_data, event) for event in action_config.events],
         key=lambda x: x.get("recorded_at") or datetime.datetime.min, reverse=True
     )
 
@@ -376,13 +371,13 @@ async def process_attachments(transformed_data, response, integration):
             continue
 
 
-async def patch_events(events, updated_config_data, integration, auto_resolve_entry_alerts=False):
+async def patch_events(events, updated_config_data, integration):
     logger.info(f"Patching {len(events)} existing events for integration '{integration.id}'.")
     responses = []
     for event in events:
         gundi_object_id = event[0]
         new_event = event[1]
-        transformed_data = transform(updated_config_data, new_event, auto_resolve_entry_alerts)
+        transformed_data = transform(updated_config_data, new_event)
         if transformed_data:
             response = await gundi_tools.update_gundi_event(
                 event=transformed_data,

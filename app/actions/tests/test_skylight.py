@@ -749,33 +749,6 @@ def test_transform_aoi_visit_no_end_no_end_metadata():
     assert "end_lat" not in result["event_details"]
 
 
-def test_transform_aoi_visit_auto_resolve_with_end_sets_state_resolved(skylight_aoi_visit_event):
-    result = transform(CONFIG, skylight_aoi_visit_event, auto_resolve_entry_alerts=True)
-    assert result["state"] == "resolved"
-
-
-def test_transform_aoi_visit_auto_resolve_without_end_does_not_set_state():
-    event = {
-        "eventId": "evt-aoi-noend",
-        "eventType": "aoi_visit",
-        "start": {"point": {"lat": -40.5, "lon": -62.0}, "time": "2025-04-01T06:00:00Z"},
-        "end": None,
-        "vessels": {},
-        "eventDetails": {"entrySpeed": 5.0, "entryHeading": 180, "endHeading": None}
-    }
-    result = transform(CONFIG, event, auto_resolve_entry_alerts=True)
-    assert "state" not in result
-
-
-def test_transform_aoi_visit_no_auto_resolve_does_not_set_state(skylight_aoi_visit_event):
-    result = transform(CONFIG, skylight_aoi_visit_event, auto_resolve_entry_alerts=False)
-    assert "state" not in result
-
-
-def test_transform_non_entry_event_unaffected_by_auto_resolve(skylight_fishing_event):
-    result = transform(CONFIG, skylight_fishing_event, auto_resolve_entry_alerts=True)
-    assert "state" not in result
-
 
 def test_transform_includes_created_at_and_updated_at(skylight_fishing_event):
     result = transform(CONFIG, skylight_fishing_event)
