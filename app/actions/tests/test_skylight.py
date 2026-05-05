@@ -104,8 +104,8 @@ async def test_action_process_events_per_aoi_success(mocker, integration, proces
     mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
     mocker.patch("app.services.action_runner.publish_event", mock_publish_event)
     mocker.patch("app.services.action_scheduler.publish_event", mock_publish_event)
-    mocker.patch("app.actions.handlers.transform", return_value={"event_id": "event1"})
-    mocker.patch("app.actions.handlers.generate_batches", return_value=[[{"event_id": "event1"}]])
+    mocker.patch("app.actions.handlers.transform", return_value={"eventId": "event1"})
+    mocker.patch("app.actions.handlers.generate_batches", return_value=[[{"eventId": "event1"}]])
     mocker.patch("app.actions.handlers.gundi_tools.send_events_to_gundi", return_value=[{"object_id": "event1"}])
     mocker.patch("app.actions.handlers.process_attachments", return_value=None)
     mocker.patch("app.actions.handlers.save_events_state", return_value=None)
@@ -118,8 +118,8 @@ async def test_action_process_events_per_aoi_failure(mocker, integration, proces
     mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
     mocker.patch("app.services.action_runner.publish_event", mock_publish_event)
     mocker.patch("app.services.action_scheduler.publish_event", mock_publish_event)
-    mocker.patch("app.actions.handlers.transform", return_value={"event_id": "event1"})
-    mocker.patch("app.actions.handlers.generate_batches", return_value=[[{"event_id": "event1"}]])
+    mocker.patch("app.actions.handlers.transform", return_value={"eventId": "event1"})
+    mocker.patch("app.actions.handlers.generate_batches", return_value=[[{"eventId": "event1"}]])
     mocker.patch("app.actions.handlers.gundi_tools.send_events_to_gundi", side_effect=httpx.HTTPError("Error"))
 
     with pytest.raises(httpx.HTTPError):
@@ -130,7 +130,7 @@ async def test_action_pull_events_triggers_process_events_per_aoi(mocker, integr
     mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
     mocker.patch("app.services.action_runner.publish_event", mock_publish_event)
     mocker.patch("app.services.action_scheduler.publish_event", mock_publish_event)
-    mocker.patch("app.actions.client.get_skylight_events", return_value=({"aoi": [{"event_id": "event1"}]}, []))
+    mocker.patch("app.actions.client.get_skylight_events", return_value=({"global": [{"eventId": "event1"}]}, []))
     mocker.patch("app.actions.client.get_auth_config", return_value=None)
     mocker.patch("app.services.state.IntegrationStateManager.get_state", return_value=None)
     mock_trigger_action = mocker.patch("app.actions.handlers.trigger_action", return_value=None)
@@ -142,8 +142,8 @@ async def test_action_pull_events_triggers_process_events_per_aoi(mocker, integr
         "process_events_per_aoi",
         config=ProcessEventsPerAOIConfig(
             integration_id=integration.id,
-            aoi="aoi",
-            events=[{"event_id": "event1"}],
+            aoi="global",
+            events=[{"eventId": "event1"}],
             updated_config_data=[]
         )
     )
@@ -151,7 +151,7 @@ async def test_action_pull_events_triggers_process_events_per_aoi(mocker, integr
 
 @pytest.mark.asyncio
 async def test_process_attachments_success(mocker, integration):
-    transformed_data = [{"event_details": {"image_url": "https://example.com/image.png"}}]
+    transformed_data = [{"event_details": {"imageUrl": "https://example.com/image.png"}}]
     response = [{"object_id": "event1"}]
     mock_image_content = b"image data"
 
@@ -169,7 +169,7 @@ async def test_process_attachments_success(mocker, integration):
 
 @pytest.mark.asyncio
 async def test_process_attachments_403_error(mocker, integration):
-    transformed_data = [{"event_details": {"image_url": "https://example.com/image.png"}}]
+    transformed_data = [{"event_details": {"imageUrl": "https://example.com/image.png"}}]
     response = [{"object_id": "event1"}]
 
     mock_read_img = mocker.patch("httpx.AsyncClient.get", side_effect=httpx.HTTPStatusError("403 Forbidden", request=mocker.Mock(), response=mocker.Mock(status_code=403)))
@@ -182,8 +182,8 @@ async def test_process_attachments_403_error(mocker, integration):
 
 def test_transform_with_vessel_info():
     data = {
-        "event_type": "some_event_type",
-        "event_details": {},
+        "eventType": "some_event_type",
+        "eventDetails": {},
         "end": {
             'point':
                 {
@@ -206,8 +206,8 @@ def test_transform_with_vessel_info():
 
 def test_transform_with_empty_vessel_detail(skylight_client):
     data = {
-        "event_type": "some_event_type",
-        "event_details": {},
+        "eventType": "some_event_type",
+        "eventDetails": {},
         "end": {
             'point':
                 {
@@ -217,19 +217,19 @@ def test_transform_with_empty_vessel_detail(skylight_client):
             'time': '2025-02-28T02:46:18.489582Z'
         },
         "vessels": {
-            "vessel_0": None
+            "vessel0": None
         }
     }
     skylight_client.EMPTY_VESSEL_DICT = {"id": "N/A", "name": "N/A"}
     config = [{"skylight_event_type": "some_event_type", "event_title": "Test Event", "event_type": "test_event"}]
     result = transform(config, data)
-    assert result["event_details"]["vessel_0_id"] == "N/A"
-    assert result["event_details"]["vessel_0_name"] == "N/A"
+    assert result["event_details"]["vessel0_id"] == "N/A"
+    assert result["event_details"]["vessel0_name"] == "N/A"
 
 def test_transform_without_vessel_info(skylight_client):
     data = {
-        "event_type": "some_event_type",
-        "event_details": {},
+        "eventType": "some_event_type",
+        "eventDetails": {},
         "end": {
             'point':
                 {
@@ -242,5 +242,5 @@ def test_transform_without_vessel_info(skylight_client):
     skylight_client.EMPTY_VESSEL_DICT = {"id": "N/A", "name": "N/A"}
     config = [{"skylight_event_type": "some_event_type", "event_title": "Test Event", "event_type": "test_event"}]
     result = transform(config, data)
-    assert result["event_details"]["vessel_0_id"] == "N/A"
-    assert result["event_details"]["vessel_0_name"] == "N/A"
+    assert result["event_details"]["vessel0_id"] == "N/A"
+    assert result["event_details"]["vessel0_name"] == "N/A"

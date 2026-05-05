@@ -31,14 +31,18 @@ DEFAULT_SKYLIGHT_API_URL = 'https://api.skylight.earth/graphql'
 
 # For use in case an event doesn't have a vessel dict
 EMPTY_VESSEL_DICT = {
-    "category": "N/A",
-    "class": "N/A",
-    "country_filter": "N/A",
-    "display_country": "N/A",
-    "mmsi": "N/A",
+    "vesselId": "N/A",
     "name": "N/A",
+    "mmsi": "N/A",
+    "imo": "N/A",
+    "countryCode": "N/A",
+    "trackId": "N/A",
+    "category": "N/A",
     "subcategory": "N/A",
-    "type": "N/A",
+    "vesselType": "N/A",
+    "gfwVesselId": "N/A",
+    "displayCountry": "N/A",
+    "length": "N/A",
 }
 
 # Default mapping values (for ER destinations)
@@ -63,11 +67,6 @@ DEFAULT_EVENT_MAPPING = {
         "event_title": "Marine Entry",
         "skylight_event_type": "aoi_visit"
     },
-    "dark_activity": {
-        "event_type": "dark_activity_alert_rep",
-        "event_title": "Dark Activity",
-        "skylight_event_type": "dark_activity"
-    },
     "dark_rendezvous": {
         "event_type": "dark_rendezvous_alert_rep",
         "event_title": "Dark Rendezvous",
@@ -89,17 +88,18 @@ class ERSkylightEventTypes(str, Enum):
     speed_range_alert_rep = 'speed_range_alert_rep'
     standard_rendezvous_alert_rep = 'standard_rendezvous_alert_rep'
     entry_alert_rep = 'entry_alert_rep'
-    dark_activity_alert_rep = 'dark_activity_alert_rep'
 
 
 class SkylightEventTypes(str, Enum):
     dark_rendezvous = 'dark_rendezvous'
-    detection = 'detection'
     fishing_activity_history = 'fishing_activity_history'
     speed_range = 'speed_range'
     standard_rendezvous = 'standard_rendezvous'
     aoi_visit = 'aoi_visit'
-    dark_activity = 'dark_activity'
+    viirs = 'viirs'
+    sar_sentinel1 = 'sar_sentinel1'
+    eo_sentinel2 = 'eo_sentinel2'
+    eo_landsat_8_9 = 'eo_landsat_8_9'
 
 
 class EventType(pydantic.BaseModel):
@@ -264,9 +264,7 @@ async def execute_gql_query(gql_client, query, params, integration, auth):
         result = gql_client.execute(query, variable_values=params)
     except TransportQueryError as te:
         if te.errors[0]["extensions"].get("code") in ["UNAUTHENTICATED", "UNAUTHORIZED"]:
-            # Currently, if we receive None in the response, there was an unknown error in Skylight API
-            # Will delete token and try again
-            logger.info(f'"getRendedzvousExternal" query returned {te.errors[0]["extensions"].get("code")}, retrying with a new token...')
+            logger.info(f'"searchEventsV2" query returned {te.errors[0]["extensions"].get("code")}, retrying with a new token...')
             await state_manager.delete_state(
                 str(integration.id),
                 "pull_events",
@@ -278,198 +276,199 @@ async def execute_gql_query(gql_client, query, params, integration, auth):
 
 
 async def get_skylight_events(integration, config_data, auth):
-    # Check if data mapping dict is set in the integration
     if not integration.additional:
         msg = f'Data map JSON not found. Will use default ER map for integration ID: "{str(integration.id)}"'
         logger.warning(msg)
 
-    # GraphQL Client
     default_transport_dict = dict(
-        url=integration.base_url or DEFAULT_SKYLIGHT_API_URL,
+        url=DEFAULT_SKYLIGHT_API_URL,
         verify=True,
     )
     gql_client = build_graphql_client(default_transport_dict)
-
-    # get Token
     headers = await build_request_header(integration, auth, gql_client)
-
-    # Add 'header' to GraphQL client
-    transport_dict_with_header = default_transport_dict
-    transport_dict_with_header['headers'] = headers.dict()
+    transport_dict_with_header = {**default_transport_dict, 'headers': headers.dict()}
     gql_client = build_graphql_client(transport_dict_with_header)
 
-    events = {}
-
-    # GetEvents query (external)
     query = gql(
         """
-        query getRendedzvousExternal(
-            $eventTypes:[EventType]!
-            $aoiId: String
+        query searchSkylightEventsV2(
+            $eventTypes: [String!]!
             $startTime: String
-            $pageSize: Int
-            $pageNum: Int
-        ) 
-        {
-            events(
-                eventTypes: $eventTypes, 
-                aoiId: $aoiId, 
-                startTime: $startTime
-                pageSize: $pageSize
-                pageNum: $pageNum
-            ) {
-                items {
-                    event_id
-                    event_type  
+            $endTime: String
+            $aoiId: String
+            $limit: Int
+            $offset: Int
+            $snapshotId: String
+        ) {
+            searchEventsV2(input: {
+                eventType: { inc: $eventTypes }
+                startTime: { gte: $startTime, lte: $endTime }
+                intersectsAoiId: $aoiId
+                limit: $limit
+                offset: $offset
+                snapshotId: $snapshotId
+            }) {
+                records {
+                    eventId
+                    eventType
+                    createdAt
+                    updatedAt
                     start {
-                        point {
-                            lat
-                            lon
-                        }
+                        point { lat lon }
+                        time
+                    }
+                    end {
+                        point { lat lon }
                         time
                     }
                     vessels {
-                        vessel_0 {
-                            category
-                            class
-                            country_filter
-                            display_country
-                            mmsi
+                        vessel0 {
                             name
+                            mmsi
+                            imo
+                            countryCode
+                            trackId
+                            category
                             length
-                            type
-                            vessel_id
+                        }
+                        vessel1 {
+                            name
+                            mmsi
+                            imo
+                            countryCode
+                            trackId
+                            category
+                            length
                         }
                     }
-                    event_details {
-                        average_speed
-                        data_source
-                        distance
-                        duration
-                        correlated
-                        image_url
-                        entry_speed
-                        entry_heading
-                        end_heading
-                        visit_type
-                    }
-                    end {
-                        point {
-                            lat
-                            lon
+                    eventDetails {
+                        ... on FishingEventDetails {
+                            fishingScore
                         }
-                        time
+                        ... on DarkRendezvousEventDetails {
+                            osrScore
+                        }
+                        ... on StandardRendezvousEventDetails {
+                            __typename
+                        }
+                        ... on SpeedRangeEventDetails {
+                            averageSpeed
+                            distance
+                            durationSec
+                        }
+                        ... on AoiVisitEventDetails {
+                            entrySpeed
+                            entryHeading
+                            endHeading
+                        }
+                        ... on ImageryMetadataEventDetails {
+                            imageUrl
+                            detectionType
+                            score
+                            estimatedLength
+                            estimatedSpeedKts
+                            estimatedVesselCategory
+                            frameIds
+                            heading
+                            distanceToCoastM
+                            orientation
+                            metersPerPixel
+                        }
+                        ... on ViirsEventDetails {
+                            detectionType
+                            estimatedLength
+                            estimatedSpeedKts
+                            estimatedVesselCategory
+                            frameIds
+                            heading
+                            imageUrl
+                            radianceNw
+                        }
                     }
                 }
                 meta {
+                    snapshotId
                     total
-                    pageSize
-                    pageNum
                 }
             }
         }
         """
     )
 
-    # Map event types
     mapped_event_types = [map_event_type(integration, event_type) for event_type in config_data.event_types]
-
     if "error" in mapped_event_types:
         msg = f'Invalid config received for integration ID: {str(integration.id)}'
         logger.error(msg)
         raise PullEventsBadConfigException(msg)
 
-    # Get variables from mapped event types
     event_types = []
     for mapped_event in mapped_event_types:
         if isinstance(mapped_event.skylight_event_type, list):
             event_types.extend(mapped_event.skylight_event_type)
         else:
             event_types.append(mapped_event.skylight_event_type)
-    aoi_ids = config_data.aoi_ids
-    page_size = config_data.pageSize
+
+    limit = config_data.pageSize
     initial_data_window_days = config_data.initial_data_window_days or settings.DEFAULT_WINDOW_DAYS
 
-    for aoi in aoi_ids:
-        try:
-            response_list = []
-            saved_aoi_start_time = await state_manager.get_state(str(integration.id), "pull_events", aoi)
-            if saved_aoi_start_time:
-                start_time = dp(saved_aoi_start_time.get("start_time")).isoformat()
-            else:
-                start_time = (
-                        datetime.now(tz=timezone.utc).replace(hour=0, minute=0, second=0) -
-                        timedelta(days=initial_data_window_days)
-                ).isoformat()
+    try:
+        saved_state = await state_manager.get_state(str(integration.id), "pull_events", "global")
+        if saved_state:
+            start_time = dp(saved_state.get("start_time")).isoformat()
+        else:
+            start_time = (
+                datetime.now(tz=timezone.utc).replace(hour=0, minute=0, second=0) -
+                timedelta(days=initial_data_window_days)
+            ).isoformat()
 
-            page_num = 1
+        end_time = datetime.now(tz=timezone.utc).isoformat()
+        response_list = []
+        aoi_ids = config_data.aoi_ids or [None]
+
+        for aoi_id in aoi_ids:
+            offset = 0
+            snapshot_id = None
             has_data = True
 
             while has_data:
                 params = {
                     "eventTypes": event_types,
-                    "aoiId": aoi,
                     "startTime": start_time,
-                    "pageSize": page_size,
-                    "pageNum": page_num
+                    "endTime": end_time,
+                    "aoiId": aoi_id,
+                    "limit": limit,
+                    "offset": offset,
                 }
+                if snapshot_id:
+                    params["snapshotId"] = snapshot_id
 
-                logger.info(f'Sending "getRendedzvousExternal" query request. Params: "{params}"...')
-
+                logger.info(f'Sending "searchEventsV2" query. AOI: "{aoi_id}". Params: "{params}"...')
                 response = await execute_gql_query(gql_client, query, params, integration, auth)
+                search_response = response['searchEventsV2']
+                records = search_response.get('records') or []
 
-                events_response = response['events']['items']
+                logger.info(f'"searchEventsV2" returned {len(records)} records.')
 
-                logger.info(f'"getRendedzvousExternal" query returned: "{events_response}"...')
+                if not snapshot_id:
+                    snapshot_id = (search_response.get('meta') or {}).get('snapshotId')
 
-                if events_response is None:
-                    # Currently, if we receive None in the response, there was an unknown error in Skylight API
-                    # Will delete token and try again
-                    logger.info(f'"getRendedzvousExternal" query returned None, retrying with a new token...')
-                    await state_manager.delete_state(
-                        str(integration.id),
-                        "pull_events",
-                        auth.username
-                    )
-                    return await get_skylight_events(integration, config_data, auth)
-
-                if not events_response:
+                if not records:
                     has_data = False
+                else:
+                    response_list.extend(records)
+                    offset += limit
 
-                response_list.extend(events_response)
-                page_num += 1
-            events.update({aoi: response_list})
-        except pydantic.ValidationError as ve:
-            message = f'Validation error in Skylight "getRendedzvousExternal" endpoint. {ve.json()}'
-            logger.exception(
-                message,
-                extra={
-                    "integration_id": str(integration.id),
-                    "attention_needed": True
-                }
-            )
-            raise ve
-        except TransportQueryError as te:
-            message = f"TransportQueryError. message: {te.errors[0].get('message')}"
-            logger.exception(
-                message,
-                extra={
-                    "aoi": aoi,
-                    "integration_id": str(integration.id),
-                    "attention_needed": True
-                }
-            )
-            continue
-        except Exception as e:
-            message = f"Unhandled exception occurred. Exception: {e}"
-            logger.exception(
-                message,
-                extra={
-                    "aoi": aoi,
-                    "integration_id": str(integration.id),
-                    "attention_needed": True
-                }
-            )
-            continue
+    except pydantic.ValidationError as ve:
+        message = f'Validation error in Skylight "searchEventsV2" endpoint. {ve.json()}'
+        logger.exception(message, extra={"integration_id": str(integration.id), "attention_needed": True})
+        raise ve
+    except TransportQueryError as te:
+        message = f"TransportQueryError. message: {te.errors[0].get('message')}"
+        logger.exception(message, extra={"integration_id": str(integration.id), "attention_needed": True})
+        raise te
+    except Exception as e:
+        message = f"Unhandled exception occurred. Exception: {e}"
+        logger.exception(message, extra={"integration_id": str(integration.id), "attention_needed": True})
+        raise e
 
-    return events, mapped_event_types
+    return {"global": response_list}, mapped_event_types

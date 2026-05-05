@@ -28,16 +28,14 @@ state_manager = IntegrationStateManager()
 
 
 def get_clean_event_id(event):
-    # This logic is to extract and remove timestamps from event_id
-    event_id = ";".join([x for x in event.get("event_id").split(";")[:-1]])
+    event_id = ";".join([x for x in event.get("eventId").split(";")[:-1]])
     if not event_id:
-        # no timestamp attached to event_ids, using event_id as it is
-        event_id = event.get("event_id")
+        event_id = event.get("eventId")
     return event_id
 
 
 def transform(config, data: dict) -> dict:
-    event_type = data.get("event_type")
+    event_type = data.get("eventType")
     event_config = None
 
     try:
@@ -61,20 +59,15 @@ def transform(config, data: dict) -> dict:
     else:
         full_event_details = {}
 
-        # Get all available event_details
-        event_details = deepcopy(data.get("event_details", {}))
+        event_details = deepcopy(data.get("eventDetails", {}))
         for key, detail in event_details.items():
             if detail is not None:
                 full_event_details.update({key: detail})
 
-        # Get all available vessels info
         vessels = deepcopy(data.get("vessels", {}))
         if not vessels:
             full_event_details.update(
-                {
-                    f"vessel_0_{key}": value
-                    for key, value in client.EMPTY_VESSEL_DICT.items()
-                }
+                {f"vessel0_{key}": value for key, value in client.EMPTY_VESSEL_DICT.items()}
             )
         else:
             for vessel_name, vessel_detail in vessels.items():
@@ -84,18 +77,14 @@ def transform(config, data: dict) -> dict:
                             full_event_details.update({vessel_name + "_" + key: detail})
                 else:
                     full_event_details.update(
-                        {
-                            f"{vessel_name}_{key}": value
-                            for key, value in client.EMPTY_VESSEL_DICT.items()
-                        }
+                        {f"{vessel_name}_{key}": value for key, value in client.EMPTY_VESSEL_DICT.items()}
                     )
 
-        full_event_details["event_id"] = data.get("event_id")
+        full_event_details["eventId"] = data.get("eventId")
         full_event_details["entry_link"] = settings.ENTRY_LINK_URL.format(
-            event_id=full_event_details["event_id"]
+            event_id=full_event_details["eventId"]
         )
 
-        # Get end and/or start info
         event_time_and_location = data.get('end') or data.get('start')
 
         return dict(
@@ -117,7 +106,7 @@ async def action_auth(integration, action_config: AuthenticateConfig):
     try:
         # GraphQL Client
         default_transport_dict = dict(
-            url=integration.base_url or client.DEFAULT_SKYLIGHT_API_URL,
+            url=client.DEFAULT_SKYLIGHT_API_URL,
             verify=True,
         )
         gql_client = client.build_graphql_client(default_transport_dict)
@@ -298,12 +287,12 @@ async def action_process_events_per_aoi(integration, action_config: ProcessEvent
 async def process_attachments(transformed_data, response, integration):
     for data, event_id in zip(transformed_data, response):
         try:
-            image_url = data["event_details"].get("image_url", None)
+            image_url = data["event_details"].get("imageUrl", None)
             if image_url:
                 filename = (
                         image_url.split("/")[-1]
                         or
-                        f"skylight_att_{str(integration.id)}_{data['event_details'].get('data_source', 'default')}.png"
+                        f"skylight_att_{str(integration.id)}_{data['event_details'].get('dataSource', 'default')}.png"
                 )
                 logger.info(
                     f"Processing attachment '{filename}' for event ID '{event_id['object_id']}'",
@@ -378,7 +367,7 @@ async def save_events_state(response, events, integration):
                 expire=259200 # 72 hrs
             )
         except Exception as e:
-            message = f"Error while saving event ID '{event.get('event_id')}'. Exception: {e}."
+            message = f"Error while saving event ID '{event.get('eventId')}'. Exception: {e}."
             logger.exception(message, extra={
                 "integration_id": str(integration.id),
                 "attention_needed": True
