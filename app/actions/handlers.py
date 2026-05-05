@@ -52,7 +52,7 @@ def transform(config, data: dict) -> dict:
             message = f"'{event_type}' event type is not supported at the moment."
             logger.info(message)
             return {}
-    except:
+    except Exception:
         message = f"'{event_type}' event type is not supported at the moment."
         logger.info(message)
         return {}
@@ -185,17 +185,17 @@ async def action_pull_events(integration, action_config: PullEventsConfig):
 
         event_ids = []
         async def get_skylight_events_to_patch():
-            # Get through the events and check if state_manager has it recorded from a previous execution
             patch_these_events = []
             for aoi, events_list in events.items():
+                new_events = []
                 for event in events_list:
                     event_id = get_clean_event_id(event)
                     event_ids.append(event_id)
                     if saved_event := await state_manager.get_state(str(integration.id), "pull_events", event_id):
-                        # Event already exists, will patch it
                         patch_these_events.append((saved_event.get("object_id"), event))
-                        events_list.remove(event)
-                events[aoi] = events_list
+                    else:
+                        new_events.append(event)
+                events[aoi] = new_events
             return events, patch_these_events
 
         events, events_to_patch = await get_skylight_events_to_patch()
@@ -292,7 +292,7 @@ async def process_attachments(transformed_data, response, integration):
                 filename = (
                         image_url.split("/")[-1]
                         or
-                        f"skylight_att_{str(integration.id)}_{data['event_details'].get('dataSource', 'default')}.png"
+                        f"skylight_att_{str(integration.id)}_default.png"
                 )
                 logger.info(
                     f"Processing attachment '{filename}' for event ID '{event_id['object_id']}'",

@@ -90,17 +90,6 @@ class ERSkylightEventTypes(str, Enum):
     entry_alert_rep = 'entry_alert_rep'
 
 
-class SkylightEventTypes(str, Enum):
-    dark_rendezvous = 'dark_rendezvous'
-    fishing_activity_history = 'fishing_activity_history'
-    speed_range = 'speed_range'
-    standard_rendezvous = 'standard_rendezvous'
-    aoi_visit = 'aoi_visit'
-    viirs = 'viirs'
-    sar_sentinel1 = 'sar_sentinel1'
-    eo_sentinel2 = 'eo_sentinel2'
-    eo_landsat_8_9 = 'eo_landsat_8_9'
-
 
 class EventType(pydantic.BaseModel):
     skylight_event_type: Any = pydantic.Field(
@@ -323,21 +312,31 @@ async def get_skylight_events(integration, config_data, auth):
                     }
                     vessels {
                         vessel0 {
+                            vesselId
                             name
                             mmsi
                             imo
                             countryCode
                             trackId
                             category
+                            subcategory
+                            vesselType
+                            gfwVesselId
+                            displayCountry
                             length
                         }
                         vessel1 {
+                            vesselId
                             name
                             mmsi
                             imo
                             countryCode
                             trackId
                             category
+                            subcategory
+                            vesselType
+                            gfwVesselId
+                            displayCountry
                             length
                         }
                     }
@@ -471,4 +470,12 @@ async def get_skylight_events(integration, config_data, auth):
         logger.exception(message, extra={"integration_id": str(integration.id), "attention_needed": True})
         raise e
 
-    return {"global": response_list}, mapped_event_types
+    seen = set()
+    deduped = []
+    for record in response_list:
+        eid = record.get("eventId")
+        if eid not in seen:
+            seen.add(eid)
+            deduped.append(record)
+
+    return {"global": deduped}, mapped_event_types
