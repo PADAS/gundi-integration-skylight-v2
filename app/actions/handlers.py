@@ -93,6 +93,10 @@ def transform(config, data: dict, auto_resolve_entry_alerts: bool = False) -> di
         if is_entry_alert:
             event_time_and_location = data.get('start')
             end = data.get('end')
+            if not event_time_and_location:
+                message = f"Entry alert '{data.get('eventId')}' has no start point, skipping."
+                logger.warning(message)
+                return {}
             if end:
                 full_event_details["end_time"] = end.get('time')
                 end_point = end.get('point') or {}
@@ -105,6 +109,10 @@ def transform(config, data: dict, auto_resolve_entry_alerts: bool = False) -> di
         else:
             event_time_and_location = data.get('end') or data.get('start')
             end = None
+            if not event_time_and_location:
+                message = f"Event '{data.get('eventId')}' has no start or end point, skipping."
+                logger.warning(message)
+                return {}
             start = data.get('start')
             if start:
                 full_event_details["start_time"] = start.get('time')
@@ -122,8 +130,8 @@ def transform(config, data: dict, auto_resolve_entry_alerts: bool = False) -> di
             event_type=event_config.get("event_type"),
             recorded_at=dp(event_time_and_location.get('time')),
             location={
-                "lat": event_time_and_location["point"].get('lat'),
-                "lon": event_time_and_location["point"].get('lon')
+                "lat": (event_time_and_location.get('point') or {}).get('lat'),
+                "lon": (event_time_and_location.get('point') or {}).get('lon')
             },
             event_details=full_event_details
         )
@@ -213,26 +221,20 @@ async def action_pull_events(integration, action_config: PullEventsConfig):
         )
         raise e
     else:
-        await state_manager.set_state(
-            str(integration.id),
-            "pull_events",
-            {"start_time": end_time},
-            "global"
-        )
-
         if all([len(items) == 0 for items in events.values()]):
             logger.info(f"No events were pulled for integration: '{str(integration.id)}'.")
             result["message"] = f"No events were pulled for integration: '{str(integration.id)}'."
+            await state_manager.set_state(
+                str(integration.id), "pull_events", {"start_time": end_time}, "global"
+            )
             return result
 
-        event_ids = []
         async def get_skylight_events_to_patch():
             patch_these_events = []
             for aoi, events_list in events.items():
                 new_events = []
                 for event in events_list:
                     event_id = get_clean_event_id(event)
-                    event_ids.append(event_id)
                     if saved_event := await state_manager.get_state(str(integration.id), "pull_events", event_id):
                         patch_these_events.append((saved_event.get("object_id"), event))
                     else:
@@ -259,7 +261,6 @@ async def action_pull_events(integration, action_config: PullEventsConfig):
                 logger.info(f"Triggered 'process_events_per_aoi' action for AOI: '{aoi}'")
 
         if events_to_patch:
-            # Process events to patch
             response = await patch_events(
                 events_to_patch,
                 [config.dict() for config in updated_config_data],
@@ -269,6 +270,9 @@ async def action_pull_events(integration, action_config: PullEventsConfig):
             result["events_updated"] = len(response)
             result["details"]["updated"] = response
 
+        await state_manager.set_state(
+            str(integration.id), "pull_events", {"start_time": end_time}, "global"
+        )
         return result
 
 

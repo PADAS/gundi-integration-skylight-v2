@@ -313,18 +313,14 @@ async def test_get_skylight_events_with_aoi(mocker, integration, auth, pull_even
 
 
 @pytest.mark.asyncio
-async def test_get_skylight_events_without_aoi(mocker, integration, auth, pull_events_config_no_aoi):
-    empty_response = {"searchEventsV2": {"records": [], "meta": {"snapshotId": None, "total": 0}}}
+async def test_get_skylight_events_without_aoi_raises(mocker, integration, auth, pull_events_config_no_aoi):
+    from app.actions.client import PullEventsBadConfigException
     mocker.patch("app.actions.client.state_manager.get_state", return_value=None)
     mocker.patch("app.actions.client.build_request_header", return_value=MagicMock(dict=lambda: {}))
     mocker.patch("app.actions.client.build_graphql_client")
-    mock_execute = mocker.patch("app.actions.client.execute_gql_query", return_value=empty_response)
 
-    result, _, _end_time = await get_skylight_events(integration, pull_events_config_no_aoi, auth)
-
-    assert result == {"global": []}
-    call_params = mock_execute.call_args_list[0][0][2]
-    assert call_params["aoiId"] is None
+    with pytest.raises(PullEventsBadConfigException):
+        await get_skylight_events(integration, pull_events_config_no_aoi, auth)
 
 
 @pytest.mark.asyncio

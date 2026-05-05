@@ -422,7 +422,11 @@ async def get_skylight_events(integration, config_data, auth):
 
         end_time = datetime.now(tz=timezone.utc).isoformat()
         response_list = []
-        aoi_ids = config_data.aoi_ids or [None]
+        aoi_ids = config_data.aoi_ids
+        if not aoi_ids:
+            msg = f'No AOI IDs configured for integration "{str(integration.id)}". At least one AOI ID is required.'
+            logger.error(msg)
+            raise PullEventsBadConfigException(msg)
 
         for aoi_id in aoi_ids:
             offset = 0
