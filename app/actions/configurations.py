@@ -24,6 +24,11 @@ class ProcessEventsPerAOIConfig(InternalActionConfiguration):
     updated_config_data: List[dict]
     auto_resolve_entry_alerts: bool = False
 
+    def dict_for_logging(self, **kwargs):
+        d = self.dict(exclude={"events", "updated_config_data"}, **kwargs)
+        d["events_count"] = len(self.events)
+        return d
+
 
 class PullEventsConfig(PullActionConfiguration):
     aoi_ids: List[str] = Field(

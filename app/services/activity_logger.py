@@ -132,7 +132,10 @@ def activity_logger(on_start=True, on_completion=True, on_error=True):
             integration_id = str(integration.id) if integration else None
             action_id = func.__name__.replace("action_", "")
             action_config = kwargs.get("action_config")
-            config_data = action_config.dict() if action_config else {} or {}
+            if action_config and hasattr(action_config, "dict_for_logging"):
+                config_data = action_config.dict_for_logging()
+            else:
+                config_data = action_config.dict() if action_config else {}
             if on_start:
                 await publish_event(
                     event=IntegrationActionStarted(
