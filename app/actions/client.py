@@ -473,7 +473,8 @@ async def get_skylight_events(integration, config_data, auth):
     seen = set()
     deduped = []
     for record in response_list:
-        eid = record.get("eventId")
+        raw_eid = record.get("eventId") or ""
+        eid = ";".join(raw_eid.split(";")[:-1]) or raw_eid
         if eid not in seen:
             seen.add(eid)
             deduped.append(record)

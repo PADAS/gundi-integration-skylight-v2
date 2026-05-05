@@ -22,6 +22,7 @@ class ProcessEventsPerAOIConfig(InternalActionConfiguration):
     aoi: str
     events: List[dict]
     updated_config_data: List[dict]
+    auto_resolve_entry_alerts: bool = False
 
 
 class PullEventsConfig(PullActionConfiguration):
@@ -42,6 +43,11 @@ class PullEventsConfig(PullActionConfiguration):
         30,
         title='Days to fetch data from',
         description='Number of days the integration will get data from if no startTime set.',
+    )
+    auto_resolve_entry_alerts: bool = Field(
+        False,
+        title='Auto-resolve Entry Alerts',
+        description='Automatically resolve entry alerts in EarthRanger when the vessel has left the protected area (end time is available).',
     )
 
     @validator('event_types')

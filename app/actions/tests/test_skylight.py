@@ -304,7 +304,7 @@ async def test_get_skylight_events_with_aoi(mocker, integration, auth, pull_even
         side_effect=[mock_skylight_gql_response, {"searchEventsV2": {"records": [], "meta": {"snapshotId": None, "total": 0}}}]
     )
 
-    result, _ = await get_skylight_events(integration, pull_events_config, auth)
+    result, _, _end_time = await get_skylight_events(integration, pull_events_config, auth)
 
     assert "global" in result
     assert len(result["global"]) == 2
@@ -320,7 +320,7 @@ async def test_get_skylight_events_without_aoi(mocker, integration, auth, pull_e
     mocker.patch("app.actions.client.build_graphql_client")
     mock_execute = mocker.patch("app.actions.client.execute_gql_query", return_value=empty_response)
 
-    result, _ = await get_skylight_events(integration, pull_events_config_no_aoi, auth)
+    result, _, _end_time = await get_skylight_events(integration, pull_events_config_no_aoi, auth)
 
     assert result == {"global": []}
     call_params = mock_execute.call_args_list[0][0][2]
@@ -343,7 +343,7 @@ async def test_get_skylight_events_multiple_aois(mocker, integration, auth):
         side_effect=[page_a, page_a_empty, page_b, page_b_empty]
     )
 
-    result, _ = await get_skylight_events(integration, config, auth)
+    result, _, _end_time = await get_skylight_events(integration, config, auth)
 
     assert len(result["global"]) == 2
     assert result["global"][0]["eventId"] == "evt-1"
@@ -364,7 +364,7 @@ async def test_get_skylight_events_pagination_uses_snapshot_id(mocker, integrati
         side_effect=[page1, page2, page3]
     )
 
-    result, _ = await get_skylight_events(integration, pull_events_config, auth)
+    result, _, _end_time = await get_skylight_events(integration, pull_events_config, auth)
 
     assert len(result["global"]) == 2
     # Second and third calls should include snapshotId
@@ -382,7 +382,7 @@ async def test_get_skylight_events_uses_saved_state_as_start_time(mocker, integr
     mocker.patch("app.actions.client.build_graphql_client")
     mock_execute = mocker.patch("app.actions.client.execute_gql_query", return_value=empty_response)
 
-    await get_skylight_events(integration, pull_events_config, auth)
+    _, _, _end_time = await get_skylight_events(integration, pull_events_config, auth)
 
     call_params = mock_execute.call_args_list[0][0][2]
     assert "2025-04-01" in call_params["startTime"]
@@ -566,9 +566,10 @@ async def test_action_pull_events_triggers_process_events_per_aoi(mocker, integr
     mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
     mocker.patch("app.services.action_runner.publish_event", mock_publish_event)
     mocker.patch("app.services.action_scheduler.publish_event", mock_publish_event)
-    mocker.patch("app.actions.client.get_skylight_events", return_value=({"global": [{"eventId": "event1"}]}, []))
+    mocker.patch("app.actions.client.get_skylight_events", return_value=({"global": [{"eventId": "event1"}]}, [], "2025-04-01T12:00:00+00:00"))
     mocker.patch("app.actions.client.get_auth_config", return_value=None)
     mocker.patch("app.services.state.IntegrationStateManager.get_state", return_value=None)
+    mocker.patch("app.services.state.IntegrationStateManager.set_state", return_value=None)
     mock_trigger_action = mocker.patch("app.actions.handlers.trigger_action", return_value=None)
 
     result = await action_pull_events(integration, pull_events_config)
@@ -593,9 +594,10 @@ async def test_action_pull_events_patches_existing_events(mocker, integration, p
     mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
     mocker.patch("app.services.action_runner.publish_event", mock_publish_event)
     mocker.patch("app.services.action_scheduler.publish_event", mock_publish_event)
-    mocker.patch("app.actions.client.get_skylight_events", return_value=({"global": [raw_event]}, []))
+    mocker.patch("app.actions.client.get_skylight_events", return_value=({"global": [raw_event]}, [], "2025-04-01T12:00:00+00:00"))
     mocker.patch("app.actions.client.get_auth_config", return_value=None)
     mocker.patch("app.services.state.IntegrationStateManager.get_state", return_value=saved_event)
+    mocker.patch("app.services.state.IntegrationStateManager.set_state", return_value=None)
     mock_patch = mocker.patch("app.actions.handlers.patch_events", return_value=[{"object_id": "gundi-obj-001"}])
     mocker.patch("app.actions.handlers.trigger_action", return_value=None)
 
@@ -610,9 +612,10 @@ async def test_action_pull_events_no_events_returns_early(mocker, integration, p
     mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
     mocker.patch("app.services.action_runner.publish_event", mock_publish_event)
     mocker.patch("app.services.action_scheduler.publish_event", mock_publish_event)
-    mocker.patch("app.actions.client.get_skylight_events", return_value=({"global": []}, []))
+    mocker.patch("app.actions.client.get_skylight_events", return_value=({"global": []}, [], "2025-04-01T12:00:00+00:00"))
     mocker.patch("app.actions.client.get_auth_config", return_value=None)
     mocker.patch("app.services.state.IntegrationStateManager.get_state", return_value=None)
+    mocker.patch("app.services.state.IntegrationStateManager.set_state", return_value=None)
 
     result = await action_pull_events(integration, pull_events_config)
 
@@ -669,3 +672,134 @@ async def test_process_attachments_skips_events_without_image(mocker, integratio
     await process_attachments(transformed_data, response, integration)
 
     mock_send.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# AOI deduplication
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_get_skylight_events_deduplicates_same_event_across_aois(mocker, integration, auth):
+    config = PullEventsConfig(aoi_ids=["aoi-a", "aoi-b"], event_types=["fishing"], pageSize=100)
+    # Same base event returned for both AOIs with different suffixes
+    event_aoi_a = {"eventId": "evt-abc;aoi-a"}
+    event_aoi_b = {"eventId": "evt-abc;aoi-b"}
+    page_a = {"searchEventsV2": {"records": [event_aoi_a], "meta": {"snapshotId": "s1", "total": 1}}}
+    page_a_empty = {"searchEventsV2": {"records": [], "meta": {"snapshotId": "s1", "total": 1}}}
+    page_b = {"searchEventsV2": {"records": [event_aoi_b], "meta": {"snapshotId": "s2", "total": 1}}}
+    page_b_empty = {"searchEventsV2": {"records": [], "meta": {"snapshotId": "s2", "total": 1}}}
+
+    mocker.patch("app.actions.client.state_manager.get_state", return_value=None)
+    mocker.patch("app.actions.client.build_request_header", return_value=MagicMock(dict=lambda: {}))
+    mocker.patch("app.actions.client.build_graphql_client")
+    mocker.patch(
+        "app.actions.client.execute_gql_query",
+        side_effect=[page_a, page_a_empty, page_b, page_b_empty]
+    )
+
+    result, _, _end_time = await get_skylight_events(integration, config, auth)
+
+    assert len(result["global"]) == 1
+    assert result["global"][0]["eventId"] == "evt-abc;aoi-a"
+
+
+@pytest.mark.asyncio
+async def test_get_skylight_events_returns_end_time(mocker, integration, auth, pull_events_config):
+    empty_response = {"searchEventsV2": {"records": [], "meta": {"snapshotId": None, "total": 0}}}
+    mocker.patch("app.actions.client.state_manager.get_state", return_value=None)
+    mocker.patch("app.actions.client.build_request_header", return_value=MagicMock(dict=lambda: {}))
+    mocker.patch("app.actions.client.build_graphql_client")
+    mocker.patch("app.actions.client.execute_gql_query", return_value=empty_response)
+
+    _, _, end_time = await get_skylight_events(integration, pull_events_config, auth)
+
+    assert end_time is not None
+    assert "T" in end_time  # ISO format
+
+
+# ---------------------------------------------------------------------------
+# transform — entry alert (aoi_visit) changes
+# ---------------------------------------------------------------------------
+
+def test_transform_aoi_visit_uses_start_for_location(skylight_aoi_visit_event):
+    result = transform(CONFIG, skylight_aoi_visit_event)
+    assert result["location"] == {"lat": -40.5, "lon": -62.0}  # start point, not end
+
+
+def test_transform_aoi_visit_uses_start_for_recorded_at(skylight_aoi_visit_event):
+    result = transform(CONFIG, skylight_aoi_visit_event)
+    assert "2025-04-01T06" in result["recorded_at"].isoformat()  # start time
+
+
+def test_transform_aoi_visit_includes_end_as_metadata(skylight_aoi_visit_event):
+    result = transform(CONFIG, skylight_aoi_visit_event)
+    assert result["event_details"]["end_time"] == "2025-04-01T08:00:00Z"
+    assert result["event_details"]["end_lat"] == -40.6
+    assert result["event_details"]["end_lon"] == -62.1
+
+
+def test_transform_aoi_visit_no_end_no_end_metadata():
+    event = {
+        "eventId": "evt-aoi-noend",
+        "eventType": "aoi_visit",
+        "start": {"point": {"lat": -40.5, "lon": -62.0}, "time": "2025-04-01T06:00:00Z"},
+        "end": None,
+        "vessels": {},
+        "eventDetails": {"entrySpeed": 5.0, "entryHeading": 180, "endHeading": None}
+    }
+    result = transform(CONFIG, event)
+    assert result["location"] == {"lat": -40.5, "lon": -62.0}
+    assert "end_time" not in result["event_details"]
+    assert "end_lat" not in result["event_details"]
+
+
+def test_transform_aoi_visit_auto_resolve_with_end_sets_state_resolved(skylight_aoi_visit_event):
+    result = transform(CONFIG, skylight_aoi_visit_event, auto_resolve_entry_alerts=True)
+    assert result["state"] == "resolved"
+
+
+def test_transform_aoi_visit_auto_resolve_without_end_does_not_set_state():
+    event = {
+        "eventId": "evt-aoi-noend",
+        "eventType": "aoi_visit",
+        "start": {"point": {"lat": -40.5, "lon": -62.0}, "time": "2025-04-01T06:00:00Z"},
+        "end": None,
+        "vessels": {},
+        "eventDetails": {"entrySpeed": 5.0, "entryHeading": 180, "endHeading": None}
+    }
+    result = transform(CONFIG, event, auto_resolve_entry_alerts=True)
+    assert "state" not in result
+
+
+def test_transform_aoi_visit_no_auto_resolve_does_not_set_state(skylight_aoi_visit_event):
+    result = transform(CONFIG, skylight_aoi_visit_event, auto_resolve_entry_alerts=False)
+    assert "state" not in result
+
+
+def test_transform_non_entry_event_unaffected_by_auto_resolve(skylight_fishing_event):
+    result = transform(CONFIG, skylight_fishing_event, auto_resolve_entry_alerts=True)
+    assert "state" not in result
+
+
+# ---------------------------------------------------------------------------
+# action_pull_events — cursor saved to state
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_action_pull_events_saves_cursor_to_state(mocker, integration, pull_events_config, mock_publish_event):
+    mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
+    mocker.patch("app.services.action_runner.publish_event", mock_publish_event)
+    mocker.patch("app.services.action_scheduler.publish_event", mock_publish_event)
+    mocker.patch("app.actions.client.get_skylight_events", return_value=({"global": []}, [], "2025-05-01T10:00:00+00:00"))
+    mocker.patch("app.actions.client.get_auth_config", return_value=None)
+    mocker.patch("app.services.state.IntegrationStateManager.get_state", return_value=None)
+    mock_set_state = mocker.patch("app.services.state.IntegrationStateManager.set_state", return_value=None)
+
+    await action_pull_events(integration, pull_events_config)
+
+    mock_set_state.assert_called_once_with(
+        str(integration.id),
+        "pull_events",
+        {"start_time": "2025-05-01T10:00:00+00:00"},
+        "global"
+    )
