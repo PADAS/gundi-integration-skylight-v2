@@ -50,11 +50,11 @@ def transform(config, data: dict, auto_resolve_entry_alerts: bool = False) -> di
                     break
         if not event_config:
             message = f"'{event_type}' event type is not supported at the moment."
-            logger.info(message)
+            logger.warning(message)
             return {}
     except Exception:
         message = f"'{event_type}' event type is not supported at the moment."
-        logger.info(message)
+        logger.warning(message)
         return {}
     else:
         full_event_details = {}
@@ -158,7 +158,7 @@ async def action_auth(integration, action_config: AuthenticateConfig):
             logger.error(f"Auth unsuccessful for integration '{integration.id}'.")
             return {"valid_credentials": False}
 
-        logger.info(f"Auth successful for integration '{integration.id}'. Token: {token.access_token}")
+        logger.info(f"Auth successful for integration '{integration.id}'.")
         return {"valid_credentials": True}
     except Exception as e:
         logger.info(f"An error occurred while fetching token for integration '{integration.id}'")
@@ -167,7 +167,7 @@ async def action_auth(integration, action_config: AuthenticateConfig):
 
 @activity_logger()
 async def action_pull_events(integration, action_config: PullEventsConfig):
-    logger.info(
+    logger.debug(
         f"Executing pull_events action with integration {integration} and action_config {action_config}..."
     )
     result = {"events_extracted": 0, "process_events_per_aoi_action_triggered": 0, "details": {}}
@@ -258,7 +258,6 @@ async def action_pull_events(integration, action_config: PullEventsConfig):
                 )
                 await trigger_action(integration.id, "process_events_per_aoi", config=parsed_config)
                 result["process_events_per_aoi_action_triggered"] += 1
-                logger.info(f"Triggered 'process_events_per_aoi' action for AOI: '{aoi}'")
 
         if events_to_patch:
             response = await patch_events(
@@ -378,6 +377,7 @@ async def process_attachments(transformed_data, response, integration):
 
 
 async def patch_events(events, updated_config_data, integration, auto_resolve_entry_alerts=False):
+    logger.info(f"Patching {len(events)} existing events for integration '{integration.id}'.")
     responses = []
     for event in events:
         gundi_object_id = event[0]
@@ -390,6 +390,7 @@ async def patch_events(events, updated_config_data, integration, auto_resolve_en
                 event_id=gundi_object_id
             )
             responses.append(response)
+    logger.info(f"Patched {len(responses)}/{len(events)} events for integration '{integration.id}'.")
     return responses
 
 

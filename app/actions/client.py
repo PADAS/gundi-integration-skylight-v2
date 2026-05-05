@@ -253,7 +253,7 @@ async def execute_gql_query(gql_client, query, params, integration, auth):
         result = gql_client.execute(query, variable_values=params)
     except TransportQueryError as te:
         if te.errors[0]["extensions"].get("code") in ["UNAUTHENTICATED", "UNAUTHORIZED"]:
-            logger.info(f'"searchEventsV2" query returned {te.errors[0]["extensions"].get("code")}, retrying with a new token...')
+            logger.warning(f'"searchEventsV2" query returned {te.errors[0]["extensions"].get("code")}, retrying with a new token...')
             await state_manager.delete_state(
                 str(integration.id),
                 "pull_events",
@@ -445,12 +445,12 @@ async def get_skylight_events(integration, config_data, auth):
                 if snapshot_id:
                     params["snapshotId"] = snapshot_id
 
-                logger.info(f'Sending "searchEventsV2" query. AOI: "{aoi_id}". Params: "{params}"...')
+                logger.debug(f'Sending "searchEventsV2" query. AOI: "{aoi_id}". Params: "{params}"...')
                 response = await execute_gql_query(gql_client, query, params, integration, auth)
                 search_response = response['searchEventsV2']
                 records = search_response.get('records') or []
 
-                logger.info(f'"searchEventsV2" returned {len(records)} records.')
+                logger.debug(f'"searchEventsV2" returned {len(records)} records for AOI "{aoi_id}" at offset {offset}.')
 
                 if not snapshot_id:
                     snapshot_id = (search_response.get('meta') or {}).get('snapshotId')
@@ -460,6 +460,8 @@ async def get_skylight_events(integration, config_data, auth):
                 else:
                     response_list.extend(records)
                     offset += limit
+
+            logger.info(f'Fetched {offset} records for AOI "{aoi_id}" (time window: {start_time} → {end_time}).')
 
     except pydantic.ValidationError as ve:
         message = f'Validation error in Skylight "searchEventsV2" endpoint. {ve.json()}'
