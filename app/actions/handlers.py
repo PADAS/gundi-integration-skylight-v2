@@ -85,7 +85,17 @@ def transform(config, data: dict) -> dict:
             event_id=full_event_details["eventId"]
         )
 
-        event_time_and_location = data.get('end') or data.get('start')
+        is_entry_alert = event_config.get("skylight_event_type") == "aoi_visit"
+        if is_entry_alert:
+            event_time_and_location = data.get('start')
+            end = data.get('end')
+            if end:
+                full_event_details["end_time"] = end.get('time')
+                end_point = end.get('point') or {}
+                full_event_details["end_lat"] = end_point.get('lat')
+                full_event_details["end_lon"] = end_point.get('lon')
+        else:
+            event_time_and_location = data.get('end') or data.get('start')
 
         return dict(
             title=event_config.get("event_title"),
@@ -137,7 +147,7 @@ async def action_pull_events(integration, action_config: PullEventsConfig):
                 wait_jitter=datetime.timedelta(seconds=3)
         ):
             with attempt:
-                events, updated_config_data = await client.get_skylight_events(
+                events, updated_config_data, end_time = await client.get_skylight_events(
                     integration=integration,
                     config_data=action_config,
                     auth=client.get_auth_config(integration)
@@ -178,6 +188,13 @@ async def action_pull_events(integration, action_config: PullEventsConfig):
         )
         raise e
     else:
+        await state_manager.set_state(
+            str(integration.id),
+            "pull_events",
+            {"start_time": end_time},
+            "global"
+        )
+
         if all([len(items) == 0 for items in events.values()]):
             logger.info(f"No events were pulled for integration: '{str(integration.id)}'.")
             result["message"] = f"No events were pulled for integration: '{str(integration.id)}'."
@@ -269,16 +286,6 @@ async def action_process_events_per_aoi(integration, action_config: ProcessEvent
             )
             raise e
         else:
-            # Update states
-            state = {
-                "start_time": transformed_data[0].get("recorded_at")
-            }
-            await state_manager.set_state(
-                str(integration.id),
-                "pull_events",
-                state,
-                action_config.aoi
-            )
             return result
     else:
         return result

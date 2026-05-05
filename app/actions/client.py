@@ -478,4 +478,4 @@ async def get_skylight_events(integration, config_data, auth):
             seen.add(eid)
             deduped.append(record)
 
-    return {"global": deduped}, mapped_event_types
+    return {"global": deduped}, mapped_event_types, end_time
