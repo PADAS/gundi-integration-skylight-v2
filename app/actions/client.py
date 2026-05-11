@@ -29,21 +29,6 @@ state_manager = IntegrationStateManager()
 
 DEFAULT_SKYLIGHT_API_URL = 'https://api.skylight.earth/graphql'
 
-# For use in case an event doesn't have a vessel dict
-EMPTY_VESSEL_DICT = {
-    "vesselId": "N/A",
-    "name": "N/A",
-    "mmsi": "N/A",
-    "imo": "N/A",
-    "countryCode": "N/A",
-    "trackId": "N/A",
-    "category": "N/A",
-    "subcategory": "N/A",
-    "vesselType": "N/A",
-    "gfwVesselId": "N/A",
-    "displayCountry": "N/A",
-    "length": "N/A",
-}
 
 # Default mapping values (for ER destinations)
 DEFAULT_EVENT_MAPPING = {
@@ -164,12 +149,28 @@ def build_graphql_client(transport_dict):
     return gql_client
 
 
+def _is_token_expired(access_token: str) -> bool:
+    try:
+        import base64, json as _json
+        payload = access_token.split(".")[1]
+        padded = payload + "=" * (4 - len(payload) % 4)
+        claims = _json.loads(base64.b64decode(padded))
+        exp = claims.get("exp")
+        if not exp:
+            return True
+        return datetime.now(tz=timezone.utc).timestamp() >= exp
+    except Exception:
+        return True
+
+
 async def build_request_header(integration, auth, gql_client):
     token_dict = await state_manager.get_state(str(integration.id), "pull_events", auth.username)
 
-    if token_dict:
+    if token_dict and not _is_token_expired(token_dict.get("access_token", "")):
         token_dict = SkylightGetTokenResponse.parse_obj(token_dict)
     else:
+        if token_dict:
+            logger.info(f"Skylight token expired for '{auth.username}', refreshing.")
         token_dict = await get_authentication_token(integration, auth, gql_client)
         await state_manager.set_state(
             str(integration.id),

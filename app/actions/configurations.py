@@ -1,7 +1,7 @@
 from re import sub
 from app.actions.core import AuthActionConfiguration, PullActionConfiguration, ExecutableActionMixin, InternalActionConfiguration
 from app.services.utils import GlobalUISchemaOptions
-from typing import List
+from typing import List, Optional
 from pydantic import Field, validator, SecretStr
 
 
@@ -22,6 +22,8 @@ class ProcessEventsPerAOIConfig(InternalActionConfiguration):
     aoi: str
     events: List[dict]
     updated_config_data: List[dict]
+    # # TESTING ONLY — uncomment to limit events sent to ER per event type
+    # max_events_per_type: Optional[int] = None
 
     def dict_for_logging(self, **kwargs):
         d = self.dict(exclude={"events", "updated_config_data"}, **kwargs)
@@ -48,6 +50,13 @@ class PullEventsConfig(PullActionConfiguration):
         title='Days to fetch data from',
         description='Number of days the integration will get data from if no startTime set.',
     )
+    # # TESTING ONLY — uncomment to limit events sent to ER per event type
+    # max_events_per_type: Optional[int] = Field(
+    #     None,
+    #     title='[TESTING] Max events per type',
+    #     description='If set, limits the number of events sent to ER per event type. For testing only.',
+    # )
+
     @validator('event_types')
     def format_string_case(cls, v):
         format_string_case_list = [

@@ -4,7 +4,7 @@ import httpx
 from gql.transport.exceptions import TransportQueryError
 from unittest.mock import AsyncMock, MagicMock
 
-from app.actions.client import execute_gql_query, EMPTY_VESSEL_DICT, get_skylight_events
+from app.actions.client import execute_gql_query, get_skylight_events
 from app.actions.configurations import ProcessEventsPerAOIConfig, PullEventsConfig
 from app.actions.handlers import action_pull_events, action_process_events_per_aoi, process_attachments, transform
 from app.services.state import IntegrationStateManager
@@ -392,8 +392,8 @@ def test_transform_fishing_event(skylight_fishing_event):
     result = transform(CONFIG, skylight_fishing_event)
     assert result["event_type"] == "fishing_alert_rep"
     assert result["event_details"]["fishingScore"] == 0.92
-    assert result["event_details"]["vessel0_name"] == "Pescador I"
-    assert result["event_details"]["vessel0_mmsi"] == "701234567"
+    assert result["event_details"]["name_vessel0"] == "Pescador I"
+    assert result["event_details"]["mmsi_vessel0"] == "701234567"
     assert result["location"] == {"lat": -40.1, "lon": -65.1}
 
 
@@ -401,16 +401,16 @@ def test_transform_dark_rendezvous_event(skylight_dark_rendezvous_event):
     result = transform(CONFIG, skylight_dark_rendezvous_event)
     assert result["event_type"] == "dark_rendezvous_alert_rep"
     assert result["event_details"]["osrScore"] == 0.87
-    assert result["event_details"]["vessel0_name"] == "Dark Ship"
+    assert result["event_details"]["name_vessel0"] == "Dark Ship"
 
 
 def test_transform_standard_rendezvous_with_vessel1(skylight_standard_rendezvous_event):
     result = transform(CONFIG, skylight_standard_rendezvous_event)
     assert result["event_type"] == "standard_rendezvous_alert_rep"
-    assert result["event_details"]["vessel0_name"] == "Vessel A"
-    assert result["event_details"]["vessel1_name"] == "Vessel B"
-    assert result["event_details"]["vessel1_mmsi"] == "701333333"
-    assert result["event_details"]["vessel1_countryCode"] == "CN"
+    assert result["event_details"]["name_vessel0"] == "Vessel A"
+    assert result["event_details"]["name_vessel1"] == "Vessel B"
+    assert result["event_details"]["mmsi_vessel1"] == "701333333"
+    assert result["event_details"]["country_code_vessel1"] == "CN"
 
 
 def test_transform_speed_range_event(skylight_speed_range_event):
@@ -490,8 +490,8 @@ def test_transform_with_vessel_info():
         "vessels": {"vessel1": {"detail1": "value1", "detail2": "value2"}}
     }
     result = transform(CONFIG, data)
-    assert result["event_details"]["vessel1_detail1"] == "value1"
-    assert result["event_details"]["vessel1_detail2"] == "value2"
+    assert result["event_details"]["detail1_vessel1"] == "value1"
+    assert result["event_details"]["detail2_vessel1"] == "value2"
 
 
 def test_transform_with_empty_vessel_detail(skylight_client):
@@ -501,10 +501,9 @@ def test_transform_with_empty_vessel_detail(skylight_client):
         "end": {"point": {"lat": 5.88, "lon": 115.69}, "time": "2025-02-28T02:46:18.489582Z"},
         "vessels": {"vessel0": None}
     }
-    skylight_client.EMPTY_VESSEL_DICT = {"id": "N/A", "name": "N/A"}
     result = transform(CONFIG, data)
-    assert result["event_details"]["vessel0_id"] == "N/A"
-    assert result["event_details"]["vessel0_name"] == "N/A"
+    assert "vessel0_id" not in result["event_details"]
+    assert "vessel0_name" not in result["event_details"]
 
 
 def test_transform_without_vessel_info(skylight_client):
@@ -513,10 +512,9 @@ def test_transform_without_vessel_info(skylight_client):
         "eventDetails": {},
         "end": {"point": {"lat": 5.88, "lon": 115.69}, "time": "2025-02-28T02:46:18.489582Z"},
     }
-    skylight_client.EMPTY_VESSEL_DICT = {"id": "N/A", "name": "N/A"}
     result = transform(CONFIG, data)
-    assert result["event_details"]["vessel0_id"] == "N/A"
-    assert result["event_details"]["vessel0_name"] == "N/A"
+    assert "vessel0_id" not in result["event_details"]
+    assert "vessel0_name" not in result["event_details"]
 
 
 # ---------------------------------------------------------------------------
