@@ -32,16 +32,9 @@ def _to_snake(name: str) -> str:
     return re.sub(r'(?<!^)(?=[A-Z])', '_', name).lower()
 
 
-# Explicit field mapping for entry alert (aoi_visit) events.
-# Keys are internal field names; values are the display names shown in ER.
-# Fields with "Pending" fallback will show "Pending" when absent (no exit yet).
+# Explicit field mappings — vessel info is sent separately as a "vessels" array
+# Fields with "Pending" fallback will show "Pending" when absent (e.g. no exit yet)
 _AOI_VISIT_FIELD_MAP = {
-    "vessel_name": ("name_vessel0", None),
-    "country": ("display_country_vessel0", None),
-    "mmsi": ("mmsi_vessel0", None),
-    "vessel_type": ("vessel_type_vessel0", None),
-    "imo": ("imo_vessel0", None),
-    "length": ("length_vessel0", None),
     "entry_speed": ("entrySpeed", None),
     "entry_heading": ("entryHeading", None),
     "end_heading": ("endHeading", None),
@@ -50,44 +43,14 @@ _AOI_VISIT_FIELD_MAP = {
     "skylight_link": ("entry_link", None),
 }
 
-
 _SPEED_RANGE_FIELD_MAP = {
-    "vessel_name": ("name_vessel0", None),
-    "country": ("display_country_vessel0", None),
-    "mmsi": ("mmsi_vessel0", None),
-    "vessel_type": ("vessel_type_vessel0", None),
-    "imo": ("imo_vessel0", None),
-    "length": ("length_vessel0", None),
     "average_speed_range": ("averageSpeed", None),
     "duration_in_seconds": ("durationSec", None),
     "distance": ("distance", None),
     "skylight_link": ("entry_link", None),
 }
 
-
-# Value mappings for fields that need raw API values translated to display values
-_DETECTION_TYPE_VALUES = {
-    "dark": "Night Lights",
-    "ais_correlated": "AIS Correlated",
-}
-
-# Vessel fields only populated for AIS correlated detections
-_VESSEL0_FIELD_MAP = {
-    "vessel_name": ("name_vessel0", None),
-    "country": ("display_country_vessel0", None),
-    "mmsi": ("mmsi_vessel0", None),
-    "vessel_type": ("vessel_type_vessel0", None),
-    "imo": ("imo_vessel0", None),
-    "length": ("length_vessel0", None),
-}
-
 _FISHING_FIELD_MAP = {
-    "vessel_name": ("name_vessel0", None),
-    "country": ("display_country_vessel0", None),
-    "mmsi": ("mmsi_vessel0", None),
-    "vessel_type": ("vessel_type_vessel0", None),
-    "imo": ("imo_vessel0", None),
-    "length": ("length_vessel0", None),
     "fishing_score": ("fishingScore", None),
     "skylight_link": ("entry_link", None),
 }
@@ -95,6 +58,27 @@ _FISHING_FIELD_MAP = {
 _RENDEZVOUS_FIELD_MAP = {
     "osr_score": ("osrScore", None),
     "duration_hours": ("duration_hours", None),
+    "skylight_link": ("entry_link", None),
+}
+
+_VIIRS_FIELD_MAP = {
+    "detection_type": ("detectionType", None),
+    "estimated_length": ("estimatedLength", None),
+    "heading": ("heading", None),
+    "radiance": ("radianceNw", None),
+    "skylight_link": ("entry_link", None),
+}
+
+_IMAGERY_FIELD_MAP = {
+    "detection_type": ("detectionType", None),
+    "estimated_length": ("estimatedLength", None),
+    "estimated_speed": ("estimatedSpeedKts", None),
+    "estimated_vessel_category": ("estimatedVesselCategory", None),
+    "heading": ("heading", None),
+    "score": ("score", None),
+    "distance_to_coast_m": ("distanceToCoastM", None),
+    "orientation": ("orientation", None),
+    "meters_per_pixel": ("metersPerPixel", None),
     "skylight_link": ("entry_link", None),
 }
 
@@ -107,8 +91,6 @@ _VESSEL_ARRAY_FIELDS = [
     ("imo", "imo"),
     ("length", "length"),
 ]
-
-_RENDEZVOUS_SKYLIGHT_TYPES = {"dark_rendezvous", "standard_rendezvous"}
 
 
 def _build_vessels_list(vessels: dict) -> list:
@@ -125,30 +107,6 @@ def _build_vessels_list(vessels: dict) -> list:
                 result.append(obj)
     return result
 
-_VIIRS_BASE_FIELD_MAP = {
-    "detection_type": ("detectionType", None),
-    "estimated_length": ("estimatedLength", None),
-    "heading": ("heading", None),
-    "radiance": ("radianceNw", None),
-    "skylight_link": ("entry_link", None),
-}
-
-_IMAGERY_BASE_FIELD_MAP = {
-    "detection_type": ("detectionType", None),
-    "estimated_length": ("estimatedLength", None),
-    "estimated_speed": ("estimatedSpeedKts", None),
-    "estimated_vessel_category": ("estimatedVesselCategory", None),
-    "heading": ("heading", None),
-    "score": ("score", None),
-    "distance_to_coast_m": ("distanceToCoastM", None),
-    "orientation": ("orientation", None),
-    "meters_per_pixel": ("metersPerPixel", None),
-    "skylight_link": ("entry_link", None),
-}
-
-_VIIRS_AIS_FIELD_MAP = {**_VIIRS_BASE_FIELD_MAP, **_VESSEL0_FIELD_MAP}
-_IMAGERY_AIS_FIELD_MAP = {**_IMAGERY_BASE_FIELD_MAP, **_VESSEL0_FIELD_MAP}
-
 
 def _map_details(field_map: dict, details: dict, value_maps: dict = None) -> dict:
     mapped = {}
@@ -161,30 +119,24 @@ def _map_details(field_map: dict, details: dict, value_maps: dict = None) -> dic
     return mapped
 
 
-# Keyed by Skylight event type (or (event_type, detection_type) for detections):
-# value is (field_map, value_maps, fixed_fields)
-# fixed_fields override the mapped value with a hardcoded string
+# Keyed by Skylight event type: (field_map, value_maps, fixed_fields)
+# fixed_fields hardcode a display value regardless of what the API returns
+# Vessel data is handled separately via _build_vessels_list() in transform()
 _EVENT_TYPE_FIELD_MAPS = {
-    "aoi_visit": (_AOI_VISIT_FIELD_MAP, None, None),
-    "speed_range": (_SPEED_RANGE_FIELD_MAP, None, None),
-    "fishing_activity_history": (_FISHING_FIELD_MAP, None, None),
-    "dark_rendezvous": (_RENDEZVOUS_FIELD_MAP, None, None),
-    "standard_rendezvous": (_RENDEZVOUS_FIELD_MAP, None, None),
-    # Detection events — keyed by (skylight_type, detectionType)
-    ("viirs", "dark"):              (_VIIRS_BASE_FIELD_MAP,    None, {"detection_type": "Night Lights (VIIRS)"}),
-    ("viirs", "ais_correlated"):    (_VIIRS_AIS_FIELD_MAP,     None, {"detection_type": "Night Lights (VIIRS)"}),
-    ("sar_sentinel1", "dark"):      (_IMAGERY_BASE_FIELD_MAP,  None, {"detection_type": "Sentinel-1 Radar"}),
-    ("sar_sentinel1", "ais_correlated"): (_IMAGERY_AIS_FIELD_MAP, None, {"detection_type": "Sentinel-1 Radar"}),
-    ("eo_sentinel2", "dark"):       (_IMAGERY_BASE_FIELD_MAP,  None, {"detection_type": "Sentinel-2 Optical"}),
-    ("eo_sentinel2", "ais_correlated"): (_IMAGERY_AIS_FIELD_MAP, None, {"detection_type": "Sentinel-2 Optical"}),
-    ("eo_landsat_8_9", "dark"):     (_IMAGERY_BASE_FIELD_MAP,  None, {"detection_type": "Landsat 8/9 Optical"}),
-    ("eo_landsat_8_9", "ais_correlated"): (_IMAGERY_AIS_FIELD_MAP, None, {"detection_type": "Landsat 8/9 Optical"}),
+    "aoi_visit":                (_AOI_VISIT_FIELD_MAP,   None, None),
+    "speed_range":              (_SPEED_RANGE_FIELD_MAP, None, None),
+    "fishing_activity_history": (_FISHING_FIELD_MAP,     None, None),
+    "dark_rendezvous":          (_RENDEZVOUS_FIELD_MAP,  None, None),
+    "standard_rendezvous":      (_RENDEZVOUS_FIELD_MAP,  None, None),
+    "viirs":                    (_VIIRS_FIELD_MAP,    None, {"detection_type": "Night Lights (VIIRS)"}),
+    "sar_sentinel1":            (_IMAGERY_FIELD_MAP,  None, {"detection_type": "Sentinel-1 Radar"}),
+    "eo_sentinel2":             (_IMAGERY_FIELD_MAP,  None, {"detection_type": "Sentinel-2 Optical"}),
+    "eo_landsat_8_9":           (_IMAGERY_FIELD_MAP,  None, {"detection_type": "Landsat 8/9 Optical"}),
 }
 
 
-def _get_mapped_details(skylight_event_type: str, details: dict, detection_type: str = None) -> dict:
-    key = (skylight_event_type, detection_type) if detection_type else skylight_event_type
-    config = _EVENT_TYPE_FIELD_MAPS.get(key)
+def _get_mapped_details(skylight_event_type: str, details: dict) -> dict:
+    config = _EVENT_TYPE_FIELD_MAPS.get(skylight_event_type)
     if config:
         field_map, value_maps, fixed_fields = config
         mapped = _map_details(field_map, details, value_maps)
@@ -199,9 +151,9 @@ def _get_mapped_details(skylight_event_type: str, details: dict, detection_type:
 _DETECTION_SKYLIGHT_TYPES = {"viirs", "sar_sentinel1", "eo_sentinel2", "eo_landsat_8_9"}
 
 _DETECTION_ER_OVERRIDES = {
-    "ais_correlated": ("ais_correlated_detection_rep", "AIS Correlated Vessel Detection"),
+    "ais_correlated": ("detection_alert_rep", "AIS Correlated Vessel Detection"),
 }
-_DETECTION_ER_DEFAULT = ("dark_detection_rep", "Dark Vessel Detection")
+_DETECTION_ER_DEFAULT = ("detection_alert_rep", "Dark Vessel Detection")
 
 
 def get_clean_event_id(event):
@@ -294,7 +246,6 @@ def transform(config, data: dict) -> dict:
                     full_event_details["duration_hours"] = round((end_dt - start_dt).total_seconds() / 3600, 2)
 
         skylight_type = data.get("eventType")
-        raw_detection_type = None
         if skylight_type in _DETECTION_SKYLIGHT_TYPES:
             raw_detection_type = (data.get("eventDetails") or {}).get("detectionType")
             er_event_type, er_event_title = _DETECTION_ER_OVERRIDES.get(
@@ -305,12 +256,11 @@ def transform(config, data: dict) -> dict:
             er_event_title = event_config.get("event_title")
 
         time_str = event_time_and_location.get('time')
-        event_details = _get_mapped_details(skylight_type, full_event_details, raw_detection_type)
+        event_details = _get_mapped_details(skylight_type, full_event_details)
 
-        if skylight_type in _RENDEZVOUS_SKYLIGHT_TYPES:
-            vessels = _build_vessels_list(data.get("vessels"))
-            if vessels:
-                event_details["vessels"] = vessels
+        # Add vessels array for all event types (empty for dark detections)
+        vessels = _build_vessels_list(data.get("vessels"))
+        event_details["vessels"] = vessels
 
         transformed = dict(
             title=er_event_title,

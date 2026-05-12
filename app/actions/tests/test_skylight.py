@@ -392,8 +392,9 @@ def test_transform_fishing_event(skylight_fishing_event):
     result = transform(CONFIG, skylight_fishing_event)
     assert result["event_type"] == "fishing_alert_rep"
     assert result["event_details"]["fishing_score"] == 0.92
-    assert result["event_details"]["vessel_name"] == "Pescador I"
-    assert result["event_details"]["mmsi"] == "701234567"
+    vessels = result["event_details"]["vessels"]
+    assert vessels[0]["vessel_name"] == "Pescador I"
+    assert vessels[0]["mmsi"] == "701234567"
     assert result["location"] == {"lat": -40.1, "lon": -65.1}
 
 
@@ -422,6 +423,8 @@ def test_transform_speed_range_event(skylight_speed_range_event):
     assert result["event_details"]["average_speed_range"] == 14.5
     assert result["event_details"]["distance"] == 28.9
     assert result["event_details"]["duration_in_seconds"] == 7200.0
+    vessels = result["event_details"]["vessels"]
+    assert vessels[0]["vessel_name"] == "Fast Ship"
 
 
 def test_transform_aoi_visit_event(skylight_aoi_visit_event):
@@ -430,39 +433,46 @@ def test_transform_aoi_visit_event(skylight_aoi_visit_event):
     assert result["event_details"]["entry_speed"] == 6.2
     assert result["event_details"]["entry_heading"] == 270
     assert result["event_details"]["end_heading"] == 90
+    vessels = result["event_details"]["vessels"]
+    assert vessels[0]["vessel_name"] == "Entry Vessel"
 
 
 def test_transform_imagery_event_dark(skylight_imagery_event):
-    # detectionType == "dark" → dark_detection_rep
+    # detectionType == "dark" → detection_alert_rep, vessels is empty array
     result = transform(CONFIG, skylight_imagery_event)
-    assert result["event_type"] == "dark_detection_rep"
+    assert result["event_type"] == "detection_alert_rep"
     assert result["title"] == "Dark Vessel Detection"
     assert result["event_details"]["detection_type"] == "Sentinel-1 Radar"
     assert result["event_details"]["score"] == 0.78
     assert result["event_details"]["estimated_length"] == 95.0
     assert result["event_details"]["distance_to_coast_m"] == 52000
     assert "imageUrl" not in result["event_details"]  # sent as attachment
+    assert result["event_details"]["vessels"] == []
 
 
 def test_transform_imagery_event_ais_correlated(skylight_imagery_event):
-    # detectionType == "ais_correlated" → ais_correlated_detection_rep
+    # detectionType == "ais_correlated" → detection_alert_rep with "AIS Correlated Vessel Detection" title + vessels array
     event = dict(skylight_imagery_event)
     event["eventDetails"] = dict(event["eventDetails"])
     event["eventDetails"]["detectionType"] = "ais_correlated"
+    event["vessels"] = {"vessel0": {"name": "AIS Ship", "mmsi": 574000001, "displayCountry": "Vietnam"}, "vessel1": None}
     result = transform(CONFIG, event)
-    assert result["event_type"] == "ais_correlated_detection_rep"
+    assert result["event_type"] == "detection_alert_rep"
     assert result["title"] == "AIS Correlated Vessel Detection"
     assert result["event_details"]["detection_type"] == "Sentinel-1 Radar"
+    vessels = result["event_details"]["vessels"]
+    assert vessels[0]["vessel_name"] == "AIS Ship"
 
 
 def test_transform_viirs_event_dark(skylight_viirs_event):
-    # detectionType == "dark" → dark_detection_rep
+    # detectionType == "dark" → detection_alert_rep, vessels is empty array
     result = transform(CONFIG, skylight_viirs_event)
-    assert result["event_type"] == "dark_detection_rep"
+    assert result["event_type"] == "detection_alert_rep"
     assert result["title"] == "Dark Vessel Detection"
     assert result["event_details"]["radiance"] == 3.14
     assert result["event_details"]["detection_type"] == "Night Lights (VIIRS)"
     assert "imageUrl" not in result["event_details"]  # sent as attachment, not a field
+    assert result["event_details"]["vessels"] == []
 
 
 def test_transform_viirs_event_ais_correlated():
@@ -489,11 +499,12 @@ def test_transform_viirs_event_ais_correlated():
         }
     }
     result = transform(CONFIG, event)
-    assert result["event_type"] == "ais_correlated_detection_rep"
+    assert result["event_type"] == "detection_alert_rep"
     assert result["title"] == "AIS Correlated Vessel Detection"
     assert result["event_details"]["detection_type"] == "Night Lights (VIIRS)"
-    assert result["event_details"]["vessel_name"] == "AIS Ship"
-    assert result["event_details"]["mmsi"] == "701999999"
+    vessels = result["event_details"]["vessels"]
+    assert vessels[0]["vessel_name"] == "AIS Ship"
+    assert vessels[0]["mmsi"] == "701999999"
 
 
 def test_transform_uses_end_point_for_location(skylight_fishing_event):

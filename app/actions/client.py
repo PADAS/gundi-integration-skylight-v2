@@ -63,7 +63,7 @@ DEFAULT_EVENT_MAPPING = {
         "skylight_event_type": "aoi_visit"
     },
     "vessel_detection": {
-        "event_type": "dark_detection_rep",
+        "event_type": "detection_alert_rep",
         "event_title": "Vessel Detection",
         "skylight_event_type": ["viirs", "sar_sentinel1", "eo_sentinel2", "eo_landsat_8_9"]
     },
@@ -87,8 +87,7 @@ class ERSkylightEventTypes(str, Enum):
     speed_range_alert_rep = 'speed_range_alert_rep'
     standard_rendezvous_alert_rep = 'standard_rendezvous_alert_rep'
     entry_alert_rep = 'entry_alert_rep'
-    ais_correlated_detection_rep = 'ais_correlated_detection_rep'
-    dark_detection_rep = 'dark_detection_rep'
+    detection_alert_rep = 'detection_alert_rep'
 
 
 
