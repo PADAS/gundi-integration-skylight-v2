@@ -93,22 +93,37 @@ _FISHING_FIELD_MAP = {
 }
 
 _RENDEZVOUS_FIELD_MAP = {
-    "vessel_name": ("name_vessel0", None),
-    "country": ("display_country_vessel0", None),
-    "mmsi": ("mmsi_vessel0", None),
-    "vessel_type": ("vessel_type_vessel0", None),
-    "imo": ("imo_vessel0", None),
-    "length": ("length_vessel0", None),
-    "vessel_name_2": ("name_vessel1", None),
-    "country_2": ("display_country_vessel1", None),
-    "mmsi_2": ("mmsi_vessel1", None),
-    "vessel_type_2": ("vessel_type_vessel1", None),
-    "imo_2": ("imo_vessel1", None),
-    "length_2": ("length_vessel1", None),
     "osr_score": ("osrScore", None),
     "duration_hours": ("duration_hours", None),
     "skylight_link": ("entry_link", None),
 }
+
+# Fields to extract per vessel when building the vessels array
+_VESSEL_ARRAY_FIELDS = [
+    ("vessel_name", "name"),
+    ("country", "displayCountry"),
+    ("mmsi", "mmsi"),
+    ("vessel_type", "vesselType"),
+    ("imo", "imo"),
+    ("length", "length"),
+]
+
+_RENDEZVOUS_SKYLIGHT_TYPES = {"dark_rendezvous", "standard_rendezvous"}
+
+
+def _build_vessels_list(vessels: dict) -> list:
+    result = []
+    for vessel_key in ("vessel0", "vessel1"):
+        vessel = (vessels or {}).get(vessel_key)
+        if vessel:
+            obj = {}
+            for out_key, raw_key in _VESSEL_ARRAY_FIELDS:
+                val = vessel.get(raw_key)
+                if val is not None:
+                    obj[out_key] = val
+            if obj:
+                result.append(obj)
+    return result
 
 _VIIRS_BASE_FIELD_MAP = {
     "detection_type": ("detectionType", None),
@@ -290,6 +305,13 @@ def transform(config, data: dict) -> dict:
             er_event_title = event_config.get("event_title")
 
         time_str = event_time_and_location.get('time')
+        event_details = _get_mapped_details(skylight_type, full_event_details, raw_detection_type)
+
+        if skylight_type in _RENDEZVOUS_SKYLIGHT_TYPES:
+            vessels = _build_vessels_list(data.get("vessels"))
+            if vessels:
+                event_details["vessels"] = vessels
+
         transformed = dict(
             title=er_event_title,
             event_type=er_event_type,
@@ -298,7 +320,7 @@ def transform(config, data: dict) -> dict:
                 "lat": (event_time_and_location.get('point') or {}).get('lat'),
                 "lon": (event_time_and_location.get('point') or {}).get('lon')
             },
-            event_details=_get_mapped_details(skylight_type, full_event_details, raw_detection_type)
+            event_details=event_details
         )
 
         return transformed

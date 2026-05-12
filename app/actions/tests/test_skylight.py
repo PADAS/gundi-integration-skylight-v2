@@ -401,16 +401,19 @@ def test_transform_dark_rendezvous_event(skylight_dark_rendezvous_event):
     result = transform(CONFIG, skylight_dark_rendezvous_event)
     assert result["event_type"] == "dark_rendezvous_alert_rep"
     assert result["event_details"]["osr_score"] == 0.87
-    assert result["event_details"]["vessel_name"] == "Dark Ship"
+    vessels = result["event_details"]["vessels"]
+    assert vessels[0]["vessel_name"] == "Dark Ship"
 
 
 def test_transform_standard_rendezvous_with_vessel1(skylight_standard_rendezvous_event):
     result = transform(CONFIG, skylight_standard_rendezvous_event)
     assert result["event_type"] == "standard_rendezvous_alert_rep"
-    assert result["event_details"]["vessel_name"] == "Vessel A"
-    assert result["event_details"]["vessel_name_2"] == "Vessel B"
-    assert result["event_details"]["mmsi_2"] == "701333333"
-    assert result["event_details"]["country_2"] == "China"
+    vessels = result["event_details"]["vessels"]
+    assert len(vessels) == 2
+    assert vessels[0]["vessel_name"] == "Vessel A"
+    assert vessels[1]["vessel_name"] == "Vessel B"
+    assert vessels[1]["mmsi"] == "701333333"
+    assert vessels[1]["country"] == "China"
 
 
 def test_transform_speed_range_event(skylight_speed_range_event):
@@ -535,9 +538,10 @@ def test_transform_with_vessel_info():
         "vessels": {"vessel1": {"name": "Vessel B", "mmsi": "701333333", "displayCountry": "China"}}
     }
     result = transform(CONFIG, data)
-    assert result["event_details"]["vessel_name_2"] == "Vessel B"
-    assert result["event_details"]["mmsi_2"] == "701333333"
-    assert result["event_details"]["country_2"] == "China"
+    vessels = result["event_details"]["vessels"]
+    assert vessels[0]["vessel_name"] == "Vessel B"
+    assert vessels[0]["mmsi"] == "701333333"
+    assert vessels[0]["country"] == "China"
 
 
 def test_transform_with_empty_vessel_detail(skylight_client):
