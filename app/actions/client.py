@@ -38,17 +38,17 @@ DEFAULT_EVENT_MAPPING = {
         "skylight_event_type": "fishing_activity_history"
     },
     "viirs_detection": {
-        "event_type": "viirs_detection_rep",
+        "event_type": "detection_alert_rep",
         "event_title": "Night Lights Detection",
         "skylight_event_type": "viirs"
     },
     "sar_detection": {
-        "event_type": "sar_detection_rep",
+        "event_type": "detection_alert_rep",
         "event_title": "SAR Detection",
         "skylight_event_type": "sar_sentinel1"
     },
     "eo_detection": {
-        "event_type": "eo_detection_rep",
+        "event_type": "detection_alert_rep",
         "event_title": "Optical Detection",
         "skylight_event_type": ["eo_sentinel2", "eo_landsat_8_9"]
     },
