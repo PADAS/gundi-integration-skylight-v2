@@ -491,7 +491,7 @@ async def process_attachments(transformed_data, response, integration):
                         "integration_id": str(integration.id)
                     }
                 )
-                async with httpx.AsyncClient(timeout=120, verify=False) as session:
+                async with httpx.AsyncClient(timeout=120) as session:
                     image_response = await session.get(image_url)
                     image_response.raise_for_status()
 
@@ -544,6 +544,8 @@ async def patch_events(events, updated_config_data, integration):
                 event_id=gundi_object_id
             )
             responses.append(response)
+            # Re-send attachment if available (e.g. imagery events with imageUrl)
+            await process_attachments([transformed_data], [{"object_id": gundi_object_id}], integration)
     logger.info(f"Patched {len(responses)}/{len(events)} events for integration '{integration.id}'.")
     return responses
 
