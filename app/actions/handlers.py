@@ -262,6 +262,10 @@ def transform(config, data: dict) -> dict:
         vessels = _build_vessels_list(data.get("vessels"))
         event_details["vessels"] = vessels
 
+        # Carry imageUrl outside of event_details so process_attachments() can find it
+        # (event_details is sent to ER, imageUrl must not appear there)
+        image_url = (data.get("eventDetails") or {}).get("imageUrl")
+
         transformed = dict(
             title=er_event_title,
             event_type=er_event_type,
@@ -270,7 +274,8 @@ def transform(config, data: dict) -> dict:
                 "lat": (event_time_and_location.get('point') or {}).get('lat'),
                 "lon": (event_time_and_location.get('point') or {}).get('lon')
             },
-            event_details=event_details
+            event_details=event_details,
+            **({"image_url": image_url} if image_url else {}),
         )
 
         return transformed
@@ -473,7 +478,7 @@ async def action_process_events_per_aoi(integration, action_config: ProcessEvent
 async def process_attachments(transformed_data, response, integration):
     for data, event_id in zip(transformed_data, response):
         try:
-            image_url = data["event_details"].get("imageUrl", None)
+            image_url = data.get("image_url")
             if image_url:
                 filename = (
                         image_url.split("/")[-1]

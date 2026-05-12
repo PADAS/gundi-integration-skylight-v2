@@ -684,7 +684,7 @@ async def test_action_pull_events_no_events_returns_early(mocker, integration, p
 
 @pytest.mark.asyncio
 async def test_process_attachments_success(mocker, integration):
-    transformed_data = [{"event_details": {"imageUrl": "https://example.com/image.png"}}]
+    transformed_data = [{"image_url": "https://example.com/image.png", "event_details": {}}]
     response = [{"object_id": "event1"}]
     mock_image_content = b"image data"
 
@@ -704,7 +704,7 @@ async def test_process_attachments_success(mocker, integration):
 
 @pytest.mark.asyncio
 async def test_process_attachments_403_error(mocker, integration):
-    transformed_data = [{"event_details": {"imageUrl": "https://example.com/image.png"}}]
+    transformed_data = [{"image_url": "https://example.com/image.png", "event_details": {}}]
     response = [{"object_id": "event1"}]
 
     mocker.patch("httpx.AsyncClient.get", side_effect=httpx.HTTPStatusError(

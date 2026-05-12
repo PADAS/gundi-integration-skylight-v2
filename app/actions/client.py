@@ -168,8 +168,8 @@ def _is_token_expired(access_token: str) -> bool:
     try:
         import base64, json as _json
         payload = access_token.split(".")[1]
-        padded = payload + "=" * (4 - len(payload) % 4)
-        claims = _json.loads(base64.b64decode(padded))
+        padded = payload + "=" * ((-len(payload)) % 4)
+        claims = _json.loads(base64.urlsafe_b64decode(padded))
         exp = claims.get("exp")
         if not exp:
             return True
