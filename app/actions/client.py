@@ -37,10 +37,20 @@ DEFAULT_EVENT_MAPPING = {
         "event_title": "Fishing",
         "skylight_event_type": "fishing_activity_history"
     },
-    "vessel_detection": {
-        "event_type": "detection_alert_rep",
-        "event_title": "Vessel Detection",
-        "skylight_event_type": ["viirs", "sar_sentinel1", "eo_sentinel2", "eo_landsat_8_9"]
+    "viirs_detection": {
+        "event_type": "viirs_detection_rep",
+        "event_title": "Night Lights Detection",
+        "skylight_event_type": "viirs"
+    },
+    "sar_detection": {
+        "event_type": "sar_detection_rep",
+        "event_title": "SAR Detection",
+        "skylight_event_type": "sar_sentinel1"
+    },
+    "eo_detection": {
+        "event_type": "eo_detection_rep",
+        "event_title": "Optical Detection",
+        "skylight_event_type": ["eo_sentinel2", "eo_landsat_8_9"]
     },
     "speed_range": {
         "event_type": "speed_range_alert_rep",
@@ -51,6 +61,11 @@ DEFAULT_EVENT_MAPPING = {
         "event_type": "entry_alert_rep",
         "event_title": "Marine Entry",
         "skylight_event_type": "aoi_visit"
+    },
+    "vessel_detection": {
+        "event_type": "dark_detection_rep",
+        "event_title": "Vessel Detection",
+        "skylight_event_type": ["viirs", "sar_sentinel1", "eo_sentinel2", "eo_landsat_8_9"]
     },
     "dark_rendezvous": {
         "event_type": "dark_rendezvous_alert_rep",
@@ -68,11 +83,12 @@ DEFAULT_EVENT_MAPPING = {
 # Pydantic Models
 class ERSkylightEventTypes(str, Enum):
     dark_rendezvous_alert_rep = 'dark_rendezvous_alert_rep'
-    detection_alert_rep = 'detection_alert_rep'
     fishing_alert_rep = 'fishing_alert_rep'
     speed_range_alert_rep = 'speed_range_alert_rep'
     standard_rendezvous_alert_rep = 'standard_rendezvous_alert_rep'
     entry_alert_rep = 'entry_alert_rep'
+    ais_correlated_detection_rep = 'ais_correlated_detection_rep'
+    dark_detection_rep = 'dark_detection_rep'
 
 
 

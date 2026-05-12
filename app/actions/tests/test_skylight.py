@@ -123,7 +123,7 @@ def skylight_standard_rendezvous_event():
             },
             "vessel1": {
                 "name": "Vessel B", "mmsi": "701333333", "imo": "IMO2222222",
-                "countryCode": "CN", "trackId": "track-004",
+                "countryCode": "CN", "displayCountry": "China", "trackId": "track-004",
                 "category": "tanker", "length": 180
             }
         },
@@ -391,60 +391,106 @@ async def test_get_skylight_events_uses_saved_state_as_start_time(mocker, integr
 def test_transform_fishing_event(skylight_fishing_event):
     result = transform(CONFIG, skylight_fishing_event)
     assert result["event_type"] == "fishing_alert_rep"
-    assert result["event_details"]["fishingScore"] == 0.92
-    assert result["event_details"]["name_vessel0"] == "Pescador I"
-    assert result["event_details"]["mmsi_vessel0"] == "701234567"
+    assert result["event_details"]["fishing_score"] == 0.92
+    assert result["event_details"]["vessel_name"] == "Pescador I"
+    assert result["event_details"]["mmsi"] == "701234567"
     assert result["location"] == {"lat": -40.1, "lon": -65.1}
 
 
 def test_transform_dark_rendezvous_event(skylight_dark_rendezvous_event):
     result = transform(CONFIG, skylight_dark_rendezvous_event)
     assert result["event_type"] == "dark_rendezvous_alert_rep"
-    assert result["event_details"]["osrScore"] == 0.87
-    assert result["event_details"]["name_vessel0"] == "Dark Ship"
+    assert result["event_details"]["osr_score"] == 0.87
+    assert result["event_details"]["vessel_name"] == "Dark Ship"
 
 
 def test_transform_standard_rendezvous_with_vessel1(skylight_standard_rendezvous_event):
     result = transform(CONFIG, skylight_standard_rendezvous_event)
     assert result["event_type"] == "standard_rendezvous_alert_rep"
-    assert result["event_details"]["name_vessel0"] == "Vessel A"
-    assert result["event_details"]["name_vessel1"] == "Vessel B"
-    assert result["event_details"]["mmsi_vessel1"] == "701333333"
-    assert result["event_details"]["country_code_vessel1"] == "CN"
+    assert result["event_details"]["vessel_name"] == "Vessel A"
+    assert result["event_details"]["vessel_name_2"] == "Vessel B"
+    assert result["event_details"]["mmsi_2"] == "701333333"
+    assert result["event_details"]["country_2"] == "China"
 
 
 def test_transform_speed_range_event(skylight_speed_range_event):
     result = transform(CONFIG, skylight_speed_range_event)
     assert result["event_type"] == "speed_range_alert_rep"
-    assert result["event_details"]["averageSpeed"] == 14.5
+    assert result["event_details"]["average_speed_range"] == 14.5
     assert result["event_details"]["distance"] == 28.9
-    assert result["event_details"]["durationSec"] == 7200.0
+    assert result["event_details"]["duration_in_seconds"] == 7200.0
 
 
 def test_transform_aoi_visit_event(skylight_aoi_visit_event):
     result = transform(CONFIG, skylight_aoi_visit_event)
     assert result["event_type"] == "entry_alert_rep"
-    assert result["event_details"]["entrySpeed"] == 6.2
-    assert result["event_details"]["entryHeading"] == 270
-    assert result["event_details"]["endHeading"] == 90
+    assert result["event_details"]["entry_speed"] == 6.2
+    assert result["event_details"]["entry_heading"] == 270
+    assert result["event_details"]["end_heading"] == 90
 
 
-def test_transform_imagery_event(skylight_imagery_event):
+def test_transform_imagery_event_dark(skylight_imagery_event):
+    # detectionType == "dark" → dark_detection_rep
     result = transform(CONFIG, skylight_imagery_event)
-    assert result["event_type"] == "detection_alert_rep"
-    assert result["event_details"]["imageUrl"] == "https://example.com/sat/image.png"
-    assert result["event_details"]["detectionType"] == "dark"
+    assert result["event_type"] == "dark_detection_rep"
+    assert result["title"] == "Dark Vessel Detection"
+    assert result["event_details"]["detection_type"] == "Sentinel-1 Radar"
     assert result["event_details"]["score"] == 0.78
-    assert result["event_details"]["estimatedLength"] == 95.0
-    assert result["event_details"]["distanceToCoastM"] == 52000
+    assert result["event_details"]["estimated_length"] == 95.0
+    assert result["event_details"]["distance_to_coast_m"] == 52000
+    assert "imageUrl" not in result["event_details"]  # sent as attachment
 
 
-def test_transform_viirs_event(skylight_viirs_event):
+def test_transform_imagery_event_ais_correlated(skylight_imagery_event):
+    # detectionType == "ais_correlated" → ais_correlated_detection_rep
+    event = dict(skylight_imagery_event)
+    event["eventDetails"] = dict(event["eventDetails"])
+    event["eventDetails"]["detectionType"] = "ais_correlated"
+    result = transform(CONFIG, event)
+    assert result["event_type"] == "ais_correlated_detection_rep"
+    assert result["title"] == "AIS Correlated Vessel Detection"
+    assert result["event_details"]["detection_type"] == "Sentinel-1 Radar"
+
+
+def test_transform_viirs_event_dark(skylight_viirs_event):
+    # detectionType == "dark" → dark_detection_rep
     result = transform(CONFIG, skylight_viirs_event)
-    assert result["event_type"] == "detection_alert_rep"
-    assert result["event_details"]["imageUrl"] == "https://example.com/viirs/image.png"
-    assert result["event_details"]["radianceNw"] == 3.14
-    assert result["event_details"]["detectionType"] == "dark"
+    assert result["event_type"] == "dark_detection_rep"
+    assert result["title"] == "Dark Vessel Detection"
+    assert result["event_details"]["radiance"] == 3.14
+    assert result["event_details"]["detection_type"] == "Night Lights (VIIRS)"
+    assert "imageUrl" not in result["event_details"]  # sent as attachment, not a field
+
+
+def test_transform_viirs_event_ais_correlated():
+    event = {
+        "eventId": "evt-viirs-ais-001",
+        "eventType": "viirs",
+        "createdAt": "2025-04-01T00:00:00Z",
+        "updatedAt": "2025-04-01T01:00:00Z",
+        "start": {"point": {"lat": -43.0, "lon": -64.0}, "time": "2025-04-01T03:00:00Z"},
+        "end": None,
+        "vessels": {
+            "vessel0": {
+                "name": "AIS Ship", "mmsi": "701999999", "imo": None,
+                "countryCode": "CN", "trackId": "track-viirs-ais",
+                "category": "cargo", "length": 90
+            },
+            "vessel1": None
+        },
+        "eventDetails": {
+            "imageUrl": "https://example.com/viirs/ais.png",
+            "detectionType": "ais_correlated",
+            "estimatedLength": 88.0,
+            "radianceNw": 5.5
+        }
+    }
+    result = transform(CONFIG, event)
+    assert result["event_type"] == "ais_correlated_detection_rep"
+    assert result["title"] == "AIS Correlated Vessel Detection"
+    assert result["event_details"]["detection_type"] == "Night Lights (VIIRS)"
+    assert result["event_details"]["vessel_name"] == "AIS Ship"
+    assert result["event_details"]["mmsi"] == "701999999"
 
 
 def test_transform_uses_end_point_for_location(skylight_fishing_event):
@@ -478,8 +524,7 @@ def test_transform_unknown_event_type_returns_empty():
 
 def test_transform_adds_event_id_and_entry_link(skylight_fishing_event):
     result = transform(CONFIG, skylight_fishing_event)
-    assert result["event_details"]["eventId"] == "evt-fishing-001"
-    assert "entry_link" in result["event_details"]
+    assert "skylight_link" in result["event_details"]
 
 
 def test_transform_with_vessel_info():
@@ -487,11 +532,12 @@ def test_transform_with_vessel_info():
         "eventType": "standard_rendezvous",
         "eventDetails": {},
         "end": {"point": {"lat": 5.88, "lon": 115.69}, "time": "2025-02-28T02:46:18.489582Z"},
-        "vessels": {"vessel1": {"detail1": "value1", "detail2": "value2"}}
+        "vessels": {"vessel1": {"name": "Vessel B", "mmsi": "701333333", "displayCountry": "China"}}
     }
     result = transform(CONFIG, data)
-    assert result["event_details"]["detail1_vessel1"] == "value1"
-    assert result["event_details"]["detail2_vessel1"] == "value2"
+    assert result["event_details"]["vessel_name_2"] == "Vessel B"
+    assert result["event_details"]["mmsi_2"] == "701333333"
+    assert result["event_details"]["country_2"] == "China"
 
 
 def test_transform_with_empty_vessel_detail(skylight_client):
@@ -725,14 +771,13 @@ def test_transform_aoi_visit_uses_start_for_recorded_at(skylight_aoi_visit_event
     assert "2025-04-01T06" in result["recorded_at"].isoformat()  # start time
 
 
-def test_transform_aoi_visit_includes_end_as_metadata(skylight_aoi_visit_event):
+def test_transform_aoi_visit_includes_exit_datetime(skylight_aoi_visit_event):
     result = transform(CONFIG, skylight_aoi_visit_event)
-    assert result["event_details"]["end_time"] == "2025-04-01T08:00:00Z"
-    assert result["event_details"]["end_lat"] == -40.6
-    assert result["event_details"]["end_lon"] == -62.1
+    assert result["event_details"]["exit_date"] == "2025-04-01T08:00:00Z"
+    assert result["event_details"]["duration_in_area"] == 2.0
 
 
-def test_transform_aoi_visit_no_end_no_end_metadata():
+def test_transform_aoi_visit_no_end_shows_pending():
     event = {
         "eventId": "evt-aoi-noend",
         "eventType": "aoi_visit",
@@ -743,27 +788,20 @@ def test_transform_aoi_visit_no_end_no_end_metadata():
     }
     result = transform(CONFIG, event)
     assert result["location"] == {"lat": -40.5, "lon": -62.0}
-    assert "end_time" not in result["event_details"]
-    assert "end_lat" not in result["event_details"]
+    assert result["event_details"]["exit_date"] == "Pending"
+    assert result["event_details"]["duration_in_area"] == "Pending"
 
 
 
-def test_transform_includes_created_at_and_updated_at(skylight_fishing_event):
+def test_transform_fishing_includes_skylight_link(skylight_fishing_event):
     result = transform(CONFIG, skylight_fishing_event)
-    assert result["event_details"]["createdAt"] == "2025-04-01T00:00:00Z"
-    assert result["event_details"]["updatedAt"] == "2025-04-01T01:00:00Z"
+    assert "skylight_link" in result["event_details"]
+    assert result["event_details"]["fishing_score"] == 0.92
 
 
 def test_transform_excludes_typename_from_event_details(skylight_standard_rendezvous_event):
     result = transform(CONFIG, skylight_standard_rendezvous_event)
     assert "__typename" not in result["event_details"]
-
-
-def test_transform_non_entry_event_includes_start_time(skylight_fishing_event):
-    result = transform(CONFIG, skylight_fishing_event)
-    assert result["event_details"]["start_time"] == "2025-04-01T00:00:00Z"
-    assert result["event_details"]["start_lat"] == -40.0
-    assert result["event_details"]["start_lon"] == -65.0
 
 
 def test_transform_non_entry_event_includes_duration(skylight_dark_rendezvous_event):
