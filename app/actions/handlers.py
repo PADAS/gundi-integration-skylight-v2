@@ -178,11 +178,11 @@ def transform(config, data: dict) -> dict:
                     event_config = conf
                     break
         if not event_config:
-            message = f"'{event_type}' event type is not supported at the moment."
+            message = f"Skipping event '{data.get('eventId')}': event type '{event_type}' is not supported."
             logger.warning(message)
             return {}
     except Exception:
-        message = f"'{event_type}' event type is not supported at the moment."
+        message = f"Skipping event '{data.get('eventId')}': event type '{event_type}' is not supported."
         logger.warning(message)
         return {}
     else:
@@ -300,7 +300,7 @@ async def action_auth(integration, action_config: AuthenticateConfig):
         logger.info(f"Auth successful for integration '{integration.id}'.")
         return {"valid_credentials": True}
     except Exception as e:
-        logger.info(f"An error occurred while fetching token for integration '{integration.id}'")
+        logger.exception(f"Error fetching token for integration '{integration.id}': {e}")
         return {"valid_credentials": None, "error": str(e)}
 
 
@@ -440,11 +440,15 @@ async def action_process_events_per_aoi(integration, action_config: ProcessEvent
     transformed_data = [t for t, _ in pairs]
     source_events = [e for _, e in pairs]
 
+    skipped = len(action_config.events) - len(transformed_data)
+    if skipped:
+        logger.warning(f"{skipped} event(s) skipped during transform (unsupported type or missing location). AOI: {action_config.aoi}")
+
     if transformed_data:
         # Send transformed data to Sensors API V2
         try:
             for i, batch in enumerate(generate_batches(transformed_data, 200)):
-                logger.info(f'Sending observations batch #{i}: {len(batch)} observations. AOI: {action_config.aoi}')
+                logger.debug(f'Sending observations batch #{i}: {len(batch)} observations. AOI: {action_config.aoi}')
                 response = await gundi_tools.send_events_to_gundi(
                     events=batch,
                     integration_id=integration.id
@@ -456,6 +460,11 @@ async def action_process_events_per_aoi(integration, action_config: ProcessEvent
                     # Send images as attachments (if available)
                     await process_attachments(batch, response, integration)
             await save_events_state(all_responses, source_events, integration)
+            attachments_sent = sum(1 for t in transformed_data if t.get("image_url"))
+            logger.info(
+                f"AOI '{action_config.aoi}': {len(transformed_data)} events sent to ER, "
+                f"{attachments_sent} with image attachments."
+            )
         except (httpx.ConnectTimeout, httpx.ReadTimeout) as e:
             msg = (f'Timeout exception. AOI: {action_config.aoi}. Integration: {str(integration.id)}. '
                    f'Exception: {e}, Type: {str(type(e))}, Request: {str(e.request)}')
@@ -523,9 +532,9 @@ async def process_attachments(transformed_data, response, integration):
             await log_action_activity(
                 integration_id=integration.id,
                 action_id="pull_events",
-                level=LogLevel.WARNING,
+                level=LogLevel.ERROR,
                 title=message,
-                data=log_data
+                data={**log_data, "attention_needed": True}
             )
             continue
 
@@ -537,15 +546,17 @@ async def patch_events(events, updated_config_data, integration):
         gundi_object_id = event[0]
         new_event = event[1]
         transformed_data = transform(updated_config_data, new_event)
-        if transformed_data:
-            response = await gundi_tools.update_gundi_event(
-                event=transformed_data,
-                integration_id=integration.id,
-                event_id=gundi_object_id
-            )
-            responses.append(response)
-            # Re-send attachment if available (e.g. imagery events with imageUrl)
-            await process_attachments([transformed_data], [{"object_id": gundi_object_id}], integration)
+        if not transformed_data:
+            logger.warning(f"Skipping patch for Gundi event '{gundi_object_id}': transform returned empty result.")
+            continue
+        response = await gundi_tools.update_gundi_event(
+            event=transformed_data,
+            integration_id=integration.id,
+            event_id=gundi_object_id
+        )
+        responses.append(response)
+        # Re-send attachment if available (e.g. imagery events with imageUrl)
+        await process_attachments([transformed_data], [{"object_id": gundi_object_id}], integration)
     logger.info(f"Patched {len(responses)}/{len(events)} events for integration '{integration.id}'.")
     return responses
 
