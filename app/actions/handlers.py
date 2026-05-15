@@ -192,7 +192,11 @@ def transform(config, data: dict) -> dict:
             event_id=full_event_details["eventId"]
         )
 
-        is_entry_alert = event_config.get("skylight_event_type") == "aoi_visit"
+        _skylight_type = event_config.get("skylight_event_type")
+        is_entry_alert = (
+            _skylight_type == "aoi_visit"
+            or (isinstance(_skylight_type, list) and "aoi_visit" in _skylight_type)
+        )
         if is_entry_alert:
             event_time_and_location = data.get('start')
             end = data.get('end')
