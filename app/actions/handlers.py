@@ -1,7 +1,6 @@
 import datetime
 import httpx
 import logging
-import re
 import stamina
 
 import app.actions.client as client
@@ -26,10 +25,6 @@ logger = logging.getLogger(__name__)
 
 
 state_manager = IntegrationStateManager()
-
-
-def _to_snake(name: str) -> str:
-    return re.sub(r'(?<!^)(?=[A-Z])', '_', name).lower()
 
 
 # Explicit field mappings — vessel info is sent separately as a "vessels" array
@@ -196,13 +191,6 @@ def transform(config, data: dict) -> dict:
         for field in ("createdAt", "updatedAt"):
             if data.get(field) is not None:
                 full_event_details[field] = data[field]
-
-        vessels = deepcopy(data.get("vessels", {}))
-        for vessel_name, vessel_detail in (vessels or {}).items():
-            if vessel_detail:
-                for key, detail in vessel_detail.items():
-                    if detail is not None:
-                        full_event_details.update({f"{_to_snake(key)}_{vessel_name}": detail})
 
         full_event_details["eventId"] = data.get("eventId")
         full_event_details["entry_link"] = settings.ENTRY_LINK_URL.format(
@@ -393,7 +381,6 @@ async def action_pull_events(integration, action_config: PullEventsConfig):
                     aoi=aoi,
                     events=aoi_events,
                     updated_config_data=[config.dict() for config in updated_config_data],
-                    # max_events_per_type=action_config.max_events_per_type,  # TESTING ONLY
                 )
                 await trigger_action(integration.id, "process_events_per_aoi", config=parsed_config)
                 result["process_events_per_aoi_action_triggered"] += 1
@@ -425,17 +412,6 @@ async def action_process_events_per_aoi(integration, action_config: ProcessEvent
     ]
     pairs = [(t, e) for t, e in pairs if t]
     pairs.sort(key=lambda x: x[0].get("recorded_at") or _tz_min, reverse=True)
-
-    # # TESTING ONLY — uncomment to limit events sent to ER per event type
-    # if action_config.max_events_per_type:
-    #     counts: dict = {}
-    #     filtered = []
-    #     for t, e in pairs:
-    #         et = t.get("event_type")
-    #         if counts.get(et, 0) < action_config.max_events_per_type:
-    #             filtered.append((t, e))
-    #             counts[et] = counts.get(et, 0) + 1
-    #     pairs = filtered
 
     transformed_data = [t for t, _ in pairs]
     source_events = [e for _, e in pairs]
