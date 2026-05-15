@@ -273,27 +273,33 @@ def map_event_type(integration, event_type):
         return parsed_obj
 
 
+_AUTH_ERROR_CODES = {"UNAUTHENTICATED", "UNAUTHORIZED"}
+
+
+def _gql_error_code(te: TransportQueryError):
+    """Safely extract the error code from a GraphQL TransportQueryError."""
+    try:
+        return (te.errors[0] or {}).get("extensions", {}).get("code")
+    except (IndexError, AttributeError, TypeError):
+        return None
+
+
 @backoff.on_exception(
     backoff.expo,
     TransportQueryError,
     max_tries=3,
     jitter=backoff.full_jitter,
-    giveup=lambda e: e.errors[0]["extensions"].get("code") not in ["UNAUTHENTICATED", "UNAUTHORIZED"]
+    giveup=lambda e: _gql_error_code(e) not in _AUTH_ERROR_CODES,
 )
 async def execute_gql_query(gql_client, query, params, integration, auth):
     try:
-        result = gql_client.execute(query, variable_values=params)
+        return gql_client.execute(query, variable_values=params)
     except TransportQueryError as te:
-        if te.errors[0]["extensions"].get("code") in ["UNAUTHENTICATED", "UNAUTHORIZED"]:
-            logger.warning(f'"searchEventsV2" query returned {te.errors[0]["extensions"].get("code")}, retrying with a new token...')
-            await state_manager.delete_state(
-                str(integration.id),
-                "pull_events",
-                auth.username
-            )
-        raise te
-    else:
-        return result
+        code = _gql_error_code(te)
+        if code in _AUTH_ERROR_CODES:
+            logger.warning(f'"searchEventsV2" query returned {code}, retrying with a new token...')
+            await state_manager.delete_state(str(integration.id), "pull_events", auth.username)
+        raise
 
 
 async def get_skylight_events(integration, config_data, auth):
