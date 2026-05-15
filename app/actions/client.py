@@ -262,15 +262,13 @@ async def get_authentication_token(integration, auth, gql_client):
 
 
 def map_event_type(integration, event_type):
+    events_mapping = integration.additional or DEFAULT_EVENT_MAPPING
     try:
-        events_mapping = integration.additional or DEFAULT_EVENT_MAPPING
-        parsed_obj = EventType.parse_obj(events_mapping.get(event_type, {}))
+        return EventType.parse_obj(events_mapping.get(event_type, {}))
     except pydantic.ValidationError as e:
         message = f'Failed to map "{event_type}". Either is invalid or unsupported. {e}'
         logger.warning(message)
-        return "error"
-    else:
-        return parsed_obj
+        raise PullEventsBadConfigException(message)
 
 
 _AUTH_ERROR_CODES = {"UNAUTHENTICATED", "UNAUTHORIZED"}
@@ -432,11 +430,11 @@ async def get_skylight_events(integration, config_data, auth):
         """
     )
 
-    mapped_event_types = [map_event_type(integration, event_type) for event_type in config_data.event_types]
-    if "error" in mapped_event_types:
-        msg = f'Invalid config received for integration ID: {str(integration.id)}'
-        logger.error(msg)
-        raise PullEventsBadConfigException(msg)
+    try:
+        mapped_event_types = [map_event_type(integration, et) for et in config_data.event_types]
+    except PullEventsBadConfigException:
+        logger.error(f'Invalid config received for integration ID: {str(integration.id)}')
+        raise
 
     event_types = []
     for mapped_event in mapped_event_types:
