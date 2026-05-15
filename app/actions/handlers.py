@@ -12,6 +12,7 @@ from dateparser import parse as dp
 
 from gql.transport.exceptions import TransportQueryError
 
+from app.actions.client import clean_event_id
 from app.actions.configurations import AuthenticateConfig, PullEventsConfig, ProcessEventsPerAOIConfig
 from app.services.action_scheduler import trigger_action
 from app.services.activity_logger import activity_logger, log_action_activity
@@ -150,12 +151,6 @@ _DETECTION_ER_OVERRIDES = {
 }
 _DETECTION_ER_DEFAULT = ("detection_alert_rep", "Dark Vessel Detection")
 
-
-def get_clean_event_id(event):
-    event_id = ";".join([x for x in (event.get("eventId") or "").split(";")[:-1]])
-    if not event_id:
-        event_id = event.get("eventId")
-    return event_id
 
 
 def transform(config, data: dict) -> dict:
@@ -361,7 +356,7 @@ async def action_pull_events(integration, action_config: PullEventsConfig):
             for aoi, events_list in events.items():
                 new_events = []
                 for event in events_list:
-                    event_id = get_clean_event_id(event)
+                    event_id = clean_event_id(event.get("eventId"))
                     if saved_event := await state_manager.get_state(str(integration.id), "pull_events", event_id):
                         patch_these_events.append((saved_event.get("object_id"), event))
                     else:
@@ -540,7 +535,7 @@ async def patch_events(events, updated_config_data, integration):
 async def save_events_state(response, events, integration):
     for saved_event, event in zip(response, events):
         try:
-            event_id = get_clean_event_id(event)
+            event_id = clean_event_id(event.get("eventId"))
             await state_manager.set_state(
                 integration_id=str(integration.id),
                 action_id="pull_events",

@@ -86,6 +86,16 @@ DEFAULT_EVENT_MAPPING = {
 }
 
 
+# Skylight eventIds are semicolon-delimited; the trailing segment is a per-detection
+# suffix (timestamp or sub-event marker). Stripping the last segment groups multiple
+# detections of the same underlying event so we dedupe and patch them as a single ER event.
+def clean_event_id(raw_event_id) -> str:
+    if not raw_event_id:
+        return ""
+    parts = raw_event_id.split(";")
+    return ";".join(parts[:-1]) if len(parts) > 1 else raw_event_id
+
+
 # Pydantic Models
 class ERSkylightEventTypes(str, Enum):
     dark_rendezvous_alert_rep = 'dark_rendezvous_alert_rep'
@@ -501,9 +511,8 @@ async def get_skylight_events(integration, config_data, auth):
     seen = set()
     deduped = []
     for record in response_list:
-        raw_eid = record.get("eventId") or ""
-        eid = ";".join(raw_eid.split(";")[:-1]) or raw_eid
-        if eid not in seen:
+        eid = clean_event_id(record.get("eventId"))
+        if eid and eid not in seen:
             seen.add(eid)
             deduped.append(record)
 
