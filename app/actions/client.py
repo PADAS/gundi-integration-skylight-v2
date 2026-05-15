@@ -1,4 +1,6 @@
 import backoff
+import base64
+import json
 import logging
 import pydantic
 
@@ -28,6 +30,10 @@ logger = logging.getLogger(__name__)
 state_manager = IntegrationStateManager()
 
 DEFAULT_SKYLIGHT_API_URL = 'https://api.skylight.earth/graphql'
+
+# Refresh tokens this many seconds before their actual expiry,
+# to avoid races where the token expires mid-request.
+_TOKEN_EXPIRY_SKEW_SECONDS = 60
 
 
 # Default mapping values (for ER destinations)
@@ -165,15 +171,15 @@ def build_graphql_client(transport_dict):
 
 
 def _is_token_expired(access_token: str) -> bool:
+    """Best-effort JWT exp check. Returns True on any parse failure (fail-safe)."""
     try:
-        import base64, json as _json
         payload = access_token.split(".")[1]
         padded = payload + "=" * ((-len(payload)) % 4)
-        claims = _json.loads(base64.urlsafe_b64decode(padded))
+        claims = json.loads(base64.urlsafe_b64decode(padded))
         exp = claims.get("exp")
         if not exp:
             return True
-        return datetime.now(tz=timezone.utc).timestamp() >= exp
+        return datetime.now(tz=timezone.utc).timestamp() >= (exp - _TOKEN_EXPIRY_SKEW_SECONDS)
     except Exception:
         return True
 
