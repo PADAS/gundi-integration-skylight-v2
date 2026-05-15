@@ -309,8 +309,8 @@ async def get_skylight_events(integration, config_data, auth):
         url=DEFAULT_SKYLIGHT_API_URL,
         verify=True,
     )
-    gql_client = build_graphql_client(default_transport_dict)
-    headers = await build_request_header(integration, auth, gql_client)
+    auth_client = build_graphql_client(default_transport_dict)
+    headers = await build_request_header(integration, auth, auth_client)
     transport_dict_with_header = {**default_transport_dict, 'headers': headers.dict()}
     gql_client = build_graphql_client(transport_dict_with_header)
 
