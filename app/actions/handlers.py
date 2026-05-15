@@ -24,6 +24,14 @@ from gundi_core.schemas.v2 import LogLevel
 
 logger = logging.getLogger(__name__)
 
+# Max events per Gundi send_events_to_gundi request — chosen to stay
+# under the Sensors API request size limit.
+GUNDI_EVENT_BATCH_SIZE = 200
+
+# How long to remember the Gundi object_id for a Skylight event, so we can
+# patch updates instead of re-creating. 72h covers typical Skylight re-emission windows.
+EVENT_STATE_TTL_SECONDS = 72 * 60 * 60
+
 
 state_manager = IntegrationStateManager()
 
@@ -422,7 +430,7 @@ async def action_process_events_per_aoi(integration, action_config: ProcessEvent
     if transformed_data:
         # Send transformed data to Sensors API V2
         try:
-            for i, batch in enumerate(generate_batches(transformed_data, 200)):
+            for i, batch in enumerate(generate_batches(transformed_data, GUNDI_EVENT_BATCH_SIZE)):
                 logger.debug(f'Sending observations batch #{i}: {len(batch)} observations. AOI: {action_config.aoi}')
                 response = await gundi_tools.send_events_to_gundi(
                     events=batch,
@@ -545,7 +553,7 @@ async def save_events_state(response, events, integration):
                 action_id="pull_events",
                 state=saved_event,
                 source_id=event_id,
-                expire=259200 # 72 hrs
+                expire=EVENT_STATE_TTL_SECONDS
             )
         except Exception as e:
             message = f"Error while saving event ID '{event.get('eventId')}'. Exception: {e}."

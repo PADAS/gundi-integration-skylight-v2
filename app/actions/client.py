@@ -30,6 +30,7 @@ logger = logging.getLogger(__name__)
 state_manager = IntegrationStateManager()
 
 DEFAULT_SKYLIGHT_API_URL = 'https://api.skylight.earth/graphql'
+GRAPHQL_EXECUTE_TIMEOUT_SECONDS = 60
 
 # Refresh tokens this many seconds before their actual expiry,
 # to avoid races where the token expires mid-request.
@@ -174,7 +175,7 @@ def build_graphql_client(transport_dict):
     # Create a GraphQL client using the defined transport
     gql_client = GQLClient(
         transport=transport,
-        execute_timeout=60,
+        execute_timeout=GRAPHQL_EXECUTE_TIMEOUT_SECONDS,
         fetch_schema_from_transport=False
     )
     return gql_client
