@@ -1,12 +1,21 @@
+import base64
+import json
+import time
 import pytest
 import httpx
 
 from gql.transport.exceptions import TransportQueryError
 
-from app.actions.client import execute_gql_query
+from app.actions.client import execute_gql_query, build_request_header, _is_token_expired, _TOKEN_EXPIRY_SKEW_SECONDS
 from app.actions.configurations import ProcessEventsPerAOIConfig
 from app.actions.handlers import action_pull_events, action_process_events_per_aoi, process_attachments, transform
 from app.services.state import IntegrationStateManager
+
+
+def _make_jwt(exp: int) -> str:
+    """Build a minimal unsigned JWT with a given exp timestamp."""
+    payload = base64.urlsafe_b64encode(json.dumps({"exp": exp}).encode()).rstrip(b"=").decode()
+    return f"header.{payload}.sig"
 
 @pytest.fixture
 def integration(mocker):
@@ -98,6 +107,93 @@ async def test_execute_gql_query_does_not_retry_if_not_unauthorized_code(
     with pytest.raises(TransportQueryError):
         await execute_gql_query(gql_client, query, params, integration, auth)
     assert state_manager.delete_state.call_count == 0
+
+
+# --- _is_token_expired ---
+
+def test_is_token_expired_returns_false_for_valid_token():
+    future_exp = int(time.time()) + 3600  # expires in 1 hour
+    token = _make_jwt(future_exp)
+    assert _is_token_expired(token) is False
+
+
+def test_is_token_expired_returns_true_within_skew_window():
+    # Token expires in 30s — within the 60s skew, so should be treated as expired
+    soon_exp = int(time.time()) + (_TOKEN_EXPIRY_SKEW_SECONDS - 30)
+    token = _make_jwt(soon_exp)
+    assert _is_token_expired(token) is True
+
+
+def test_is_token_expired_returns_true_for_expired_token():
+    past_exp = int(time.time()) - 60
+    token = _make_jwt(past_exp)
+    assert _is_token_expired(token) is True
+
+
+def test_is_token_expired_returns_true_for_unparsable_token():
+    assert _is_token_expired("not.a.jwt") is True
+
+
+def test_is_token_expired_returns_true_for_empty_token():
+    assert _is_token_expired("") is True
+
+
+# --- build_request_header ---
+
+@pytest.mark.asyncio
+async def test_build_request_header_reuses_valid_cached_token(mocker, integration, auth, gql_client, state_manager):
+    future_exp = int(time.time()) + 3600
+    cached = {"access_token": _make_jwt(future_exp), "expires_in": 3600, "token_type": "Bearer"}
+    state_manager.get_state.return_value = cached
+    mocker.patch("app.actions.client.state_manager", state_manager)
+    get_auth = mocker.patch("app.actions.client.get_authentication_token")
+
+    header = await build_request_header(integration, auth, gql_client)
+
+    get_auth.assert_not_called()
+    assert "Bearer" in header.Authorization
+
+
+@pytest.mark.asyncio
+async def test_build_request_header_refreshes_expired_token(mocker, integration, auth, gql_client, state_manager):
+    past_exp = int(time.time()) - 60
+    cached = {"access_token": _make_jwt(past_exp), "expires_in": 3600, "token_type": "Bearer"}
+    state_manager.get_state.return_value = cached
+    mocker.patch("app.actions.client.state_manager", state_manager)
+
+    from app.actions.client import SkylightGetTokenResponse
+    new_token = SkylightGetTokenResponse(
+        access_token=_make_jwt(int(time.time()) + 3600),
+        expires_in=3600,
+        token_type="Bearer",
+    )
+    get_auth = mocker.patch("app.actions.client.get_authentication_token", return_value=new_token)
+
+    header = await build_request_header(integration, auth, gql_client)
+
+    get_auth.assert_called_once()
+    state_manager.set_state.assert_called_once()
+    assert "Bearer" in header.Authorization
+
+
+@pytest.mark.asyncio
+async def test_build_request_header_fetches_token_when_no_cache(mocker, integration, auth, gql_client, state_manager):
+    state_manager.get_state.return_value = None
+    mocker.patch("app.actions.client.state_manager", state_manager)
+
+    from app.actions.client import SkylightGetTokenResponse
+    new_token = SkylightGetTokenResponse(
+        access_token=_make_jwt(int(time.time()) + 3600),
+        expires_in=3600,
+        token_type="Bearer",
+    )
+    get_auth = mocker.patch("app.actions.client.get_authentication_token", return_value=new_token)
+
+    header = await build_request_header(integration, auth, gql_client)
+
+    get_auth.assert_called_once()
+    state_manager.set_state.assert_called_once()
+    assert "Bearer" in header.Authorization
 
 
 @pytest.mark.asyncio
@@ -247,3 +343,56 @@ def test_transform_without_vessel_info(skylight_client):
     result = transform(config, data)
     assert result["event_details"]["vessel_0_id"] == "N/A"
     assert result["event_details"]["vessel_0_name"] == "N/A"
+
+
+# --- Entry alert (aoi_visit) transform ---
+
+_ENTRY_ALERT_CONFIG = [{"skylight_event_type": "aoi_visit", "event_title": "Marine Entry", "event_type": "entry_alert_rep"}]
+
+
+def test_transform_entry_alert_start_and_end():
+    """location and recorded_at come from start; exit_date and duration_in_area computed from end."""
+    data = {
+        "event_id": "evt1",
+        "event_type": "aoi_visit",
+        "event_details": {},
+        "vessels": {},
+        "start": {"point": {"lat": 1.0, "lon": 104.0}, "time": "2026-06-01T00:00:00Z"},
+        "end": {"point": {"lat": 1.1, "lon": 104.1}, "time": "2026-06-01T02:30:00Z"},
+    }
+    result = transform(_ENTRY_ALERT_CONFIG, data)
+
+    assert result["recorded_at"].isoformat().startswith("2026-06-01T00:00:00")
+    assert result["location"] == {"lat": 1.0, "lon": 104.0}
+    assert result["event_details"]["exit_date"] == "2026-06-01T02:30:00Z"
+    assert result["event_details"]["duration_in_area"] == 2.5
+
+
+def test_transform_entry_alert_start_only_pending():
+    """When vessel has not exited, exit_date and duration_in_area are 'Pending'."""
+    data = {
+        "event_id": "evt2",
+        "event_type": "aoi_visit",
+        "event_details": {},
+        "vessels": {},
+        "start": {"point": {"lat": 2.0, "lon": 105.0}, "time": "2026-06-01T06:00:00Z"},
+    }
+    result = transform(_ENTRY_ALERT_CONFIG, data)
+
+    assert result["recorded_at"].isoformat().startswith("2026-06-01T06:00:00")
+    assert result["location"] == {"lat": 2.0, "lon": 105.0}
+    assert result["event_details"]["exit_date"] == "Pending"
+    assert result["event_details"]["duration_in_area"] == "Pending"
+
+
+def test_transform_entry_alert_no_start_returns_empty():
+    """An entry alert with no start point is invalid — transform returns {}."""
+    data = {
+        "event_id": "evt3",
+        "event_type": "aoi_visit",
+        "event_details": {},
+        "vessels": {},
+        "end": {"point": {"lat": 1.0, "lon": 104.0}, "time": "2026-06-01T02:00:00Z"},
+    }
+    result = transform(_ENTRY_ALERT_CONFIG, data)
+    assert result == {}

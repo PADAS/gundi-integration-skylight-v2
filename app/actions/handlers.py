@@ -146,7 +146,7 @@ async def action_auth(integration, action_config: AuthenticateConfig):
     try:
         # GraphQL Client
         default_transport_dict = dict(
-            url=integration.base_url or client.DEFAULT_SKYLIGHT_API_URL,
+            url=client.DEFAULT_SKYLIGHT_API_URL,
             verify=True,
         )
         gql_client = client.build_graphql_client(default_transport_dict)
