@@ -1,4 +1,3 @@
-import backoff
 import base64
 import json
 import logging
@@ -48,6 +47,12 @@ EMPTY_VESSEL_DICT = {
 }
 
 # Default mapping values (for ER destinations)
+# Maps a Skylight event type (the snake_case keys here) to its EarthRanger
+# event type and title. The keys MUST match the values produced by
+# PullEventsConfig.format_string_case (configurations.py), which lower/snake-cases
+# the SkylightEventType enum labels selected in the portal. Three things stay in
+# lockstep: the SkylightEventType enum labels, that validator, and these keys.
+# When adding an event type, update all three.
 DEFAULT_EVENT_MAPPING = {
     "fishing": {
         "event_type": "fishing_alert_rep",
@@ -68,11 +73,6 @@ DEFAULT_EVENT_MAPPING = {
         "event_type": "entry_alert_rep",
         "event_title": "Marine Entry",
         "skylight_event_type": "aoi_visit"
-    },
-    "dark_activity": {
-        "event_type": "dark_activity_alert_rep",
-        "event_title": "Dark Activity",
-        "skylight_event_type": "dark_activity"
     },
     "dark_rendezvous": {
         "event_type": "dark_rendezvous_alert_rep",
@@ -95,17 +95,6 @@ class ERSkylightEventTypes(str, Enum):
     speed_range_alert_rep = 'speed_range_alert_rep'
     standard_rendezvous_alert_rep = 'standard_rendezvous_alert_rep'
     entry_alert_rep = 'entry_alert_rep'
-    dark_activity_alert_rep = 'dark_activity_alert_rep'
-
-
-class SkylightEventTypes(str, Enum):
-    dark_rendezvous = 'dark_rendezvous'
-    detection = 'detection'
-    fishing_activity_history = 'fishing_activity_history'
-    speed_range = 'speed_range'
-    standard_rendezvous = 'standard_rendezvous'
-    aoi_visit = 'aoi_visit'
-    dark_activity = 'dark_activity'
 
 
 class EventType(pydantic.BaseModel):
@@ -283,20 +272,18 @@ def _gql_error_code(te: TransportQueryError):
         return None
 
 
-@backoff.on_exception(
-    backoff.expo,
-    TransportQueryError,
-    max_tries=3,
-    jitter=backoff.full_jitter,
-    giveup=lambda e: _gql_error_code(e) not in _AUTH_ERROR_CODES,
-)
 async def execute_gql_query(gql_client, query, params, integration, auth):
     try:
         return gql_client.execute(query, variable_values=params)
     except TransportQueryError as te:
         code = _gql_error_code(te)
         if code in _AUTH_ERROR_CODES:
-            logger.warning(f'"getRendedzvousExternal" query returned {code}, retrying with a new token...')
+            # Delete the cached token so the next action run re-authenticates.
+            # We do not retry here: the gql_client transport headers already
+            # hold the stale token, so retrying with the same client would fail
+            # identically. The proactive _is_token_expired check in
+            # build_request_header prevents this path in the common case.
+            logger.warning(f'"getRendedzvousExternal" query returned {code}, clearing token for next run.')
             await state_manager.delete_state(str(integration.id), "pull_events", auth.username)
         raise
 
@@ -434,10 +421,18 @@ async def get_skylight_events(integration, config_data, auth):
                 try:
                     response = await execute_gql_query(gql_client, query, params, integration, auth)
                 except TransportQueryError as te:
-                    logger.warning(
+                    # Log as error with attention_needed so this surfaces in
+                    # activity logs. We break rather than raise so a partial
+                    # page failure doesn't abort the entire AOI sync.
+                    logger.error(
                         f'"getRendedzvousExternal" page {page_num} failed for AOI "{aoi}": {te}. '
+                        f'Request params: {params}. '
                         f'Keeping {len(response_list)} events collected so far.',
-                        extra={"integration_id": str(integration.id), "aoi": aoi}
+                        extra={
+                            "integration_id": str(integration.id),
+                            "aoi": aoi,
+                            "attention_needed": True,
+                        }
                     )
                     break
 

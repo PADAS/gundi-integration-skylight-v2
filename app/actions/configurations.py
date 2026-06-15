@@ -6,6 +6,11 @@ from typing import List
 from pydantic import Field, validator, SecretStr
 
 
+# Labels shown in the portal's event-type picker. The format_string_case
+# validator on PullEventsConfig.event_types snake_cases these labels (e.g.
+# "Dark Rendezvous" -> "dark_rendezvous"), and the result MUST match a key in
+# DEFAULT_EVENT_MAPPING (client.py). "Dark Activity" is intentionally omitted
+# here: it is deprecated and no longer offered.
 class SkylightEventType(str, Enum):
     dark_rendezvous = "Dark Rendezvous"
     vessel_detection = "Vessel Detection"

@@ -41,7 +41,10 @@ async def test_execute_gql_query_success(mocker, gql_client, integration, auth):
     assert response == {"data": "response"}
 
 @pytest.mark.asyncio
-async def test_execute_gql_query_retry_on_unauthorized(mocker, gql_client, integration, auth, state_manager):
+async def test_execute_gql_query_clears_token_on_unauthorized(mocker, gql_client, integration, auth, state_manager):
+    # On UNAUTHORIZED: state is deleted once (so next run re-auths) and the
+    # error is re-raised. No retry — the stale token is still in gql_client's
+    # transport headers, so retrying with the same client would fail identically.
     gql_client.execute = mocker.MagicMock(
         side_effect=TransportQueryError(
             "Error",
@@ -54,11 +57,11 @@ async def test_execute_gql_query_retry_on_unauthorized(mocker, gql_client, integ
     mocker.patch("app.actions.client.state_manager", state_manager)
     with pytest.raises(TransportQueryError):
         await execute_gql_query(gql_client, query, params, integration, auth)
-    assert state_manager.delete_state.call_count == 3
+    assert state_manager.delete_state.call_count == 1
 
 
 @pytest.mark.asyncio
-async def test_execute_gql_query_delete_state_on_retry(mocker, gql_client, integration, auth, state_manager):
+async def test_execute_gql_query_clears_token_on_unauthenticated(mocker, gql_client, integration, auth, state_manager):
     gql_client.execute = mocker.MagicMock(
         side_effect=TransportQueryError(
             "Error",
@@ -71,7 +74,7 @@ async def test_execute_gql_query_delete_state_on_retry(mocker, gql_client, integ
     mocker.patch("app.actions.client.state_manager", state_manager)
     with pytest.raises(TransportQueryError):
         await execute_gql_query(gql_client, query, params, integration, auth)
-    assert state_manager.delete_state.call_count == 3
+    assert state_manager.delete_state.call_count == 1
 
 
 @pytest.mark.asyncio
