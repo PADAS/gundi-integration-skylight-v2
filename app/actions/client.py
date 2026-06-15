@@ -313,11 +313,11 @@ async def get_skylight_events(integration, config_data, auth):
             $startTime: String
             $pageSize: Int
             $pageNum: Int
-        ) 
+        )
         {
             events(
-                eventTypes: $eventTypes, 
-                aoiId: $aoiId, 
+                eventTypes: $eventTypes,
+                aoiId: $aoiId,
                 startTime: $startTime
                 pageSize: $pageSize
                 pageNum: $pageNum
@@ -395,6 +395,7 @@ async def get_skylight_events(integration, config_data, auth):
     for aoi in aoi_ids:
         try:
             response_list = []
+            none_retries = 0
             saved_aoi_start_time = await state_manager.get_state(str(integration.id), "pull_events", aoi)
             if saved_aoi_start_time:
                 start_time = dp(saved_aoi_start_time.get("start_time")).isoformat()
@@ -441,13 +442,16 @@ async def get_skylight_events(integration, config_data, auth):
                 logger.info(f'"getRendedzvousExternal" query returned: "{events_response}"...')
 
                 if events_response is None:
+                    if none_retries >= 1:
+                        logger.error(
+                            f'"getRendedzvousExternal" returned None twice for AOI "{aoi}", giving up.',
+                            extra={"integration_id": str(integration.id), "aoi": aoi, "attention_needed": True}
+                        )
+                        break
                     logger.info(f'"getRendedzvousExternal" query returned None, retrying with a new token...')
-                    await state_manager.delete_state(
-                        str(integration.id),
-                        "pull_events",
-                        auth.username
-                    )
-                    return await get_skylight_events(integration, config_data, auth)
+                    await state_manager.delete_state(str(integration.id), "pull_events", auth.username)
+                    none_retries += 1
+                    continue
 
                 if not events_response:
                     has_data = False
