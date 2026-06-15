@@ -1,8 +1,18 @@
+from enum import Enum
 from re import sub
 from app.actions.core import AuthActionConfiguration, PullActionConfiguration, ExecutableActionMixin, InternalActionConfiguration
 from app.services.utils import GlobalUISchemaOptions
 from typing import List
 from pydantic import Field, validator, SecretStr
+
+
+class SkylightEventType(str, Enum):
+    dark_rendezvous = "Dark Rendezvous"
+    vessel_detection = "Vessel Detection"
+    fishing = "Fishing"
+    speed_range = "Speed Range"
+    standard_rendezvous = "Standard Rendezvous"
+    marine_entry = "Marine Entry"
 
 
 class AuthenticateConfig(AuthActionConfiguration, ExecutableActionMixin):
@@ -29,9 +39,10 @@ class PullEventsConfig(PullActionConfiguration):
         title='Area of Interest (AOI) IDs',
         description='IDs of the desired areas.',
     )
-    event_types: List[str] = Field(
+    event_types: List[SkylightEventType] = Field(
         title='Event Types to Fetch',
         description='The list of EventTypes the integration will use.',
+        uniqueItems=True,
     )
     pageSize: int = Field(
         1000,

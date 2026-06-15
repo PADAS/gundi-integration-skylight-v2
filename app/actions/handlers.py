@@ -95,8 +95,37 @@ def transform(config, data: dict) -> dict:
             event_id=full_event_details["event_id"]
         )
 
-        # Get end and/or start info
-        event_time_and_location = data.get('end') or data.get('start')
+        _skylight_type = event_config.get("skylight_event_type")
+        is_entry_alert = (
+            _skylight_type == "aoi_visit"
+            or (isinstance(_skylight_type, list) and "aoi_visit" in _skylight_type)
+        )
+
+        if is_entry_alert:
+            event_time_and_location = data.get('start')
+            if not event_time_and_location:
+                logger.warning(f"Entry alert '{data.get('event_id')}' has no start point, skipping.")
+                return {}
+            end = data.get('end')
+            if end:
+                full_event_details["exit_date"] = end.get('time')
+                start_dt = dp(event_time_and_location.get('time'))
+                end_dt = dp(end.get('time'))
+                if start_dt and end_dt:
+                    full_event_details["duration_in_area"] = round(
+                        (end_dt - start_dt).total_seconds() / 3600, 2
+                    )
+                else:
+                    full_event_details["duration_in_area"] = "Pending"
+            else:
+                full_event_details["exit_date"] = "Pending"
+                full_event_details["duration_in_area"] = "Pending"
+        else:
+            event_time_and_location = data.get('end') or data.get('start')
+
+        if not event_time_and_location:
+            logger.warning(f"Event '{data.get('event_id')}' has no start or end point, skipping.")
+            return {}
 
         return dict(
             title=event_config.get("event_title"),

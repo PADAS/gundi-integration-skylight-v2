@@ -1,4 +1,6 @@
 import backoff
+import base64
+import json
 import logging
 import pydantic
 
@@ -28,6 +30,10 @@ logger = logging.getLogger(__name__)
 state_manager = IntegrationStateManager()
 
 DEFAULT_SKYLIGHT_API_URL = 'https://api.skylight.earth/graphql'
+GRAPHQL_EXECUTE_TIMEOUT_SECONDS = 60
+
+# Refresh tokens this many seconds before their actual expiry to avoid races.
+_TOKEN_EXPIRY_SKEW_SECONDS = 60
 
 # For use in case an event doesn't have a vessel dict
 EMPTY_VESSEL_DICT = {
@@ -169,18 +175,34 @@ def build_graphql_client(transport_dict):
     # Create a GraphQL client using the defined transport
     gql_client = GQLClient(
         transport=transport,
-        execute_timeout=60,
+        execute_timeout=GRAPHQL_EXECUTE_TIMEOUT_SECONDS,
         fetch_schema_from_transport=False
     )
     return gql_client
 
 
+def _is_token_expired(access_token: str) -> bool:
+    """Best-effort JWT exp check. Returns True on any parse failure (fail-safe)."""
+    try:
+        payload = access_token.split(".")[1]
+        padded = payload + "=" * ((-len(payload)) % 4)
+        claims = json.loads(base64.urlsafe_b64decode(padded))
+        exp = claims.get("exp")
+        if not exp:
+            return True
+        return datetime.now(tz=timezone.utc).timestamp() >= (exp - _TOKEN_EXPIRY_SKEW_SECONDS)
+    except Exception:
+        return True
+
+
 async def build_request_header(integration, auth, gql_client):
     token_dict = await state_manager.get_state(str(integration.id), "pull_events", auth.username)
 
-    if token_dict:
+    if token_dict and not _is_token_expired(token_dict.get("access_token", "")):
         token_dict = SkylightGetTokenResponse.parse_obj(token_dict)
     else:
+        if token_dict:
+            logger.info(f"Skylight token expired for '{auth.username}', refreshing.")
         token_dict = await get_authentication_token(integration, auth, gql_client)
         await state_manager.set_state(
             str(integration.id),
@@ -241,15 +263,24 @@ async def get_authentication_token(integration, auth, gql_client):
 
 
 def map_event_type(integration, event_type):
+    events_mapping = integration.additional or DEFAULT_EVENT_MAPPING
     try:
-        events_mapping = integration.additional or DEFAULT_EVENT_MAPPING
-        parsed_obj = EventType.parse_obj(events_mapping.get(event_type, {}))
+        return EventType.parse_obj(events_mapping.get(event_type, {}))
     except pydantic.ValidationError as e:
         message = f'Failed to map "{event_type}". Either is invalid or unsupported. {e}'
         logger.warning(message)
-        return "error"
-    else:
-        return parsed_obj
+        raise PullEventsBadConfigException(message)
+
+
+_AUTH_ERROR_CODES = {"UNAUTHENTICATED", "UNAUTHORIZED"}
+
+
+def _gql_error_code(te: TransportQueryError):
+    """Safely extract the error code from a GraphQL TransportQueryError."""
+    try:
+        return (te.errors[0] or {}).get("extensions", {}).get("code")
+    except (IndexError, AttributeError, TypeError):
+        return None
 
 
 @backoff.on_exception(
@@ -257,24 +288,17 @@ def map_event_type(integration, event_type):
     TransportQueryError,
     max_tries=3,
     jitter=backoff.full_jitter,
-    giveup=lambda e: e.errors[0]["extensions"].get("code") not in ["UNAUTHENTICATED", "UNAUTHORIZED"]
+    giveup=lambda e: _gql_error_code(e) not in _AUTH_ERROR_CODES,
 )
 async def execute_gql_query(gql_client, query, params, integration, auth):
     try:
-        result = gql_client.execute(query, variable_values=params)
+        return gql_client.execute(query, variable_values=params)
     except TransportQueryError as te:
-        if te.errors[0]["extensions"].get("code") in ["UNAUTHENTICATED", "UNAUTHORIZED"]:
-            # Currently, if we receive None in the response, there was an unknown error in Skylight API
-            # Will delete token and try again
-            logger.info(f'"getRendedzvousExternal" query returned {te.errors[0]["extensions"].get("code")}, retrying with a new token...')
-            await state_manager.delete_state(
-                str(integration.id),
-                "pull_events",
-                auth.username
-            )
-        raise te
-    else:
-        return result
+        code = _gql_error_code(te)
+        if code in _AUTH_ERROR_CODES:
+            logger.warning(f'"getRendedzvousExternal" query returned {code}, retrying with a new token...')
+            await state_manager.delete_state(str(integration.id), "pull_events", auth.username)
+        raise
 
 
 async def get_skylight_events(integration, config_data, auth):
@@ -283,20 +307,13 @@ async def get_skylight_events(integration, config_data, auth):
         msg = f'Data map JSON not found. Will use default ER map for integration ID: "{str(integration.id)}"'
         logger.warning(msg)
 
-    # GraphQL Client
     default_transport_dict = dict(
-        url=integration.base_url or DEFAULT_SKYLIGHT_API_URL,
+        url=DEFAULT_SKYLIGHT_API_URL,
         verify=True,
     )
-    gql_client = build_graphql_client(default_transport_dict)
-
-    # get Token
-    headers = await build_request_header(integration, auth, gql_client)
-
-    # Add 'header' to GraphQL client
-    transport_dict_with_header = default_transport_dict
-    transport_dict_with_header['headers'] = headers.dict()
-    gql_client = build_graphql_client(transport_dict_with_header)
+    auth_client = build_graphql_client(default_transport_dict)
+    headers = await build_request_header(integration, auth, auth_client)
+    gql_client = build_graphql_client({**default_transport_dict, 'headers': headers.dict()})
 
     events = {}
 
@@ -371,13 +388,11 @@ async def get_skylight_events(integration, config_data, auth):
         """
     )
 
-    # Map event types
-    mapped_event_types = [map_event_type(integration, event_type) for event_type in config_data.event_types]
-
-    if "error" in mapped_event_types:
-        msg = f'Invalid config received for integration ID: {str(integration.id)}'
-        logger.error(msg)
-        raise PullEventsBadConfigException(msg)
+    try:
+        mapped_event_types = [map_event_type(integration, et) for et in config_data.event_types]
+    except PullEventsBadConfigException:
+        logger.error(f'Invalid config received for integration ID: {str(integration.id)}')
+        raise
 
     # Get variables from mapped event types
     event_types = []
@@ -416,15 +431,21 @@ async def get_skylight_events(integration, config_data, auth):
 
                 logger.info(f'Sending "getRendedzvousExternal" query request. Params: "{params}"...')
 
-                response = await execute_gql_query(gql_client, query, params, integration, auth)
+                try:
+                    response = await execute_gql_query(gql_client, query, params, integration, auth)
+                except TransportQueryError as te:
+                    logger.warning(
+                        f'"getRendedzvousExternal" page {page_num} failed for AOI "{aoi}": {te}. '
+                        f'Keeping {len(response_list)} events collected so far.',
+                        extra={"integration_id": str(integration.id), "aoi": aoi}
+                    )
+                    break
 
                 events_response = response['events']['items']
 
                 logger.info(f'"getRendedzvousExternal" query returned: "{events_response}"...')
 
                 if events_response is None:
-                    # Currently, if we receive None in the response, there was an unknown error in Skylight API
-                    # Will delete token and try again
                     logger.info(f'"getRendedzvousExternal" query returned None, retrying with a new token...')
                     await state_manager.delete_state(
                         str(integration.id),
