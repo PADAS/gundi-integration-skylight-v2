@@ -4,9 +4,9 @@ import time
 import pytest
 import httpx
 
-from gql.transport.exceptions import TransportQueryError
+from gql.transport.exceptions import TransportQueryError, TransportServerError
 
-from app.actions.client import execute_gql_query, build_request_header, _is_token_expired, _TOKEN_EXPIRY_SKEW_SECONDS
+from app.actions.client import execute_gql_query, build_request_header, get_skylight_events, _is_token_expired, _TOKEN_EXPIRY_SKEW_SECONDS
 from app.actions.configurations import ProcessEventsPerAOIConfig
 from app.actions.handlers import action_pull_events, action_process_events_per_aoi, process_attachments, transform
 from app.services.state import IntegrationStateManager
@@ -107,6 +107,140 @@ async def test_execute_gql_query_does_not_retry_if_not_unauthorized_code(
     with pytest.raises(TransportQueryError):
         await execute_gql_query(gql_client, query, params, integration, auth)
     assert state_manager.delete_state.call_count == 0
+
+
+# --- get_skylight_events paging / error paths ---
+
+
+class _PullCfg:
+    """Minimal stand-in for PullEventsConfig (map_event_type is patched, so
+    event_types content is irrelevant)."""
+    event_types = ["Fishing"]
+    aoi_ids = ["aoi1"]
+    pageSize = 2
+    initial_data_window_days = 1
+
+
+def _page(items, total, page_size=2, page_num=1):
+    return {"events": {"items": items, "meta": {"total": total, "pageSize": page_size, "pageNum": page_num}}}
+
+
+@pytest.fixture
+def patch_skylight_clients(mocker, state_manager):
+    """Patch the client/header builders and state so get_skylight_events can be
+    driven purely through execute_gql_query."""
+    state_manager.get_state.return_value = None
+    mocker.patch("app.actions.client.state_manager", state_manager)
+    mocker.patch("app.actions.client.build_request_header", return_value=mocker.MagicMock(dict=lambda: {}))
+    build_client = mocker.patch("app.actions.client.build_graphql_client", return_value=mocker.MagicMock())
+    mocker.patch(
+        "app.actions.client.map_event_type",
+        return_value=mocker.MagicMock(skylight_event_type="fishing_activity_history"),
+    )
+    return {"state_manager": state_manager, "build_client": build_client}
+
+
+@pytest.mark.asyncio
+async def test_get_skylight_events_stops_at_last_page_via_meta(mocker, integration, auth, patch_skylight_clients):
+    # total=3, pageSize=2 -> 2 pages. Loop must stop after page 2 (no empty 3rd request).
+    exec_mock = mocker.patch(
+        "app.actions.client.execute_gql_query",
+        side_effect=[
+            _page([{"event_id": "e1"}, {"event_id": "e2"}], total=3, page_num=1),
+            _page([{"event_id": "e3"}], total=3, page_num=2),
+        ],
+    )
+
+    events, _ = await get_skylight_events(integration, _PullCfg(), auth)
+
+    assert exec_mock.call_count == 2
+    assert len(events["aoi1"]) == 3
+
+
+@pytest.mark.asyncio
+async def test_get_skylight_events_skips_failed_page_and_continues(mocker, integration, auth, patch_skylight_clients):
+    # total=6, pageSize=2 -> 3 pages. Page 2 fails; page 1 and 3 are still collected.
+    exec_mock = mocker.patch(
+        "app.actions.client.execute_gql_query",
+        side_effect=[
+            _page([{"event_id": "e1"}, {"event_id": "e2"}], total=6, page_num=1),
+            TransportQueryError("boom", errors=[{"message": "boom"}]),
+            _page([{"event_id": "e5"}, {"event_id": "e6"}], total=6, page_num=3),
+        ],
+    )
+
+    events, _ = await get_skylight_events(integration, _PullCfg(), auth)
+
+    assert exec_mock.call_count == 3
+    collected = [e["event_id"] for e in events["aoi1"]]
+    assert collected == ["e1", "e2", "e5", "e6"]
+
+
+@pytest.mark.asyncio
+async def test_get_skylight_events_breaks_when_first_page_fails(mocker, integration, auth, patch_skylight_clients):
+    # Page 1 fails before total_pages is known -> give up the AOI (no unbounded loop).
+    exec_mock = mocker.patch(
+        "app.actions.client.execute_gql_query",
+        side_effect=[TransportQueryError("boom", errors=[{"message": "boom"}])],
+    )
+
+    events, _ = await get_skylight_events(integration, _PullCfg(), auth)
+
+    assert exec_mock.call_count == 1
+    assert events["aoi1"] == []
+
+
+@pytest.mark.asyncio
+async def test_get_skylight_events_logs_and_skips_server_error(mocker, integration, auth, patch_skylight_clients):
+    # A 500 (TransportServerError) on a later page is logged and skipped, not swallowed silently.
+    exec_mock = mocker.patch(
+        "app.actions.client.execute_gql_query",
+        side_effect=[
+            _page([{"event_id": "e1"}, {"event_id": "e2"}], total=4, page_num=1),
+            TransportServerError("500 Internal Server Error"),
+        ],
+    )
+
+    events, _ = await get_skylight_events(integration, _PullCfg(), auth)
+
+    assert exec_mock.call_count == 2
+    assert [e["event_id"] for e in events["aoi1"]] == ["e1", "e2"]
+
+
+@pytest.mark.asyncio
+async def test_get_skylight_events_retries_once_on_none_with_new_client(mocker, integration, auth, patch_skylight_clients):
+    # First response has None items -> clear token, rebuild client, retry the same page.
+    exec_mock = mocker.patch(
+        "app.actions.client.execute_gql_query",
+        side_effect=[
+            _page(None, total=1, page_num=1),
+            _page([{"event_id": "e1"}], total=1, page_num=1),
+        ],
+    )
+
+    events, _ = await get_skylight_events(integration, _PullCfg(), auth)
+
+    assert exec_mock.call_count == 2
+    patch_skylight_clients["state_manager"].delete_state.assert_called_once()
+    assert len(events["aoi1"]) == 1
+    # build_graphql_client: 1 auth client + 1 initial gql client + 1 rebuilt on retry
+    assert patch_skylight_clients["build_client"].call_count == 3
+
+
+@pytest.mark.asyncio
+async def test_get_skylight_events_gives_up_after_two_none_responses(mocker, integration, auth, patch_skylight_clients):
+    exec_mock = mocker.patch(
+        "app.actions.client.execute_gql_query",
+        side_effect=[
+            _page(None, total=1, page_num=1),
+            _page(None, total=1, page_num=1),
+        ],
+    )
+
+    events, _ = await get_skylight_events(integration, _PullCfg(), auth)
+
+    assert exec_mock.call_count == 2
+    assert events["aoi1"] == []
 
 
 # --- _is_token_expired ---

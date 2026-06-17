@@ -1,15 +1,28 @@
-version: "3.9"
-
 services:
   api:
     container_name: api
     build:
       context: ../
-      dockerfile: ./Dockerfile
+      dockerfile: ./docker/Dockerfile
+    env_file:
+      - ../.env
     ports:
       - 8080:8080
+    depends_on:
+      - redis
     healthcheck:
       test: ["CMD-SHELL", "curl -f http://0.0.0.0:8080/"]
       interval: 15s
       timeout: 15s
       retries: 10
+
+  redis:
+    container_name: redis
+    image: redis:7-alpine
+
+  pubsub_emulator:
+    container_name: pubsub_emulator
+    image: gcr.io/google.com/cloudsdktool/google-cloud-cli:emulators
+    command: gcloud beta emulators pubsub start --host-port=0.0.0.0:8085 --project=local-project
+    ports:
+      - 8085:8085

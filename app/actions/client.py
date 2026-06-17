@@ -15,7 +15,7 @@ from datetime import datetime, timedelta, timezone
 from enum import Enum
 
 from gql import Client as GQLClient, gql
-from gql.transport.exceptions import TransportQueryError
+from gql.transport.exceptions import TransportError, TransportQueryError
 from gql.transport.httpx import HTTPXAsyncTransport, HTTPXTransport
 
 from app.services.errors import ConfigurationNotFound
@@ -156,6 +156,39 @@ def get_pull_config(integration):
             f"are missing. Please fix the integration setup in the portal."
         )
     return PullEventsConfig.parse_obj(pull_config.data)
+
+
+def _redact_headers(headers):
+    """Copy headers with the Authorization token masked, so we can log full
+    request detail without leaking bearer tokens into the logs."""
+    redacted = {}
+    for key, value in headers.items():
+        redacted[key] = "Bearer ***redacted***" if key.lower() == "authorization" else value
+    return redacted
+
+
+def _log_skylight_error_response(response):
+    """httpx response hook: whenever Skylight returns an error (4xx/5xx), log
+    the full request and response (URL, headers, bodies) so the failure is
+    fully diagnosable from the activity logs. Successful responses are not
+    logged here, to avoid noise and dumping large payloads."""
+    if response.status_code < 400:
+        return
+    response.read()
+    request = response.request
+    logger.error(
+        'Skylight returned an error response.\n'
+        'Request: %s %s\nRequest headers: %s\nRequest body: %s\n'
+        'Response status: %s\nResponse headers: %s\nResponse body: %s',
+        request.method,
+        request.url,
+        _redact_headers(request.headers),
+        request.content.decode("utf-8", "replace"),
+        response.status_code,
+        dict(response.headers),
+        response.text,
+        extra={"attention_needed": True},
+    )
 
 
 def build_graphql_client(transport_dict):
@@ -300,7 +333,11 @@ async def get_skylight_events(integration, config_data, auth):
     )
     auth_client = build_graphql_client(default_transport_dict)
     headers = await build_request_header(integration, auth, auth_client)
-    gql_client = build_graphql_client({**default_transport_dict, 'headers': headers.dict()})
+    # Log full request/response detail whenever Skylight returns an error.
+    error_log_hooks = {"response": [_log_skylight_error_response]}
+    gql_client = build_graphql_client(
+        {**default_transport_dict, 'headers': headers.dict(), 'event_hooks': error_log_hooks}
+    )
 
     events = {}
 
@@ -406,9 +443,9 @@ async def get_skylight_events(integration, config_data, auth):
                 ).isoformat()
 
             page_num = 1
-            has_data = True
+            total_pages = None
 
-            while has_data:
+            while total_pages is None or page_num <= total_pages:
                 params = {
                     "eventTypes": event_types,
                     "aoiId": aoi,
@@ -421,12 +458,13 @@ async def get_skylight_events(integration, config_data, auth):
 
                 try:
                     response = await execute_gql_query(gql_client, query, params, integration, auth)
-                except TransportQueryError as te:
-                    # Log as error with attention_needed so this surfaces in
-                    # activity logs. We break rather than raise so a partial
-                    # page failure doesn't abort the entire AOI sync.
+                except TransportError as te:
+                    # Catch the TransportError base so every Skylight transport
+                    # failure is logged — query errors, 500s (TransportServerError),
+                    # protocol errors, etc.
                     logger.error(
-                        f'"getRendedzvousExternal" page {page_num} failed for AOI "{aoi}": {te}. '
+                        f'"getRendedzvousExternal" page {page_num} failed for AOI "{aoi}": '
+                        f'{type(te).__name__}: {te}. '
                         f'Request params: {params}. '
                         f'Keeping {len(response_list)} events collected so far.',
                         extra={
@@ -435,11 +473,20 @@ async def get_skylight_events(integration, config_data, auth):
                             "attention_needed": True,
                         }
                     )
-                    break
+                    # The loop is bounded by total_pages, which we can only learn
+                    # from a SUCCESSFUL response's meta.total — and the first
+                    # success is normally page 1. If we fail before ever getting
+                    # that bound (total_pages is None, i.e. page 1 itself failed),
+                    # there is nothing to stop the loop, so we must give up this
+                    # AOI rather than retry an unknown number of pages forever.
+                    # Once total_pages IS known, a later failed page is safe to
+                    # skip — page_num is still capped by the while condition.
+                    if total_pages is None:
+                        break
+                    page_num += 1
+                    continue
 
                 events_response = response['events']['items']
-
-                logger.info(f'"getRendedzvousExternal" query returned: "{events_response}"...')
 
                 if events_response is None:
                     if none_retries >= 1:
@@ -450,11 +497,17 @@ async def get_skylight_events(integration, config_data, auth):
                         break
                     logger.info(f'"getRendedzvousExternal" query returned None, retrying with a new token...')
                     await state_manager.delete_state(str(integration.id), "pull_events", auth.username)
+                    headers = await build_request_header(integration, auth, auth_client)
+                    gql_client = build_graphql_client(
+                        {**default_transport_dict, 'headers': headers.dict(), 'event_hooks': error_log_hooks}
+                    )
                     none_retries += 1
                     continue
 
-                if not events_response:
-                    has_data = False
+                meta = response['events']['meta']
+                if total_pages is None:
+                    total = meta['total'] or 0
+                    total_pages = (total + meta['pageSize'] - 1) // meta['pageSize']
 
                 response_list.extend(events_response)
                 page_num += 1
