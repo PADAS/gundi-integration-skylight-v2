@@ -281,6 +281,20 @@ async def test_get_skylight_events_gives_up_after_two_none_responses(mocker, int
     assert events["aoi1"] == []
 
 
+@pytest.mark.asyncio
+async def test_get_skylight_events_handles_null_meta(mocker, integration, auth, patch_skylight_clients):
+    # A null meta must not crash the AOI or discard events already collected.
+    exec_mock = mocker.patch(
+        "app.actions.client.execute_gql_query",
+        side_effect=[{"events": {"items": [{"event_id": "e1"}], "meta": None}}],
+    )
+
+    events, _ = await get_skylight_events(integration, _PullCfg(), auth)
+
+    assert exec_mock.call_count == 1
+    assert events["aoi1"] == [{"event_id": "e1"}]
+
+
 # --- map_event_type ---
 
 def test_map_event_type_valid_returns_eventtype(mocker):
@@ -449,6 +463,29 @@ async def test_action_process_events_per_aoi_success(mocker, integration, proces
 
     result = await action_process_events_per_aoi(integration, process_events_config)
     assert result["events_processed"] == 1
+
+
+@pytest.mark.asyncio
+async def test_action_process_events_per_aoi_filters_empty_transforms(mocker, integration, process_events_config, mock_publish_event):
+    # transform() returns {} for skipped events; those must not leak into the
+    # Gundi batch. process_events_config has two events; the first is skipped.
+    mocker.patch("app.services.state.IntegrationStateManager.get_state", return_value=None)
+    mocker.patch("app.services.state.IntegrationStateManager.set_state", return_value=None)
+    mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
+    mocker.patch("app.services.action_runner.publish_event", mock_publish_event)
+    mocker.patch("app.services.action_scheduler.publish_event", mock_publish_event)
+    mocker.patch("app.actions.handlers.transform", side_effect=[{}, {"event_id": "event2"}])
+    send_mock = mocker.patch(
+        "app.actions.handlers.gundi_tools.send_events_to_gundi", return_value=[{"object_id": "event2"}]
+    )
+    mocker.patch("app.actions.handlers.process_attachments", return_value=None)
+    mocker.patch("app.actions.handlers.save_events_state", return_value=None)
+
+    await action_process_events_per_aoi(integration, process_events_config)
+
+    sent_events = send_mock.call_args.kwargs["events"]
+    assert {} not in sent_events
+    assert sent_events == [{"event_id": "event2"}]
 
 @pytest.mark.asyncio
 async def test_action_process_events_per_aoi_failure(mocker, integration, process_events_config, mock_publish_event):

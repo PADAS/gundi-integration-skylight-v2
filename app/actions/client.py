@@ -516,7 +516,10 @@ async def get_skylight_events(integration, config_data, auth):
                 # None responses (not Nones scattered across the AOI) trigger the abort.
                 none_retries = 0
 
-                meta = response['events']['meta']
+                # Guard against a null/absent meta: without this, meta.get()
+                # would raise AttributeError, fall through to the broad except
+                # below, and drop the AOI *including events already collected*.
+                meta = response['events'].get('meta') or {}
                 if total_pages is None:
                     total = meta.get('total') or 0
                     # Use our requested page_size as the divisor (always >= 1),

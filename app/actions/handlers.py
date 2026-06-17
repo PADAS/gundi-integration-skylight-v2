@@ -273,8 +273,15 @@ async def action_process_events_per_aoi(integration, action_config: ProcessEvent
     result = {"events_processed": 0, "details": {}}
     all_responses = []
 
+    # Filter out falsy results: transform() returns {} for events it skips
+    # (e.g. an entry alert with no start point). An empty dict is truthy inside
+    # a list, so it must be filtered here or it would leak into the Gundi batch.
     transformed_data = sorted(
-        [transform(action_config.updated_config_data, event) for event in action_config.events],
+        [
+            transformed
+            for event in action_config.events
+            if (transformed := transform(action_config.updated_config_data, event))
+        ],
         key=lambda x: x.get("recorded_at") or datetime.datetime.min, reverse=True
     )
 
