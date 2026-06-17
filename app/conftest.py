@@ -69,7 +69,7 @@ def process_events_config(mocker):
 def pull_events_config(mocker):
     return PullEventsConfig(
         aoi_ids=["aoi1", "aoi2"],
-        event_types=["event1", "event2"]
+        event_types=["Fishing", "Speed Range"]
     )
 
 

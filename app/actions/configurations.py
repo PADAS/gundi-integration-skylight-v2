@@ -1,8 +1,23 @@
+from enum import Enum
 from re import sub
 from app.actions.core import AuthActionConfiguration, PullActionConfiguration, ExecutableActionMixin, InternalActionConfiguration
 from app.services.utils import GlobalUISchemaOptions
 from typing import List
 from pydantic import Field, validator, SecretStr
+
+
+# Labels shown in the portal's event-type picker. The format_string_case
+# validator on PullEventsConfig.event_types snake_cases these labels (e.g.
+# "Dark Rendezvous" -> "dark_rendezvous"), and the result MUST match a key in
+# DEFAULT_EVENT_MAPPING (client.py). "Dark Activity" is intentionally omitted
+# here: it is deprecated and no longer offered.
+class SkylightEventType(str, Enum):
+    dark_rendezvous = "Dark Rendezvous"
+    vessel_detection = "Vessel Detection"
+    fishing = "Fishing"
+    speed_range = "Speed Range"
+    standard_rendezvous = "Standard Rendezvous"
+    marine_entry = "Marine Entry"
 
 
 class AuthenticateConfig(AuthActionConfiguration, ExecutableActionMixin):
@@ -29,9 +44,10 @@ class PullEventsConfig(PullActionConfiguration):
         title='Area of Interest (AOI) IDs',
         description='IDs of the desired areas.',
     )
-    event_types: List[str] = Field(
+    event_types: List[SkylightEventType] = Field(
         title='Event Types to Fetch',
         description='The list of EventTypes the integration will use.',
+        uniqueItems=True,
     )
     pageSize: int = Field(
         1000,
@@ -46,6 +62,15 @@ class PullEventsConfig(PullActionConfiguration):
 
     @validator('event_types')
     def format_string_case(cls, v):
+        # The portal stores the SkylightEventType display labels (e.g. "Dark Rendezvous").
+        # This validator converts them to snake_case keys (e.g. "dark_rendezvous") that
+        # match DEFAULT_EVENT_MAPPING in client.py.
+        #
+        # This behaviour predates this PR: the portal JSON schema was manually edited to
+        # use these same display labels as enum values long before SkylightEventType was
+        # added to code. The enum simply formalises what was already stored in production.
+        # Verified: all 6 display labels round-trip correctly through this validator and
+        # resolve to a valid DEFAULT_EVENT_MAPPING entry.
         format_string_case_list = [
             '_'.join(
                 sub('([A-Z][a-z]+)', r' \1',

@@ -1,4 +1,5 @@
-import backoff
+import base64
+import json
 import logging
 import pydantic
 
@@ -14,7 +15,7 @@ from datetime import datetime, timedelta, timezone
 from enum import Enum
 
 from gql import Client as GQLClient, gql
-from gql.transport.exceptions import TransportQueryError
+from gql.transport.exceptions import TransportError, TransportQueryError
 from gql.transport.httpx import HTTPXAsyncTransport, HTTPXTransport
 
 from app.services.errors import ConfigurationNotFound
@@ -28,6 +29,10 @@ logger = logging.getLogger(__name__)
 state_manager = IntegrationStateManager()
 
 DEFAULT_SKYLIGHT_API_URL = 'https://api.skylight.earth/graphql'
+GRAPHQL_EXECUTE_TIMEOUT_SECONDS = 60
+
+# Refresh tokens this many seconds before their actual expiry to avoid races.
+_TOKEN_EXPIRY_SKEW_SECONDS = 60
 
 # For use in case an event doesn't have a vessel dict
 EMPTY_VESSEL_DICT = {
@@ -42,6 +47,12 @@ EMPTY_VESSEL_DICT = {
 }
 
 # Default mapping values (for ER destinations)
+# Maps a Skylight event type (the snake_case keys here) to its EarthRanger
+# event type and title. The keys MUST match the values produced by
+# PullEventsConfig.format_string_case (configurations.py), which lower/snake-cases
+# the SkylightEventType enum labels selected in the portal. Three things stay in
+# lockstep: the SkylightEventType enum labels, that validator, and these keys.
+# When adding an event type, update all three.
 DEFAULT_EVENT_MAPPING = {
     "fishing": {
         "event_type": "fishing_alert_rep",
@@ -62,11 +73,6 @@ DEFAULT_EVENT_MAPPING = {
         "event_type": "entry_alert_rep",
         "event_title": "Marine Entry",
         "skylight_event_type": "aoi_visit"
-    },
-    "dark_activity": {
-        "event_type": "dark_activity_alert_rep",
-        "event_title": "Dark Activity",
-        "skylight_event_type": "dark_activity"
     },
     "dark_rendezvous": {
         "event_type": "dark_rendezvous_alert_rep",
@@ -89,17 +95,6 @@ class ERSkylightEventTypes(str, Enum):
     speed_range_alert_rep = 'speed_range_alert_rep'
     standard_rendezvous_alert_rep = 'standard_rendezvous_alert_rep'
     entry_alert_rep = 'entry_alert_rep'
-    dark_activity_alert_rep = 'dark_activity_alert_rep'
-
-
-class SkylightEventTypes(str, Enum):
-    dark_rendezvous = 'dark_rendezvous'
-    detection = 'detection'
-    fishing_activity_history = 'fishing_activity_history'
-    speed_range = 'speed_range'
-    standard_rendezvous = 'standard_rendezvous'
-    aoi_visit = 'aoi_visit'
-    dark_activity = 'dark_activity'
 
 
 class EventType(pydantic.BaseModel):
@@ -163,24 +158,87 @@ def get_pull_config(integration):
     return PullEventsConfig.parse_obj(pull_config.data)
 
 
+def _redact_headers(headers):
+    """Copy headers with the Authorization token masked, so we can log full
+    request detail without leaking bearer tokens into the logs."""
+    redacted = {}
+    for key, value in headers.items():
+        redacted[key] = "Bearer ***redacted***" if key.lower() == "authorization" else value
+    return redacted
+
+
+def _log_skylight_error_response(response):
+    """httpx response hook: whenever Skylight returns an error (4xx/5xx), log
+    the full request and response (URL, headers, bodies) so the failure is
+    fully diagnosable from the activity logs. Successful responses are not
+    logged here, to avoid noise and dumping large payloads.
+
+    Note: this is a synchronous hook for HTTPXTransport (sync). If the transport
+    is ever switched to HTTPXAsyncTransport, this must become async and use
+    `await response.aread()`."""
+    if response.status_code < 400:
+        return
+    response.read()
+    request = response.request
+    logger.error(
+        'Skylight returned an error response.\n'
+        'Request: %s %s\nRequest headers: %s\nRequest body: %s\n'
+        'Response status: %s\nResponse headers: %s\nResponse body: %s',
+        request.method,
+        request.url,
+        _redact_headers(request.headers),
+        request.content.decode("utf-8", "replace"),
+        response.status_code,
+        dict(response.headers),
+        response.text,
+        extra={"attention_needed": True},
+    )
+
+
 def build_graphql_client(transport_dict):
     transport = HTTPXTransport(**transport_dict)
 
     # Create a GraphQL client using the defined transport
     gql_client = GQLClient(
         transport=transport,
-        execute_timeout=60,
+        execute_timeout=GRAPHQL_EXECUTE_TIMEOUT_SECONDS,
         fetch_schema_from_transport=False
     )
     return gql_client
 
 
+def build_events_client(base_transport_dict, headers):
+    """Build the authenticated events GraphQL client, with the error-logging
+    hook attached so any Skylight 4xx/5xx is fully captured."""
+    return build_graphql_client({
+        **base_transport_dict,
+        'headers': headers.dict(),
+        'event_hooks': {"response": [_log_skylight_error_response]},
+    })
+
+
+def _is_token_expired(access_token: str) -> bool:
+    """Best-effort JWT exp check. Returns True on any parse failure (fail-safe)."""
+    try:
+        payload = access_token.split(".")[1]
+        padded = payload + "=" * ((-len(payload)) % 4)
+        claims = json.loads(base64.urlsafe_b64decode(padded))
+        exp = claims.get("exp")
+        if not exp:
+            return True
+        return datetime.now(tz=timezone.utc).timestamp() >= (exp - _TOKEN_EXPIRY_SKEW_SECONDS)
+    except Exception:
+        return True
+
+
 async def build_request_header(integration, auth, gql_client):
     token_dict = await state_manager.get_state(str(integration.id), "pull_events", auth.username)
 
-    if token_dict:
+    if token_dict and not _is_token_expired(token_dict.get("access_token", "")):
         token_dict = SkylightGetTokenResponse.parse_obj(token_dict)
     else:
+        if token_dict:
+            logger.info(f"Skylight token expired for '{auth.username}', refreshing.")
         token_dict = await get_authentication_token(integration, auth, gql_client)
         await state_manager.set_state(
             str(integration.id),
@@ -241,40 +299,40 @@ async def get_authentication_token(integration, auth, gql_client):
 
 
 def map_event_type(integration, event_type):
+    events_mapping = integration.additional or DEFAULT_EVENT_MAPPING
     try:
-        events_mapping = integration.additional or DEFAULT_EVENT_MAPPING
-        parsed_obj = EventType.parse_obj(events_mapping.get(event_type, {}))
+        return EventType.parse_obj(events_mapping.get(event_type, {}))
     except pydantic.ValidationError as e:
         message = f'Failed to map "{event_type}". Either is invalid or unsupported. {e}'
         logger.warning(message)
-        return "error"
-    else:
-        return parsed_obj
+        raise PullEventsBadConfigException(message)
 
 
-@backoff.on_exception(
-    backoff.expo,
-    TransportQueryError,
-    max_tries=3,
-    jitter=backoff.full_jitter,
-    giveup=lambda e: e.errors[0]["extensions"].get("code") not in ["UNAUTHENTICATED", "UNAUTHORIZED"]
-)
+_AUTH_ERROR_CODES = {"UNAUTHENTICATED", "UNAUTHORIZED"}
+
+
+def _gql_error_code(te: TransportQueryError):
+    """Safely extract the error code from a GraphQL TransportQueryError."""
+    try:
+        return (te.errors[0] or {}).get("extensions", {}).get("code")
+    except (IndexError, AttributeError, TypeError):
+        return None
+
+
 async def execute_gql_query(gql_client, query, params, integration, auth):
     try:
-        result = gql_client.execute(query, variable_values=params)
+        return gql_client.execute(query, variable_values=params)
     except TransportQueryError as te:
-        if te.errors[0]["extensions"].get("code") in ["UNAUTHENTICATED", "UNAUTHORIZED"]:
-            # Currently, if we receive None in the response, there was an unknown error in Skylight API
-            # Will delete token and try again
-            logger.info(f'"getRendedzvousExternal" query returned {te.errors[0]["extensions"].get("code")}, retrying with a new token...')
-            await state_manager.delete_state(
-                str(integration.id),
-                "pull_events",
-                auth.username
-            )
-        raise te
-    else:
-        return result
+        code = _gql_error_code(te)
+        if code in _AUTH_ERROR_CODES:
+            # Delete the cached token so the next action run re-authenticates.
+            # We do not retry here: the gql_client transport headers already
+            # hold the stale token, so retrying with the same client would fail
+            # identically. The proactive _is_token_expired check in
+            # build_request_header prevents this path in the common case.
+            logger.warning(f'"getRendedzvousExternal" query returned {code}, clearing token for next run.')
+            await state_manager.delete_state(str(integration.id), "pull_events", auth.username)
+        raise
 
 
 async def get_skylight_events(integration, config_data, auth):
@@ -283,20 +341,13 @@ async def get_skylight_events(integration, config_data, auth):
         msg = f'Data map JSON not found. Will use default ER map for integration ID: "{str(integration.id)}"'
         logger.warning(msg)
 
-    # GraphQL Client
     default_transport_dict = dict(
-        url=integration.base_url or DEFAULT_SKYLIGHT_API_URL,
+        url=DEFAULT_SKYLIGHT_API_URL,
         verify=True,
     )
-    gql_client = build_graphql_client(default_transport_dict)
-
-    # get Token
-    headers = await build_request_header(integration, auth, gql_client)
-
-    # Add 'header' to GraphQL client
-    transport_dict_with_header = default_transport_dict
-    transport_dict_with_header['headers'] = headers.dict()
-    gql_client = build_graphql_client(transport_dict_with_header)
+    auth_client = build_graphql_client(default_transport_dict)
+    headers = await build_request_header(integration, auth, auth_client)
+    gql_client = build_events_client(default_transport_dict, headers)
 
     events = {}
 
@@ -309,11 +360,11 @@ async def get_skylight_events(integration, config_data, auth):
             $startTime: String
             $pageSize: Int
             $pageNum: Int
-        ) 
+        )
         {
             events(
-                eventTypes: $eventTypes, 
-                aoiId: $aoiId, 
+                eventTypes: $eventTypes,
+                aoiId: $aoiId,
                 startTime: $startTime
                 pageSize: $pageSize
                 pageNum: $pageNum
@@ -371,13 +422,11 @@ async def get_skylight_events(integration, config_data, auth):
         """
     )
 
-    # Map event types
-    mapped_event_types = [map_event_type(integration, event_type) for event_type in config_data.event_types]
-
-    if "error" in mapped_event_types:
-        msg = f'Invalid config received for integration ID: {str(integration.id)}'
-        logger.error(msg)
-        raise PullEventsBadConfigException(msg)
+    try:
+        mapped_event_types = [map_event_type(integration, et) for et in config_data.event_types]
+    except PullEventsBadConfigException:
+        logger.error(f'Invalid config received for integration ID: {str(integration.id)}')
+        raise
 
     # Get variables from mapped event types
     event_types = []
@@ -393,6 +442,7 @@ async def get_skylight_events(integration, config_data, auth):
     for aoi in aoi_ids:
         try:
             response_list = []
+            none_retries = 0
             saved_aoi_start_time = await state_manager.get_state(str(integration.id), "pull_events", aoi)
             if saved_aoi_start_time:
                 start_time = dp(saved_aoi_start_time.get("start_time")).isoformat()
@@ -403,9 +453,9 @@ async def get_skylight_events(integration, config_data, auth):
                 ).isoformat()
 
             page_num = 1
-            has_data = True
+            total_pages = None
 
-            while has_data:
+            while total_pages is None or page_num <= total_pages:
                 params = {
                     "eventTypes": event_types,
                     "aoiId": aoi,
@@ -416,25 +466,66 @@ async def get_skylight_events(integration, config_data, auth):
 
                 logger.info(f'Sending "getRendedzvousExternal" query request. Params: "{params}"...')
 
-                response = await execute_gql_query(gql_client, query, params, integration, auth)
+                try:
+                    response = await execute_gql_query(gql_client, query, params, integration, auth)
+                except TransportError as te:
+                    # Catch the TransportError base so every Skylight transport
+                    # failure is logged — query errors, 500s (TransportServerError),
+                    # protocol errors, etc.
+                    logger.error(
+                        f'"getRendedzvousExternal" page {page_num} failed for AOI "{aoi}": '
+                        f'{type(te).__name__}: {te}. '
+                        f'Request params: {params}. '
+                        f'Keeping {len(response_list)} events collected so far.',
+                        extra={
+                            "integration_id": str(integration.id),
+                            "aoi": aoi,
+                            "attention_needed": True,
+                        }
+                    )
+                    # The loop is bounded by total_pages, which we can only learn
+                    # from a SUCCESSFUL response's meta.total — and the first
+                    # success is normally page 1. If we fail before ever getting
+                    # that bound (total_pages is None, i.e. page 1 itself failed),
+                    # there is nothing to stop the loop, so we must give up this
+                    # AOI rather than retry an unknown number of pages forever.
+                    # Once total_pages IS known, a later failed page is safe to
+                    # skip — page_num is still capped by the while condition.
+                    if total_pages is None:
+                        break
+                    page_num += 1
+                    continue
 
                 events_response = response['events']['items']
 
-                logger.info(f'"getRendedzvousExternal" query returned: "{events_response}"...')
-
                 if events_response is None:
-                    # Currently, if we receive None in the response, there was an unknown error in Skylight API
-                    # Will delete token and try again
+                    if none_retries >= 1:
+                        logger.error(
+                            f'"getRendedzvousExternal" returned None twice for AOI "{aoi}", giving up.',
+                            extra={"integration_id": str(integration.id), "aoi": aoi, "attention_needed": True}
+                        )
+                        break
                     logger.info(f'"getRendedzvousExternal" query returned None, retrying with a new token...')
-                    await state_manager.delete_state(
-                        str(integration.id),
-                        "pull_events",
-                        auth.username
-                    )
-                    return await get_skylight_events(integration, config_data, auth)
+                    await state_manager.delete_state(str(integration.id), "pull_events", auth.username)
+                    headers = await build_request_header(integration, auth, auth_client)
+                    gql_client = build_events_client(default_transport_dict, headers)
+                    none_retries += 1
+                    continue
 
-                if not events_response:
-                    has_data = False
+                # Successful page: reset the None counter so only *consecutive*
+                # None responses (not Nones scattered across the AOI) trigger the abort.
+                none_retries = 0
+
+                # Guard against a null/absent meta: without this, meta.get()
+                # would raise AttributeError, fall through to the broad except
+                # below, and drop the AOI *including events already collected*.
+                meta = response['events'].get('meta') or {}
+                if total_pages is None:
+                    total = meta.get('total') or 0
+                    # Use our requested page_size as the divisor (always >= 1),
+                    # not the echoed meta['pageSize'], to avoid a ZeroDivisionError
+                    # if Skylight ever returns pageSize: 0.
+                    total_pages = (total + page_size - 1) // page_size
 
                 response_list.extend(events_response)
                 page_num += 1

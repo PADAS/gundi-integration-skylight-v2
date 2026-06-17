@@ -1,12 +1,31 @@
+import base64
+import json
+import time
 import pytest
 import httpx
 
-from gql.transport.exceptions import TransportQueryError
+from gql.transport.exceptions import TransportQueryError, TransportServerError
 
-from app.actions.client import execute_gql_query
+from app.actions.client import (
+    execute_gql_query,
+    build_request_header,
+    get_skylight_events,
+    map_event_type,
+    _is_token_expired,
+    _redact_headers,
+    _log_skylight_error_response,
+    PullEventsBadConfigException,
+    _TOKEN_EXPIRY_SKEW_SECONDS,
+)
 from app.actions.configurations import ProcessEventsPerAOIConfig
 from app.actions.handlers import action_pull_events, action_process_events_per_aoi, process_attachments, transform
 from app.services.state import IntegrationStateManager
+
+
+def _make_jwt(exp: int) -> str:
+    """Build a minimal unsigned JWT with a given exp timestamp."""
+    payload = base64.urlsafe_b64encode(json.dumps({"exp": exp}).encode()).rstrip(b"=").decode()
+    return f"header.{payload}.sig"
 
 @pytest.fixture
 def integration(mocker):
@@ -41,7 +60,10 @@ async def test_execute_gql_query_success(mocker, gql_client, integration, auth):
     assert response == {"data": "response"}
 
 @pytest.mark.asyncio
-async def test_execute_gql_query_retry_on_unauthorized(mocker, gql_client, integration, auth, state_manager):
+async def test_execute_gql_query_clears_token_on_unauthorized(mocker, gql_client, integration, auth, state_manager):
+    # On UNAUTHORIZED: state is deleted once (so next run re-auths) and the
+    # error is re-raised. No retry — the stale token is still in gql_client's
+    # transport headers, so retrying with the same client would fail identically.
     gql_client.execute = mocker.MagicMock(
         side_effect=TransportQueryError(
             "Error",
@@ -54,11 +76,11 @@ async def test_execute_gql_query_retry_on_unauthorized(mocker, gql_client, integ
     mocker.patch("app.actions.client.state_manager", state_manager)
     with pytest.raises(TransportQueryError):
         await execute_gql_query(gql_client, query, params, integration, auth)
-    assert state_manager.delete_state.call_count == 3
+    assert state_manager.delete_state.call_count == 1
 
 
 @pytest.mark.asyncio
-async def test_execute_gql_query_delete_state_on_retry(mocker, gql_client, integration, auth, state_manager):
+async def test_execute_gql_query_clears_token_on_unauthenticated(mocker, gql_client, integration, auth, state_manager):
     gql_client.execute = mocker.MagicMock(
         side_effect=TransportQueryError(
             "Error",
@@ -71,7 +93,7 @@ async def test_execute_gql_query_delete_state_on_retry(mocker, gql_client, integ
     mocker.patch("app.actions.client.state_manager", state_manager)
     with pytest.raises(TransportQueryError):
         await execute_gql_query(gql_client, query, params, integration, auth)
-    assert state_manager.delete_state.call_count == 3
+    assert state_manager.delete_state.call_count == 1
 
 
 @pytest.mark.asyncio
@@ -97,6 +119,335 @@ async def test_execute_gql_query_does_not_retry_if_not_unauthorized_code(
     assert state_manager.delete_state.call_count == 0
 
 
+# --- get_skylight_events paging / error paths ---
+
+
+class _PullCfg:
+    """Minimal stand-in for PullEventsConfig (map_event_type is patched, so
+    event_types content is irrelevant)."""
+    event_types = ["Fishing"]
+    aoi_ids = ["aoi1"]
+    pageSize = 2
+    initial_data_window_days = 1
+
+
+def _page(items, total, page_size=2, page_num=1):
+    return {"events": {"items": items, "meta": {"total": total, "pageSize": page_size, "pageNum": page_num}}}
+
+
+@pytest.fixture
+def patch_skylight_clients(mocker, state_manager):
+    """Patch the client/header builders and state so get_skylight_events can be
+    driven purely through execute_gql_query."""
+    state_manager.get_state.return_value = None
+    mocker.patch("app.actions.client.state_manager", state_manager)
+    mocker.patch("app.actions.client.build_request_header", return_value=mocker.MagicMock(dict=lambda: {}))
+    build_client = mocker.patch("app.actions.client.build_graphql_client", return_value=mocker.MagicMock())
+    mocker.patch(
+        "app.actions.client.map_event_type",
+        return_value=mocker.MagicMock(skylight_event_type="fishing_activity_history"),
+    )
+    return {"state_manager": state_manager, "build_client": build_client}
+
+
+@pytest.mark.asyncio
+async def test_get_skylight_events_stops_at_last_page_via_meta(mocker, integration, auth, patch_skylight_clients):
+    # total=3, pageSize=2 -> 2 pages. Loop must stop after page 2 (no empty 3rd request).
+    exec_mock = mocker.patch(
+        "app.actions.client.execute_gql_query",
+        side_effect=[
+            _page([{"event_id": "e1"}, {"event_id": "e2"}], total=3, page_num=1),
+            _page([{"event_id": "e3"}], total=3, page_num=2),
+        ],
+    )
+
+    events, _ = await get_skylight_events(integration, _PullCfg(), auth)
+
+    assert exec_mock.call_count == 2
+    assert len(events["aoi1"]) == 3
+
+
+@pytest.mark.asyncio
+async def test_get_skylight_events_skips_failed_page_and_continues(mocker, integration, auth, patch_skylight_clients):
+    # total=6, pageSize=2 -> 3 pages. Page 2 fails; page 1 and 3 are still collected.
+    exec_mock = mocker.patch(
+        "app.actions.client.execute_gql_query",
+        side_effect=[
+            _page([{"event_id": "e1"}, {"event_id": "e2"}], total=6, page_num=1),
+            TransportQueryError("boom", errors=[{"message": "boom"}]),
+            _page([{"event_id": "e5"}, {"event_id": "e6"}], total=6, page_num=3),
+        ],
+    )
+
+    events, _ = await get_skylight_events(integration, _PullCfg(), auth)
+
+    assert exec_mock.call_count == 3
+    collected = [e["event_id"] for e in events["aoi1"]]
+    assert collected == ["e1", "e2", "e5", "e6"]
+
+
+@pytest.mark.asyncio
+async def test_get_skylight_events_breaks_when_first_page_fails(mocker, integration, auth, patch_skylight_clients):
+    # Page 1 fails before total_pages is known -> give up the AOI (no unbounded loop).
+    exec_mock = mocker.patch(
+        "app.actions.client.execute_gql_query",
+        side_effect=[TransportQueryError("boom", errors=[{"message": "boom"}])],
+    )
+
+    events, _ = await get_skylight_events(integration, _PullCfg(), auth)
+
+    assert exec_mock.call_count == 1
+    assert events["aoi1"] == []
+
+
+@pytest.mark.asyncio
+async def test_get_skylight_events_logs_and_skips_server_error(mocker, integration, auth, patch_skylight_clients):
+    # A 500 (TransportServerError) on a later page is logged and skipped, not swallowed silently.
+    exec_mock = mocker.patch(
+        "app.actions.client.execute_gql_query",
+        side_effect=[
+            _page([{"event_id": "e1"}, {"event_id": "e2"}], total=4, page_num=1),
+            TransportServerError("500 Internal Server Error"),
+        ],
+    )
+    log = mocker.patch("app.actions.client.logger")
+
+    events, _ = await get_skylight_events(integration, _PullCfg(), auth)
+
+    assert exec_mock.call_count == 2
+    assert [e["event_id"] for e in events["aoi1"]] == ["e1", "e2"]
+    # The skipped page must be logged with attention_needed so it surfaces in activity logs.
+    assert any(
+        "failed for AOI" in str(call) and call.kwargs.get("extra", {}).get("attention_needed")
+        for call in log.error.call_args_list
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_skylight_events_resets_none_counter_after_success(mocker, integration, auth, patch_skylight_clients):
+    # Non-consecutive Nones must NOT abort: a None on page 1 (recovered via retry)
+    # should not count against a later None on page 3.
+    exec_mock = mocker.patch(
+        "app.actions.client.execute_gql_query",
+        side_effect=[
+            _page(None, total=6, page_num=1),                                  # page 1: None -> retry
+            _page([{"event_id": "e1"}, {"event_id": "e2"}], total=6, page_num=1),  # page 1 retry: ok
+            _page([{"event_id": "e3"}, {"event_id": "e4"}], total=6, page_num=2),  # page 2: ok
+            _page(None, total=6, page_num=3),                                  # page 3: None -> retry (counter was reset)
+            _page([{"event_id": "e5"}, {"event_id": "e6"}], total=6, page_num=3),  # page 3 retry: ok
+        ],
+    )
+
+    events, _ = await get_skylight_events(integration, _PullCfg(), auth)
+
+    # If the counter weren't reset, the page-3 None would have aborted the AOI.
+    assert exec_mock.call_count == 5
+    assert [e["event_id"] for e in events["aoi1"]] == ["e1", "e2", "e3", "e4", "e5", "e6"]
+
+
+@pytest.mark.asyncio
+async def test_get_skylight_events_retries_once_on_none_with_new_client(mocker, integration, auth, patch_skylight_clients):
+    # First response has None items -> clear token, rebuild client, retry the same page.
+    exec_mock = mocker.patch(
+        "app.actions.client.execute_gql_query",
+        side_effect=[
+            _page(None, total=1, page_num=1),
+            _page([{"event_id": "e1"}], total=1, page_num=1),
+        ],
+    )
+
+    events, _ = await get_skylight_events(integration, _PullCfg(), auth)
+
+    assert exec_mock.call_count == 2
+    patch_skylight_clients["state_manager"].delete_state.assert_called_once()
+    assert len(events["aoi1"]) == 1
+    # build_graphql_client: 1 auth client + 1 initial gql client + 1 rebuilt on retry
+    assert patch_skylight_clients["build_client"].call_count == 3
+
+
+@pytest.mark.asyncio
+async def test_get_skylight_events_gives_up_after_two_none_responses(mocker, integration, auth, patch_skylight_clients):
+    exec_mock = mocker.patch(
+        "app.actions.client.execute_gql_query",
+        side_effect=[
+            _page(None, total=1, page_num=1),
+            _page(None, total=1, page_num=1),
+        ],
+    )
+
+    events, _ = await get_skylight_events(integration, _PullCfg(), auth)
+
+    assert exec_mock.call_count == 2
+    assert events["aoi1"] == []
+
+
+@pytest.mark.asyncio
+async def test_get_skylight_events_handles_null_meta(mocker, integration, auth, patch_skylight_clients):
+    # A null meta must not crash the AOI or discard events already collected.
+    exec_mock = mocker.patch(
+        "app.actions.client.execute_gql_query",
+        side_effect=[{"events": {"items": [{"event_id": "e1"}], "meta": None}}],
+    )
+
+    events, _ = await get_skylight_events(integration, _PullCfg(), auth)
+
+    assert exec_mock.call_count == 1
+    assert events["aoi1"] == [{"event_id": "e1"}]
+
+
+# --- map_event_type ---
+
+def test_map_event_type_valid_returns_eventtype(mocker):
+    integration = mocker.MagicMock(additional=None)  # falls back to DEFAULT_EVENT_MAPPING
+    result = map_event_type(integration, "fishing")
+    assert result.event_type == "fishing_alert_rep"
+    assert result.skylight_event_type == "fishing_activity_history"
+
+
+def test_map_event_type_unknown_raises(mocker):
+    integration = mocker.MagicMock(additional=None)
+    with pytest.raises(PullEventsBadConfigException):
+        map_event_type(integration, "not_a_real_event_type")
+
+
+# --- error-response logging hook ---
+
+def _make_response(mocker, status_code):
+    request = mocker.MagicMock(
+        method="POST",
+        url="https://api.skylight.earth/graphql",
+        headers={"Authorization": "Bearer super-secret-token", "Content-Type": "application/json"},
+        content=b'{"query": "getRendedzvousExternal"}',
+    )
+    return mocker.MagicMock(
+        status_code=status_code,
+        headers={"content-type": "application/json"},
+        text="Internal Server Error",
+        request=request,
+    )
+
+
+def test_redact_headers_masks_authorization():
+    redacted = _redact_headers({"Authorization": "Bearer secret-123", "Content-Type": "application/json"})
+    assert redacted["Authorization"] == "Bearer ***redacted***"
+    assert redacted["Content-Type"] == "application/json"
+
+
+def test_redact_headers_is_case_insensitive():
+    assert _redact_headers({"authorization": "Bearer x"})["authorization"] == "Bearer ***redacted***"
+
+
+def test_log_skylight_error_response_logs_full_detail_on_error(mocker):
+    response = _make_response(mocker, 500)
+    log = mocker.patch("app.actions.client.logger")
+
+    _log_skylight_error_response(response)
+
+    response.read.assert_called_once()
+    log.error.assert_called_once()
+    # The bearer token must be redacted, never logged in the clear.
+    logged = str(log.error.call_args)
+    assert "super-secret-token" not in logged
+    assert "***redacted***" in logged
+
+
+def test_log_skylight_error_response_silent_on_success(mocker):
+    response = _make_response(mocker, 200)
+    log = mocker.patch("app.actions.client.logger")
+
+    _log_skylight_error_response(response)
+
+    log.error.assert_not_called()
+    response.read.assert_not_called()
+
+
+# --- _is_token_expired ---
+
+def test_is_token_expired_returns_false_for_valid_token():
+    future_exp = int(time.time()) + 3600  # expires in 1 hour
+    token = _make_jwt(future_exp)
+    assert _is_token_expired(token) is False
+
+
+def test_is_token_expired_returns_true_within_skew_window():
+    # Token expires in 30s — within the 60s skew, so should be treated as expired
+    soon_exp = int(time.time()) + (_TOKEN_EXPIRY_SKEW_SECONDS - 30)
+    token = _make_jwt(soon_exp)
+    assert _is_token_expired(token) is True
+
+
+def test_is_token_expired_returns_true_for_expired_token():
+    past_exp = int(time.time()) - 60
+    token = _make_jwt(past_exp)
+    assert _is_token_expired(token) is True
+
+
+def test_is_token_expired_returns_true_for_unparsable_token():
+    assert _is_token_expired("not.a.jwt") is True
+
+
+def test_is_token_expired_returns_true_for_empty_token():
+    assert _is_token_expired("") is True
+
+
+# --- build_request_header ---
+
+@pytest.mark.asyncio
+async def test_build_request_header_reuses_valid_cached_token(mocker, integration, auth, gql_client, state_manager):
+    future_exp = int(time.time()) + 3600
+    cached = {"access_token": _make_jwt(future_exp), "expires_in": 3600, "token_type": "Bearer"}
+    state_manager.get_state.return_value = cached
+    mocker.patch("app.actions.client.state_manager", state_manager)
+    get_auth = mocker.patch("app.actions.client.get_authentication_token")
+
+    header = await build_request_header(integration, auth, gql_client)
+
+    get_auth.assert_not_called()
+    assert "Bearer" in header.Authorization
+
+
+@pytest.mark.asyncio
+async def test_build_request_header_refreshes_expired_token(mocker, integration, auth, gql_client, state_manager):
+    past_exp = int(time.time()) - 60
+    cached = {"access_token": _make_jwt(past_exp), "expires_in": 3600, "token_type": "Bearer"}
+    state_manager.get_state.return_value = cached
+    mocker.patch("app.actions.client.state_manager", state_manager)
+
+    from app.actions.client import SkylightGetTokenResponse
+    new_token = SkylightGetTokenResponse(
+        access_token=_make_jwt(int(time.time()) + 3600),
+        expires_in=3600,
+        token_type="Bearer",
+    )
+    get_auth = mocker.patch("app.actions.client.get_authentication_token", return_value=new_token)
+
+    header = await build_request_header(integration, auth, gql_client)
+
+    get_auth.assert_called_once()
+    state_manager.set_state.assert_called_once()
+    assert "Bearer" in header.Authorization
+
+
+@pytest.mark.asyncio
+async def test_build_request_header_fetches_token_when_no_cache(mocker, integration, auth, gql_client, state_manager):
+    state_manager.get_state.return_value = None
+    mocker.patch("app.actions.client.state_manager", state_manager)
+
+    from app.actions.client import SkylightGetTokenResponse
+    new_token = SkylightGetTokenResponse(
+        access_token=_make_jwt(int(time.time()) + 3600),
+        expires_in=3600,
+        token_type="Bearer",
+    )
+    get_auth = mocker.patch("app.actions.client.get_authentication_token", return_value=new_token)
+
+    header = await build_request_header(integration, auth, gql_client)
+
+    get_auth.assert_called_once()
+    state_manager.set_state.assert_called_once()
+    assert "Bearer" in header.Authorization
+
+
 @pytest.mark.asyncio
 async def test_action_process_events_per_aoi_success(mocker, integration, process_events_config, mock_publish_event):
     mocker.patch("app.services.state.IntegrationStateManager.get_state", return_value=None)
@@ -112,6 +463,29 @@ async def test_action_process_events_per_aoi_success(mocker, integration, proces
 
     result = await action_process_events_per_aoi(integration, process_events_config)
     assert result["events_processed"] == 1
+
+
+@pytest.mark.asyncio
+async def test_action_process_events_per_aoi_filters_empty_transforms(mocker, integration, process_events_config, mock_publish_event):
+    # transform() returns {} for skipped events; those must not leak into the
+    # Gundi batch. process_events_config has two events; the first is skipped.
+    mocker.patch("app.services.state.IntegrationStateManager.get_state", return_value=None)
+    mocker.patch("app.services.state.IntegrationStateManager.set_state", return_value=None)
+    mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
+    mocker.patch("app.services.action_runner.publish_event", mock_publish_event)
+    mocker.patch("app.services.action_scheduler.publish_event", mock_publish_event)
+    mocker.patch("app.actions.handlers.transform", side_effect=[{}, {"event_id": "event2"}])
+    send_mock = mocker.patch(
+        "app.actions.handlers.gundi_tools.send_events_to_gundi", return_value=[{"object_id": "event2"}]
+    )
+    mocker.patch("app.actions.handlers.process_attachments", return_value=None)
+    mocker.patch("app.actions.handlers.save_events_state", return_value=None)
+
+    await action_process_events_per_aoi(integration, process_events_config)
+
+    sent_events = send_mock.call_args.kwargs["events"]
+    assert {} not in sent_events
+    assert sent_events == [{"event_id": "event2"}]
 
 @pytest.mark.asyncio
 async def test_action_process_events_per_aoi_failure(mocker, integration, process_events_config, mock_publish_event):
@@ -244,3 +618,56 @@ def test_transform_without_vessel_info(skylight_client):
     result = transform(config, data)
     assert result["event_details"]["vessel_0_id"] == "N/A"
     assert result["event_details"]["vessel_0_name"] == "N/A"
+
+
+# --- Entry alert (aoi_visit) transform ---
+
+_ENTRY_ALERT_CONFIG = [{"skylight_event_type": "aoi_visit", "event_title": "Marine Entry", "event_type": "entry_alert_rep"}]
+
+
+def test_transform_entry_alert_start_and_end():
+    """location and recorded_at come from start; exit_date and duration_in_area computed from end."""
+    data = {
+        "event_id": "evt1",
+        "event_type": "aoi_visit",
+        "event_details": {},
+        "vessels": {},
+        "start": {"point": {"lat": 1.0, "lon": 104.0}, "time": "2026-06-01T00:00:00Z"},
+        "end": {"point": {"lat": 1.1, "lon": 104.1}, "time": "2026-06-01T02:30:00Z"},
+    }
+    result = transform(_ENTRY_ALERT_CONFIG, data)
+
+    assert result["recorded_at"].isoformat().startswith("2026-06-01T00:00:00")
+    assert result["location"] == {"lat": 1.0, "lon": 104.0}
+    assert result["event_details"]["exit_date"] == "2026-06-01T02:30:00Z"
+    assert result["event_details"]["duration_in_area"] == 2.5
+
+
+def test_transform_entry_alert_start_only_pending():
+    """When vessel has not exited, exit_date and duration_in_area are 'Pending'."""
+    data = {
+        "event_id": "evt2",
+        "event_type": "aoi_visit",
+        "event_details": {},
+        "vessels": {},
+        "start": {"point": {"lat": 2.0, "lon": 105.0}, "time": "2026-06-01T06:00:00Z"},
+    }
+    result = transform(_ENTRY_ALERT_CONFIG, data)
+
+    assert result["recorded_at"].isoformat().startswith("2026-06-01T06:00:00")
+    assert result["location"] == {"lat": 2.0, "lon": 105.0}
+    assert result["event_details"]["exit_date"] == "Pending"
+    assert result["event_details"]["duration_in_area"] == "Pending"
+
+
+def test_transform_entry_alert_no_start_returns_empty():
+    """An entry alert with no start point is invalid — transform returns {}."""
+    data = {
+        "event_id": "evt3",
+        "event_type": "aoi_visit",
+        "event_details": {},
+        "vessels": {},
+        "end": {"point": {"lat": 1.0, "lon": 104.0}, "time": "2026-06-01T02:00:00Z"},
+    }
+    result = transform(_ENTRY_ALERT_CONFIG, data)
+    assert result == {}
