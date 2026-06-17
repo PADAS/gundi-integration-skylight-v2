@@ -6,7 +6,17 @@ import httpx
 
 from gql.transport.exceptions import TransportQueryError, TransportServerError
 
-from app.actions.client import execute_gql_query, build_request_header, get_skylight_events, _is_token_expired, _TOKEN_EXPIRY_SKEW_SECONDS
+from app.actions.client import (
+    execute_gql_query,
+    build_request_header,
+    get_skylight_events,
+    map_event_type,
+    _is_token_expired,
+    _redact_headers,
+    _log_skylight_error_response,
+    PullEventsBadConfigException,
+    _TOKEN_EXPIRY_SKEW_SECONDS,
+)
 from app.actions.configurations import ProcessEventsPerAOIConfig
 from app.actions.handlers import action_pull_events, action_process_events_per_aoi, process_attachments, transform
 from app.services.state import IntegrationStateManager
@@ -200,11 +210,39 @@ async def test_get_skylight_events_logs_and_skips_server_error(mocker, integrati
             TransportServerError("500 Internal Server Error"),
         ],
     )
+    log = mocker.patch("app.actions.client.logger")
 
     events, _ = await get_skylight_events(integration, _PullCfg(), auth)
 
     assert exec_mock.call_count == 2
     assert [e["event_id"] for e in events["aoi1"]] == ["e1", "e2"]
+    # The skipped page must be logged with attention_needed so it surfaces in activity logs.
+    assert any(
+        "failed for AOI" in str(call) and call.kwargs.get("extra", {}).get("attention_needed")
+        for call in log.error.call_args_list
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_skylight_events_resets_none_counter_after_success(mocker, integration, auth, patch_skylight_clients):
+    # Non-consecutive Nones must NOT abort: a None on page 1 (recovered via retry)
+    # should not count against a later None on page 3.
+    exec_mock = mocker.patch(
+        "app.actions.client.execute_gql_query",
+        side_effect=[
+            _page(None, total=6, page_num=1),                                  # page 1: None -> retry
+            _page([{"event_id": "e1"}, {"event_id": "e2"}], total=6, page_num=1),  # page 1 retry: ok
+            _page([{"event_id": "e3"}, {"event_id": "e4"}], total=6, page_num=2),  # page 2: ok
+            _page(None, total=6, page_num=3),                                  # page 3: None -> retry (counter was reset)
+            _page([{"event_id": "e5"}, {"event_id": "e6"}], total=6, page_num=3),  # page 3 retry: ok
+        ],
+    )
+
+    events, _ = await get_skylight_events(integration, _PullCfg(), auth)
+
+    # If the counter weren't reset, the page-3 None would have aborted the AOI.
+    assert exec_mock.call_count == 5
+    assert [e["event_id"] for e in events["aoi1"]] == ["e1", "e2", "e3", "e4", "e5", "e6"]
 
 
 @pytest.mark.asyncio
@@ -241,6 +279,72 @@ async def test_get_skylight_events_gives_up_after_two_none_responses(mocker, int
 
     assert exec_mock.call_count == 2
     assert events["aoi1"] == []
+
+
+# --- map_event_type ---
+
+def test_map_event_type_valid_returns_eventtype(mocker):
+    integration = mocker.MagicMock(additional=None)  # falls back to DEFAULT_EVENT_MAPPING
+    result = map_event_type(integration, "fishing")
+    assert result.event_type == "fishing_alert_rep"
+    assert result.skylight_event_type == "fishing_activity_history"
+
+
+def test_map_event_type_unknown_raises(mocker):
+    integration = mocker.MagicMock(additional=None)
+    with pytest.raises(PullEventsBadConfigException):
+        map_event_type(integration, "not_a_real_event_type")
+
+
+# --- error-response logging hook ---
+
+def _make_response(mocker, status_code):
+    request = mocker.MagicMock(
+        method="POST",
+        url="https://api.skylight.earth/graphql",
+        headers={"Authorization": "Bearer super-secret-token", "Content-Type": "application/json"},
+        content=b'{"query": "getRendedzvousExternal"}',
+    )
+    return mocker.MagicMock(
+        status_code=status_code,
+        headers={"content-type": "application/json"},
+        text="Internal Server Error",
+        request=request,
+    )
+
+
+def test_redact_headers_masks_authorization():
+    redacted = _redact_headers({"Authorization": "Bearer secret-123", "Content-Type": "application/json"})
+    assert redacted["Authorization"] == "Bearer ***redacted***"
+    assert redacted["Content-Type"] == "application/json"
+
+
+def test_redact_headers_is_case_insensitive():
+    assert _redact_headers({"authorization": "Bearer x"})["authorization"] == "Bearer ***redacted***"
+
+
+def test_log_skylight_error_response_logs_full_detail_on_error(mocker):
+    response = _make_response(mocker, 500)
+    log = mocker.patch("app.actions.client.logger")
+
+    _log_skylight_error_response(response)
+
+    response.read.assert_called_once()
+    log.error.assert_called_once()
+    # The bearer token must be redacted, never logged in the clear.
+    logged = str(log.error.call_args)
+    assert "super-secret-token" not in logged
+    assert "***redacted***" in logged
+
+
+def test_log_skylight_error_response_silent_on_success(mocker):
+    response = _make_response(mocker, 200)
+    log = mocker.patch("app.actions.client.logger")
+
+    _log_skylight_error_response(response)
+
+    log.error.assert_not_called()
+    response.read.assert_not_called()
 
 
 # --- _is_token_expired ---

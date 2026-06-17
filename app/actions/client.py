@@ -504,6 +504,10 @@ async def get_skylight_events(integration, config_data, auth):
                     none_retries += 1
                     continue
 
+                # Successful page: reset the None counter so only *consecutive*
+                # None responses (not Nones scattered across the AOI) trigger the abort.
+                none_retries = 0
+
                 meta = response['events']['meta']
                 if total_pages is None:
                     total = meta['total'] or 0
