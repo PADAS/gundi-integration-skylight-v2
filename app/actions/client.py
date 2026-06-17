@@ -171,7 +171,11 @@ def _log_skylight_error_response(response):
     """httpx response hook: whenever Skylight returns an error (4xx/5xx), log
     the full request and response (URL, headers, bodies) so the failure is
     fully diagnosable from the activity logs. Successful responses are not
-    logged here, to avoid noise and dumping large payloads."""
+    logged here, to avoid noise and dumping large payloads.
+
+    Note: this is a synchronous hook for HTTPXTransport (sync). If the transport
+    is ever switched to HTTPXAsyncTransport, this must become async and use
+    `await response.aread()`."""
     if response.status_code < 400:
         return
     response.read()
@@ -201,6 +205,16 @@ def build_graphql_client(transport_dict):
         fetch_schema_from_transport=False
     )
     return gql_client
+
+
+def build_events_client(base_transport_dict, headers):
+    """Build the authenticated events GraphQL client, with the error-logging
+    hook attached so any Skylight 4xx/5xx is fully captured."""
+    return build_graphql_client({
+        **base_transport_dict,
+        'headers': headers.dict(),
+        'event_hooks': {"response": [_log_skylight_error_response]},
+    })
 
 
 def _is_token_expired(access_token: str) -> bool:
@@ -333,11 +347,7 @@ async def get_skylight_events(integration, config_data, auth):
     )
     auth_client = build_graphql_client(default_transport_dict)
     headers = await build_request_header(integration, auth, auth_client)
-    # Log full request/response detail whenever Skylight returns an error.
-    error_log_hooks = {"response": [_log_skylight_error_response]}
-    gql_client = build_graphql_client(
-        {**default_transport_dict, 'headers': headers.dict(), 'event_hooks': error_log_hooks}
-    )
+    gql_client = build_events_client(default_transport_dict, headers)
 
     events = {}
 
@@ -498,9 +508,7 @@ async def get_skylight_events(integration, config_data, auth):
                     logger.info(f'"getRendedzvousExternal" query returned None, retrying with a new token...')
                     await state_manager.delete_state(str(integration.id), "pull_events", auth.username)
                     headers = await build_request_header(integration, auth, auth_client)
-                    gql_client = build_graphql_client(
-                        {**default_transport_dict, 'headers': headers.dict(), 'event_hooks': error_log_hooks}
-                    )
+                    gql_client = build_events_client(default_transport_dict, headers)
                     none_retries += 1
                     continue
 
@@ -510,8 +518,11 @@ async def get_skylight_events(integration, config_data, auth):
 
                 meta = response['events']['meta']
                 if total_pages is None:
-                    total = meta['total'] or 0
-                    total_pages = (total + meta['pageSize'] - 1) // meta['pageSize']
+                    total = meta.get('total') or 0
+                    # Use our requested page_size as the divisor (always >= 1),
+                    # not the echoed meta['pageSize'], to avoid a ZeroDivisionError
+                    # if Skylight ever returns pageSize: 0.
+                    total_pages = (total + page_size - 1) // page_size
 
                 response_list.extend(events_response)
                 page_num += 1
