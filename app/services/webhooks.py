@@ -1,5 +1,11 @@
+import asyncio
+import datetime
 import importlib
+import ipaddress
 import logging
+from urllib.parse import urlparse
+import httpx
+import stamina
 from fastapi import Request
 from app import settings
 from app.services.activity_logger import log_activity, publish_event
@@ -7,9 +13,123 @@ from gundi_client_v2 import GundiClient
 from gundi_core.events import IntegrationWebhookFailed, WebhookExecutionFailed
 from app.services.utils import DyntamicFactory
 from app.webhooks.core import get_webhook_handler, DynamicSchemaConfig, HexStringConfig, GenericJsonPayload
+from app.services.config_manager import IntegrationConfigurationManager
 
-_portal = GundiClient()
+config_manager = IntegrationConfigurationManager()
 logger = logging.getLogger(__name__)
+_diagnostic_client: httpx.AsyncClient | None = None
+
+
+def _get_diagnostic_client() -> httpx.AsyncClient:
+    global _diagnostic_client
+    if _diagnostic_client is None:
+        _diagnostic_client = httpx.AsyncClient(timeout=10.0)
+    return _diagnostic_client
+
+
+async def close_diagnostic_client() -> None:
+    global _diagnostic_client
+    if _diagnostic_client is not None:
+        await _diagnostic_client.aclose()
+        _diagnostic_client = None
+
+_BLOCKED_NETWORKS = [
+    ipaddress.ip_network("127.0.0.0/8"),    # loopback
+    ipaddress.ip_network("::1/128"),          # IPv6 loopback
+    ipaddress.ip_network("10.0.0.0/8"),       # RFC 1918 private
+    ipaddress.ip_network("172.16.0.0/12"),    # RFC 1918 private
+    ipaddress.ip_network("192.168.0.0/16"),   # RFC 1918 private
+    ipaddress.ip_network("169.254.0.0/16"),   # link-local / cloud metadata (AWS, GCP)
+    ipaddress.ip_network("fe80::/10"),        # IPv6 link-local
+    ipaddress.ip_network("fc00::/7"),         # IPv6 unique local
+    ipaddress.ip_network("0.0.0.0/8"),        # unspecified
+    ipaddress.ip_network("100.64.0.0/10"),    # carrier-grade NAT
+    ipaddress.ip_network("224.0.0.0/4"),      # multicast
+    ipaddress.ip_network("240.0.0.0/4"),      # reserved
+    ipaddress.ip_network("::/128"),           # IPv6 unspecified
+    ipaddress.ip_network("ff00::/8"),         # IPv6 multicast
+]
+
+
+async def _validate_diagnostic_url(url: str) -> None:
+    """Raise ValueError if url fails SSRF safety checks.
+
+    Note: this validation is a best-effort defence. Because DNS is re-resolved
+    by httpx at request time, a DNS-rebinding attack could cause the actual
+    connection to reach a private address even after this check passes (TOCTOU).
+    Operators should also restrict outbound network access at the infrastructure
+    level for a complete mitigation.
+    """
+    parsed = urlparse(url)
+    if parsed.scheme != "https":
+        raise ValueError(
+            f"Diagnostic URL scheme '{parsed.scheme}' is not allowed; only 'https' is permitted."
+        )
+    hostname = (parsed.hostname or "").rstrip(".").lower()
+    if not hostname:
+        raise ValueError("Diagnostic URL has no hostname.")
+    allowlist = settings.DIAGNOSTIC_URL_ALLOWLIST
+    if allowlist and hostname not in [h.rstrip(".").lower() for h in allowlist]:
+        raise ValueError(
+            f"Diagnostic URL hostname '{hostname}' is not in the configured allowlist."
+        )
+    loop = asyncio.get_running_loop()
+    try:
+        addr_infos = await loop.getaddrinfo(hostname, None)
+    except OSError as e:
+        raise ValueError(f"Cannot resolve diagnostic URL hostname '{hostname}': {e}")
+    for _, _, _, _, sockaddr in addr_infos:
+        ip = ipaddress.ip_address(sockaddr[0])
+        # An IPv4-mapped IPv6 address (::ffff:a.b.c.d) parses as IPv6 and would
+        # sail past the IPv4 blocklist entries; check the embedded IPv4 instead.
+        if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
+            ip = ip.ipv4_mapped
+        if any(ip in net for net in _BLOCKED_NETWORKS):
+            raise ValueError(
+                f"Diagnostic URL resolves to a private or reserved address ({ip}), "
+                "which is blocked to prevent SSRF."
+            )
+
+
+def _redact_url(url: str) -> str:
+    """Host and path only — diagnostic URLs can carry credentials or tokens
+    in the userinfo or query string, which must not reach the logs."""
+    try:
+        parsed = urlparse(url)
+        host = parsed.hostname or "<no-host>"
+        if parsed.port:
+            host = f"{host}:{parsed.port}"
+        return f"{host}{parsed.path}"
+    except Exception:
+        return "<unparseable url>"
+
+
+async def forward_payload_to_diagnostic_url(
+    destination_url: str,
+    integration_id: str,
+    json_content,
+):
+    try:
+        await _validate_diagnostic_url(destination_url)
+        metadata = {
+            "integration_id": integration_id,
+            "received_at": datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z"),
+        }
+        if isinstance(json_content, dict):
+            body = {**json_content, "__gundi_diagnostic_metadata": metadata}
+        else:
+            body = {"payload": json_content, "__gundi_diagnostic_metadata": metadata}
+        response = await _get_diagnostic_client().post(destination_url, json=body)
+        response.raise_for_status()
+        logger.debug(
+            f"Diagnostic payload forwarded to '{_redact_url(destination_url)}' "
+            f"for integration '{integration_id}'. Status: {response.status_code}"
+        )
+    except Exception as e:
+        logger.warning(
+            f"Diagnostic forwarding to '{_redact_url(destination_url)}' failed for integration "
+            f"'{integration_id}': {type(e).__name__}: {e}"
+        )
 
 
 async def get_integration(request):
@@ -19,9 +139,26 @@ async def get_integration(request):
     integration_id = consumer_integration or request.headers.get("x-gundi-integration-id") or request.query_params.get("integration_id")
     if integration_id:
         try:
-            integration = await _portal.get_integration_details(integration_id=integration_id)
+            # Retry on httpx.HTTPError (StatusError, Timeout, ConnectError, etc.)
+            for attempt in stamina.retry_context(on=httpx.HTTPError, wait_initial=10.0, wait_jitter=10.0, wait_max=300.0):
+                with attempt:
+                    # Cache the integration details and webhook config for 60 seconds. 
+                    # ToDo: Refactor to event-driven webhook config updates (as in actions)
+                    integration = await config_manager.get_integration_details(integration_id, ttl=60)
         except Exception as e:
-            logger.warning(f"Error retrieving integration '{integration_id}' from the portal: {e}")
+            error_message = f"Error retrieving integration '{integration_id}': {type(e).__name__}: {e}"
+            logger.exception(error_message)
+            await publish_event(
+                event=IntegrationWebhookFailed(
+                    payload=WebhookExecutionFailed(
+                        integration_id=str(integration_id),
+                        webhook_id=None,
+                        config_data={},
+                        error=error_message
+                    )
+                ),
+                topic_name=settings.INTEGRATION_EVENTS_TOPIC,
+            )
     return integration
 
 
@@ -29,6 +166,14 @@ async def process_webhook(request: Request):
     try:
         # Try to relate the request to an integration
         integration = await get_integration(request=request)
+        if not integration:
+            logger.warning(
+                "No integration found for webhook request: "
+                f"consumer_username: {request.headers.get('x-consumer-username')}, "
+                f"integration_id header: {request.headers.get('x-gundi-integration-id')}, "
+                f"integration_id param: {request.query_params.get('integration_id')}"
+            )
+            return {}
         # Look for the handler function in webhooks/handlers.py
         webhook_handler, payload_model, config_model = get_webhook_handler()
         json_content = await request.json()
@@ -38,6 +183,15 @@ async def process_webhook(request: Request):
         if parsed_config and issubclass(config_model, HexStringConfig):
             json_content["hex_data_field"] = json_content.get("hex_data_field", parsed_config.hex_data_field)
             json_content["hex_format"] = json_content.get("hex_format", parsed_config.hex_format)
+        # Forward raw payload to diagnostic URL before any transformation or validation
+        if diag_url := getattr(parsed_config, "diagnostic_destination_url", None):
+            asyncio.ensure_future(
+                forward_payload_to_diagnostic_url(
+                    destination_url=diag_url,
+                    integration_id=str(integration.id),
+                    json_content=json_content,
+                )
+            )
         # Parse payload if a model was defined in webhooks/configurations.py
         if payload_model:
             try:
@@ -56,7 +210,7 @@ async def process_webhook(request: Request):
                 else:
                     parsed_payload = payload_model.parse_obj(json_content)
             except Exception as e:
-                message = f"Error parsing payload: {str(e)}. Please review configurations."
+                message = f"Error parsing payload: {type(e).__name__}: {str(e)}. Please review configurations."
                 logger.exception(message)
                 await publish_event(
                     event=IntegrationWebhookFailed(
@@ -87,7 +241,7 @@ async def process_webhook(request: Request):
             topic_name=settings.INTEGRATION_EVENTS_TOPIC,
         )
     except Exception as e:
-        message = f"Error processing webhook: {str(e)}"
+        message = f"Error processing webhook: {type(e).__name__}: {str(e)}"
         logger.exception(message)
         await publish_event(
             event=IntegrationWebhookFailed(
@@ -95,7 +249,7 @@ async def process_webhook(request: Request):
                     integration_id=str(integration.id) if integration else None,
                     webhook_id=str(integration.type.webhook.value) if integration and integration.type.webhook else None,
                     config_data=webhook_config_data,
-                    error=message
+                    error=message  # ToDo: Support storing the error traceback and other details as in action errors
                 )
             ),
             topic_name=settings.INTEGRATION_EVENTS_TOPIC,

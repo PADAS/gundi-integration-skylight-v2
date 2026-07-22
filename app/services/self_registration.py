@@ -13,14 +13,14 @@ from app.actions import (
     ExecutableActionMixin,
     InternalActionConfiguration,
 )
-from app.settings import INTEGRATION_TYPE_SLUG, INTEGRATION_SERVICE_URL
+from app.settings import INTEGRATION_TYPE_SLUG, INTEGRATION_TYPE_NAME, INTEGRATION_SERVICE_URL
 from .core import ActionTypeEnum
 from app.webhooks.core import get_webhook_handler, GenericJsonTransformConfig
 
 logger = logging.getLogger(__name__)
 
 
-async def register_integration_in_gundi(gundi_client, type_slug=None, service_url=None, action_schedules=None):
+async def register_integration_in_gundi(gundi_client, type_slug=None, type_name=None, service_url=None, action_schedules=None):
     # Prepare the integration name and value
     integration_type_slug = type_slug or INTEGRATION_TYPE_SLUG
     if not integration_type_slug:
@@ -28,7 +28,7 @@ async def register_integration_in_gundi(gundi_client, type_slug=None, service_ur
             "Please define a slug id for this integration type, either passing it in the type_slug argument or setting it in the INTEGRATION_TYPE_SLUG setting."
         )
     integration_type_slug = integration_type_slug.strip().lower()
-    integration_type_name = integration_type_slug.replace("_", " ").title()
+    integration_type_name = type_name or INTEGRATION_TYPE_NAME or integration_type_slug.replace("_", " ").title()
     logger.info(f"Registering integration type '{integration_type_slug}'...")
     data = {
         "name": integration_type_name,
@@ -43,12 +43,12 @@ async def register_integration_in_gundi(gundi_client, type_slug=None, service_ur
 
     # Prepare the actions and schemas
     actions = []
-    for action_id, handler in action_handlers.items():
-        func, config_model = handler
+    for action_id, value in action_handlers.items():
+        func, config_model, data_model = value
         if issubclass(config_model, InternalActionConfiguration):
             logger.info(f"Skipping internal action '{action_id}'.")
             continue  # Internal actions are not registered in Gundi
-        action_name = action_id.replace("_", " ").title()
+        action_name = getattr(func, "action_title", None) or action_id.replace("_", " ").title()
         action_schema = json.loads(config_model.schema_json())
         action_ui_schema = config_model.ui_schema()
         if issubclass(config_model, AuthActionConfiguration):

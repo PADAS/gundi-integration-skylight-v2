@@ -13,6 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.services.action_runner import execute_action, _portal
 from app.services.self_registration import register_integration_in_gundi
+from app.services.webhooks import close_diagnostic_client
 
 
 # For running behind a proxy, we'll want to configure the root path for OpenAPI browser.
@@ -26,8 +27,9 @@ async def lifespan(app: FastAPI):
         await register_integration_in_gundi(gundi_client=_portal)
         # ToDo: set env var to false in GCP after registration
     yield
-    # Shotdown Hook
+    # Shutdown Hook
     await _portal.close()
+    await close_diagnostic_client()
 
 
 app = FastAPI(
@@ -72,29 +74,64 @@ async def execute(
     request: Request,
     background_tasks: BackgroundTasks
 ):
-    body = await request.body()
-    print(f"Message Received. RAW body: {body}")
     json_data = await request.json()
-    print(f"JSON: {json_data}")
+    logger.debug(f"JSON: {json_data}")
     payload = base64.b64decode(json_data["message"]["data"]).decode("utf-8").strip()
-    print(f"Payload: {payload}")
     json_payload = json.loads(payload)
-    print(f"JSON Payload: {json_payload}")
+    logger.debug(f"JSON Payload: {json_payload}")
+    # `triggered_by` lets the portal mark how the run was initiated (e.g. a
+    # scheduled tick vs an operator's "Run now"). Absent the marker we default
+    # to automated, so scheduled pulls on destination-only integrations skip
+    # quietly instead of erroring.
     if settings.PROCESS_PUBSUB_MESSAGES_IN_BACKGROUND:
         background_tasks.add_task(
             execute_action,
             integration_id=json_payload.get("integration_id"),
             action_id=json_payload.get("action_id"),
             config_overrides=json_payload.get("config_overrides"),
+            triggered_by=json_payload.get("triggered_by"),
         )
     else:
         await execute_action(
             integration_id=json_payload.get("integration_id"),
             action_id=json_payload.get("action_id"),
             config_overrides=json_payload.get("config_overrides"),
+            triggered_by=json_payload.get("triggered_by"),
         )
     return {}
 
+
+@app.post(
+    "/push-data",
+    summary="Process messages from PubSub and run push actions",
+)
+async def push_data(
+    request: Request,
+):
+    json_body = await request.json()
+    logger.debug(f"JSON: {json_body}")
+    payload = base64.b64decode(json_body["message"]["data"]).decode("utf-8").strip()
+    logger.debug(f"Payload: {payload}")
+    json_payload = json.loads(payload)
+    attributes = json_body["message"].get("attributes", {})
+    logger.debug(f"Attributes: {attributes}")
+    destination_id = attributes.get("destination_id")
+    if not destination_id:
+        # Ack malformed messages (2xx) — they can never succeed, so a non-2xx
+        # would only make PubSub redeliver them forever. Log attribute keys
+        # only; the values may carry sensitive data.
+        logger.error(
+            f"PubSub message missing required attribute 'destination_id'. "
+            f"Attribute keys: {sorted(attributes.keys())}"
+        )
+        return {}
+    # Push data rides in the message itself, so execution errors must propagate
+    # (non-2xx) for PubSub to redeliver — acking a failed run would drop data.
+    return await execute_action(
+        integration_id=destination_id,
+        data=json_payload,
+        metadata=attributes
+    )
 
 app.include_router(
     actions.router, prefix="/v1/actions", tags=["actions"], responses={}
