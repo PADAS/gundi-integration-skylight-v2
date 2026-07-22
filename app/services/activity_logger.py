@@ -31,6 +31,23 @@ from app import settings
 logger = logging.getLogger(__name__)
 
 
+class _NonRetryablePublishError(Exception):
+    # Carries a non-retryable publish error (4xx other than 429) past stamina's
+    # retry, which can only match on exception type. publish_event unwraps it
+    # so callers still see the original exception.
+    def __init__(self, original: Exception):
+        super().__init__(str(original))
+        self.original = original
+
+
+def _is_non_retryable(e: Exception) -> bool:
+    return (
+        isinstance(e, aiohttp.ClientResponseError)
+        and 400 <= e.status < 500
+        and e.status != 429
+    )
+
+
 # Publish events for other services or system components
 @stamina.retry(
     on=(aiohttp.ClientError, asyncio.TimeoutError),
@@ -39,7 +56,7 @@ logger = logging.getLogger(__name__)
     wait_max=60,
     wait_jitter=5.0
 )
-async def publish_event(event: SystemEventBaseModel, topic_name: str):
+async def _publish_event_with_retries(event: SystemEventBaseModel, topic_name: str):
     timeout_settings = aiohttp.ClientTimeout(total=20.0)
     async with aiohttp.ClientSession(
         raise_for_status=True, timeout=timeout_settings
@@ -54,14 +71,29 @@ async def publish_event(event: SystemEventBaseModel, topic_name: str):
         try:  # Send to pubsub
             response = await client.publish(topic, messages)
         except Exception as e:
+            if _is_non_retryable(e):
+                logger.exception(
+                    f"Error publishing system event to topic {topic_name} "
+                    f"(payload size: {len(binary_payload)} bytes): {e}. "
+                    "Client errors are not retried."
+                )
+                raise _NonRetryablePublishError(e) from e
             logger.exception(
-                f"Error publishing system event to topic {topic_name}: {e}. This will be retried."
+                f"Error publishing system event to topic {topic_name} "
+                f"(payload size: {len(binary_payload)} bytes): {e}. This will be retried."
             )
             raise e
         else:
             logger.debug(f"System event {event} published successfully.")
             logger.debug(f"GCP PubSub response: {response}")
             return response
+
+
+async def publish_event(event: SystemEventBaseModel, topic_name: str):
+    try:
+        return await _publish_event_with_retries(event, topic_name)
+    except _NonRetryablePublishError as e:
+        raise e.original
 
 
 async def log_activity(integration_id: str, action_id: str, title: str, level="INFO", config_data: dict = None, data: dict = None):

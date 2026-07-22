@@ -1,5 +1,6 @@
 import datetime
 import httpx
+import json
 import logging
 import stamina
 
@@ -25,6 +26,32 @@ logger = logging.getLogger(__name__)
 
 
 state_manager = IntegrationStateManager()
+
+# PubSub rejects publish requests over 10MB (400 Bad Request). The
+# RunIntegrationAction command message embeds the raw events plus config, and
+# PubSub base64-encodes message data (~33% overhead), so the events payload
+# per message must stay well under that limit.
+MAX_TRIGGER_PAYLOAD_BYTES = 2 * 1024 * 1024
+
+
+def batch_events_by_payload_size(events, max_payload_bytes):
+    # Splits events into ordered batches whose serialized size stays under
+    # max_payload_bytes. A single event larger than the limit gets its own
+    # batch (it can't be split further).
+    batches = []
+    current_batch = []
+    current_size = 0
+    for event in events:
+        event_size = len(json.dumps(event, default=str).encode("utf-8"))
+        if current_batch and current_size + event_size > max_payload_bytes:
+            batches.append(current_batch)
+            current_batch = []
+            current_size = 0
+        current_batch.append(event)
+        current_size += event_size
+    if current_batch:
+        batches.append(current_batch)
+    return batches
 
 
 def get_clean_event_id(event):
@@ -245,14 +272,15 @@ async def action_pull_events(integration, action_config: PullEventsConfig):
             if aoi_events:
                 result["events_extracted"] += len(aoi_events)
                 logger.info(f"Triggering 'process_events_per_aoi' action for AOI: '{aoi}' Events: '{len(aoi_events)}'")
-                parsed_config = ProcessEventsPerAOIConfig(
-                    integration_id=str(integration.id),
-                    aoi=aoi,
-                    events=aoi_events,
-                    updated_config_data=[config.dict() for config in updated_config_data]
-                )
-                await trigger_action(integration.id, "process_events_per_aoi", config=parsed_config)
-                result["process_events_per_aoi_action_triggered"] += 1
+                for events_batch in batch_events_by_payload_size(aoi_events, MAX_TRIGGER_PAYLOAD_BYTES):
+                    parsed_config = ProcessEventsPerAOIConfig(
+                        integration_id=str(integration.id),
+                        aoi=aoi,
+                        events=events_batch,
+                        updated_config_data=[config.dict() for config in updated_config_data]
+                    )
+                    await trigger_action(integration.id, "process_events_per_aoi", config=parsed_config)
+                    result["process_events_per_aoi_action_triggered"] += 1
                 logger.info(f"Triggered 'process_events_per_aoi' action for AOI: '{aoi}'")
 
         if events_to_patch:

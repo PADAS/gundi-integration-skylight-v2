@@ -1,4 +1,6 @@
+import aiohttp
 import pytest
+from types import SimpleNamespace
 from unittest.mock import ANY
 from gundi_core.events import (
     LogLevel,
@@ -43,6 +45,77 @@ async def test_publish_event(
         f"projects/{settings.GCP_PROJECT_ID}/topics/{settings.INTEGRATION_EVENTS_TOPIC}",
         [integration_event_pubsub_message],
     )
+
+
+def _client_response_error(status, message):
+    request_info = SimpleNamespace(real_url="https://pubsub.googleapis.com/v1/topics/test:publish")
+    return aiohttp.ClientResponseError(
+        request_info=request_info, history=(), status=status, message=message
+    )
+
+
+@pytest.fixture
+def fast_retries(mocker):
+    # stamina instantiates tenacity.AsyncRetrying at call time (via
+    # stamina._core._t), and tenacity binds asyncio.sleep as its default
+    # sleep. Inject an instant sleep so retry waits don't slow tests down.
+    import stamina._core
+
+    real_async_retrying = stamina._core._t.AsyncRetrying
+
+    async def _instant_sleep(_delay, result=None):
+        return result
+
+    mocker.patch.object(
+        stamina._core._t,
+        "AsyncRetrying",
+        lambda **kwargs: real_async_retrying(sleep=_instant_sleep, **kwargs),
+    )
+
+
+@pytest.mark.asyncio
+async def test_publish_event_does_not_retry_client_errors(
+        mocker, mock_pubsub_client, action_started_event, fast_retries
+):
+    # A 4xx (e.g. an oversized message rejected with 400) will never succeed
+    # on retry, so publish_event must fail fast instead of burning 5 attempts.
+    mocker.patch("app.services.activity_logger.pubsub", mock_pubsub_client)
+    publish_mock = mock_pubsub_client.PublisherClient.return_value.publish
+    publish_mock.side_effect = _client_response_error(400, "Bad Request")
+
+    with pytest.raises(aiohttp.ClientResponseError):
+        await publish_event(
+            event=action_started_event,
+            topic_name=settings.INTEGRATION_EVENTS_TOPIC,
+        )
+
+    assert publish_mock.call_count == 1
+
+
+@pytest.mark.parametrize("status", [500, 503, 429])
+@pytest.mark.asyncio
+async def test_publish_event_retries_transient_errors(
+        mocker, mock_pubsub_client, gcp_pubsub_publish_response, action_started_event, fast_retries, status
+):
+    mocker.patch("app.services.activity_logger.pubsub", mock_pubsub_client)
+    publish_mock = mock_pubsub_client.PublisherClient.return_value.publish
+
+    async def _ok():
+        return gcp_pubsub_publish_response
+
+    publish_mock.side_effect = [
+        _client_response_error(status, "Transient error"),
+        _client_response_error(status, "Transient error"),
+        _ok(),
+    ]
+
+    response = await publish_event(
+        event=action_started_event,
+        topic_name=settings.INTEGRATION_EVENTS_TOPIC,
+    )
+
+    assert response == gcp_pubsub_publish_response
+    assert publish_mock.call_count == 3
 
 
 @pytest.mark.asyncio
