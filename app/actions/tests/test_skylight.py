@@ -18,7 +18,13 @@ from app.actions.client import (
     _TOKEN_EXPIRY_SKEW_SECONDS,
 )
 from app.actions.configurations import ProcessEventsPerAOIConfig
-from app.actions.handlers import action_pull_events, action_process_events_per_aoi, process_attachments, transform
+from app.actions.handlers import (
+    action_pull_events,
+    action_process_events_per_aoi,
+    batch_events_by_payload_size,
+    process_attachments,
+    transform,
+)
 from app.services.state import IntegrationStateManager
 
 
@@ -521,6 +527,61 @@ async def test_action_pull_events_triggers_process_events_per_aoi(mocker, integr
             updated_config_data=[]
         )
     )
+
+
+def test_batch_events_by_payload_size_keeps_small_lists_in_one_batch():
+    events = [{"event_id": "event1"}, {"event_id": "event2"}]
+
+    assert batch_events_by_payload_size(events, max_payload_bytes=10_000) == [events]
+
+
+def test_batch_events_by_payload_size_splits_events_over_limit():
+    events = [{"event_id": f"event{i}", "data": "x" * 100} for i in range(5)]
+    event_size = len(json.dumps(events[0]).encode("utf-8"))
+
+    batches = batch_events_by_payload_size(events, max_payload_bytes=event_size * 2)
+
+    assert len(batches) == 3
+    assert all(len(batch) <= 2 for batch in batches)
+    assert [event for batch in batches for event in batch] == events
+
+
+def test_batch_events_by_payload_size_gives_oversized_event_its_own_batch():
+    events = [{"event_id": "event1", "data": "x" * 500}, {"event_id": "event2"}]
+
+    batches = batch_events_by_payload_size(events, max_payload_bytes=100)
+
+    assert batches == [[events[0]], [events[1]]]
+
+
+@pytest.mark.asyncio
+async def test_action_pull_events_splits_large_aoi_into_multiple_triggers(
+        mocker, integration, pull_events_config, mock_publish_event
+):
+    # A single PubSub command message embedding every event for an AOI can
+    # exceed PubSub's 10MB publish limit (400 Bad Request in production), so
+    # large AOIs must be dispatched as multiple bounded messages.
+    mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
+    mocker.patch("app.services.action_runner.publish_event", mock_publish_event)
+    mocker.patch("app.services.action_scheduler.publish_event", mock_publish_event)
+    events = [{"event_id": f"event{i}", "data": "x" * 200} for i in range(10)]
+    mocker.patch("app.actions.client.get_skylight_events", return_value=({"aoi": events}, []))
+    mocker.patch("app.actions.client.get_auth_config", return_value=None)
+    mocker.patch("app.services.state.IntegrationStateManager.get_state", return_value=None)
+    mock_trigger_action = mocker.patch("app.actions.handlers.trigger_action", return_value=None)
+    mocker.patch("app.actions.handlers.MAX_TRIGGER_PAYLOAD_BYTES", 500)
+
+    result = await action_pull_events(integration, pull_events_config)
+
+    assert mock_trigger_action.call_count > 1
+    dispatched_events = []
+    for call in mock_trigger_action.call_args_list:
+        config = call.kwargs["config"]
+        assert config.aoi == "aoi"
+        dispatched_events.extend(config.events)
+    assert dispatched_events == events
+    assert result["events_extracted"] == 10
+    assert result["process_events_per_aoi_action_triggered"] == mock_trigger_action.call_count
 
 
 @pytest.mark.asyncio
