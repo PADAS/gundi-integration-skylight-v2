@@ -611,3 +611,31 @@ async def test_push_data_acks_message_without_destination_id(
     assert response.status_code == 200
     assert response.json() == {}
     assert not mock_execute_action.called
+
+
+@pytest.mark.parametrize("corruption", ["missing_data_key", "invalid_base64", "not_json"])
+@pytest.mark.asyncio
+async def test_push_data_acks_unparseable_messages(
+        mocker, pubsub_message_request_headers, run_push_action_pubsub_payload, corruption
+):
+    # Parse/shape errors can never succeed on redelivery, so they must be
+    # acked (2xx) like a missing destination_id — a non-2xx would make PubSub
+    # redeliver the poison message forever.
+    mock_execute_action = mocker.patch("app.main.execute_action")
+    payload = json.loads(json.dumps(run_push_action_pubsub_payload))
+    if corruption == "missing_data_key":
+        payload["message"].pop("data")
+    elif corruption == "invalid_base64":
+        payload["message"]["data"] = "%%%not-base64%%%"
+    elif corruption == "not_json":
+        payload["message"]["data"] = base64.b64encode(b"plain text, not json").decode("utf-8")
+
+    response = api_client.post(
+        "/push-data",
+        headers=pubsub_message_request_headers,
+        json=payload,
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {}
+    assert not mock_execute_action.called

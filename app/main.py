@@ -110,9 +110,19 @@ async def push_data(
 ):
     json_body = await request.json()
     logger.debug(f"JSON: {json_body}")
-    payload = base64.b64decode(json_body["message"]["data"]).decode("utf-8").strip()
-    logger.debug(f"Payload: {payload}")
-    json_payload = json.loads(payload)
+    try:
+        payload = base64.b64decode(json_body["message"]["data"]).decode("utf-8").strip()
+        logger.debug(f"Payload: {payload}")
+        json_payload = json.loads(payload)
+    except (KeyError, TypeError, ValueError) as e:
+        # Parse/shape errors (missing data, bad base64/utf-8, non-JSON) can
+        # never succeed on redelivery, so ack them (2xx) like a missing
+        # destination_id below. Log the error type only; the raw payload may
+        # carry sensitive data.
+        logger.error(
+            f"Unparseable PubSub message on /push-data: {type(e).__name__}: {e}"
+        )
+        return {}
     attributes = json_body["message"].get("attributes", {})
     logger.debug(f"Attributes: {attributes}")
     destination_id = attributes.get("destination_id")
