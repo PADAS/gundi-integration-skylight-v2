@@ -261,7 +261,12 @@ async def execute_action(
         }
         if parsed_data:
             handler_kwargs["data"] = parsed_data
-        if metadata is not None:
+        if DataModel:
+            # Push handlers are only registered if they accept 'metadata',
+            # possibly without a default — always supply one so a run without
+            # metadata (e.g. via /execute) doesn't TypeError the handler.
+            handler_kwargs["metadata"] = metadata or {}
+        elif metadata is not None:
             handler_kwargs["metadata"] = metadata
         result = await asyncio.wait_for(
             handler(**handler_kwargs),

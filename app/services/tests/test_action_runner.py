@@ -639,3 +639,34 @@ async def test_push_data_acks_unparseable_messages(
     assert response.status_code == 200
     assert response.json() == {}
     assert not mock_execute_action.called
+
+
+@pytest.mark.asyncio
+async def test_execute_push_action_without_metadata_passes_empty_dict(
+        mocker, mock_gundi_client_v2, mock_publish_event, mock_action_handlers, mock_config_manager,
+        run_push_action_pubsub_payload, mock_push_observations_handler
+):
+    # Registration requires push handlers to accept 'metadata' (possibly with
+    # no default), so the runner must always supply one — a manual /execute
+    # run without metadata must not TypeError the handler.
+    mocker.patch("app.services.action_runner.action_handlers", mock_action_handlers)
+    mocker.patch("app.actions.action_handlers", mock_action_handlers)
+    mocker.patch("app.services.action_runner._portal", mock_gundi_client_v2)
+    mocker.patch("app.services.action_runner.config_manager", mock_config_manager)
+    mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
+    mocker.patch("app.services.action_runner.publish_event", mock_publish_event)
+    from app.services.action_runner import execute_action
+    payload_dict = json.loads(
+        base64.b64decode(run_push_action_pubsub_payload["message"]["data"]).decode("utf-8")
+    )
+    integration_id = run_push_action_pubsub_payload["message"]["attributes"]["destination_id"]
+
+    await execute_action(
+        integration_id=integration_id,
+        action_id="push_observations",
+        data=payload_dict,
+    )
+
+    assert mock_push_observations_handler.call_count == 1
+    call_kwargs = mock_push_observations_handler.mock_calls[0].kwargs
+    assert call_kwargs.get("metadata") == {}
