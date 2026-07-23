@@ -9,13 +9,14 @@ from app.services.action_scheduler import CrontabSchedule
 
 @click.command()
 @click.option('--slug', default=None, help='Slug ID for the integration type')
+@click.option('--name', default=None, help='Display name for the integration type (defaults to a name derived from the slug)')
 @click.option('--service-url', default=None, help='Service URL used to trigger actions or receive webhooks')
 @click.option(
     '--schedule',
     multiple=True,
     help='Schedules in the format "action_id:crontab schedule" (e.g., "pull_events:0 */4 * * *")'
 )
-def register_integration(slug, service_url, schedule):
+def register_integration(slug, name, service_url, schedule):
     schedules = {}
     for item in schedule:
         try:
@@ -29,6 +30,7 @@ def register_integration(slug, service_url, schedule):
         register_integration_in_gundi(
             gundi_client=_portal,
             type_slug=slug,
+            type_name=name,
             service_url=service_url,
             action_schedules=schedules
         )
