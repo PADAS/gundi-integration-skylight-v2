@@ -125,10 +125,20 @@ async def forward_payload_to_diagnostic_url(
             f"Diagnostic payload forwarded to '{_redact_url(destination_url)}' "
             f"for integration '{integration_id}'. Status: {response.status_code}"
         )
+    except ValueError as e:
+        # Messages from _validate_diagnostic_url contain only scheme/hostname — safe to log.
+        logger.warning(
+            f"Diagnostic forwarding to '{_redact_url(destination_url)}' blocked for integration "
+            f"'{integration_id}': {e}"
+        )
     except Exception as e:
+        # Don't log str(e): httpx error messages embed the full request URL,
+        # which can carry credentials or tokens in the query string.
+        status_code = getattr(getattr(e, "response", None), "status_code", None)
+        detail = f"HTTP {status_code}" if status_code is not None else "no response"
         logger.warning(
             f"Diagnostic forwarding to '{_redact_url(destination_url)}' failed for integration "
-            f"'{integration_id}': {type(e).__name__}: {e}"
+            f"'{integration_id}': {type(e).__name__} ({detail})"
         )
 
 
