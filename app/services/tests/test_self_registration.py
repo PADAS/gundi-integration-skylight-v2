@@ -1,5 +1,9 @@
+import sys
+import types
+
 import pytest
 from fastapi.testclient import TestClient
+from app.actions import action_title, discover_actions, PullActionConfiguration
 from app.main import app
 from app.services.self_registration import register_integration_in_gundi
 from app.services.action_scheduler import crontab_schedule, CrontabSchedule
@@ -37,6 +41,16 @@ async def test_register_integration_with_slug_setting(
                         "title": "MockPullActionConfiguration",
                         "type": "object",
                         "properties": {
+                            "run_on_schedule": {
+                                "title": "Run On Schedule",
+                                "description": (
+                                    "When enabled, this action runs automatically on its configured "
+                                    "schedule. Turn it off to pause scheduled execution for this "
+                                    "integration without deleting the configuration."
+                                ),
+                                "default": True,
+                                "type": "boolean",
+                            },
                             "lookback_days": {
                                 "title": "Data lookback days",
                                 "description": "Number of days to look back for data.",
@@ -51,13 +65,17 @@ async def test_register_integration_with_slug_setting(
                                 "default": False,
                                 "type": "boolean",
                             },
+                            "region_code": {
+                                "title": "Region Code", 
+                                "type": ["string", "null"]
+                            }
                         },
                         "definitions": {},
                     },
                     "ui_schema": {
                         "lookback_days": {"ui:widget": "range"},
                         "force_fetch": {"ui:widget": "select"},
-                        "ui:order": ["lookback_days", "force_fetch"],
+                        "ui:order": ["region_code", "lookback_days", "force_fetch"],
                     },
                     "is_periodic_action": True,
                     "crontab_schedule": {
@@ -68,7 +86,22 @@ async def test_register_integration_with_slug_setting(
                         "month_of_year": "*",
                         "tz_offset": -5
                     },
+                },
+                {
+                    "type": "push",
+                    "name": "Push Observations",
+                    "value": "push_observations",
+                    "description": "X Tracker Push Observations action",
+                    "schema": {
+                        "title": "MockPushActionConfiguration",
+                        "type": "object",
+                        "properties": {},
+                        "definitions": {}
+                    },
+                    "ui_schema": {},
+                    "is_periodic_action": False
                 }
+
             ],
             "webhook": {
                 "name": "X Tracker Webhook",
@@ -78,6 +111,11 @@ async def test_register_integration_with_slug_setting(
                     "title": "MockWebhookConfigModel",
                     "type": "object",
                     "properties": {
+                        "diagnostic_destination_url": {
+                            "title": "Diagnostic Destination URL",
+                            "description": "Optional URL to forward the raw incoming payload to for diagnostic purposes. When set, the original JSON payload is POST'd to this URL before any transformation.",
+                            "type": ["string", "null"],
+                        },
                         "allowed_devices_list": {
                             "title": "Allowed Devices List",
                             "type": "array",
@@ -88,10 +126,11 @@ async def test_register_integration_with_slug_setting(
                             "type": "boolean",
                         },
                     },
-                    "definitions": {},
                     "required": ["allowed_devices_list", "deduplication_enabled"],
+                    "definitions": {},
                 },
                 "ui_schema": {
+                    "diagnostic_destination_url": {"ui:placeholder": "https://your-diagnostic-app.example.com/webhook-dump", "ui:widget": "text"},
                     "allowed_devices_list": {"ui:widget": "list"},
                     "deduplication_enabled": {"ui:widget": "radio"},
                 },
@@ -132,6 +171,16 @@ async def test_register_integration_with_slug_arg(
                         "title": "MockPullActionConfiguration",
                         "type": "object",
                         "properties": {
+                            "run_on_schedule": {
+                                "title": "Run On Schedule",
+                                "description": (
+                                    "When enabled, this action runs automatically on its configured "
+                                    "schedule. Turn it off to pause scheduled execution for this "
+                                    "integration without deleting the configuration."
+                                ),
+                                "default": True,
+                                "type": "boolean",
+                            },
                             "lookback_days": {
                                 "title": "Data lookback days",
                                 "description": "Number of days to look back for data.",
@@ -146,13 +195,17 @@ async def test_register_integration_with_slug_arg(
                                 "default": False,
                                 "type": "boolean",
                             },
+                            "region_code": {
+                                "title": "Region Code",
+                                "type": ["string", "null"]
+                            },
                         },
                         "definitions": {},
                     },
                     "ui_schema": {
                         "lookback_days": {"ui:widget": "range"},
                         "force_fetch": {"ui:widget": "select"},
-                        "ui:order": ["lookback_days", "force_fetch"],
+                        "ui:order": ["region_code", "lookback_days", "force_fetch"],
                     },
                     "is_periodic_action": True,
                     "crontab_schedule": {
@@ -163,6 +216,20 @@ async def test_register_integration_with_slug_arg(
                         "month_of_year": "*",
                         "tz_offset": -5
                     },
+                },
+                {
+                    "type": "push",
+                    "name": "Push Observations",
+                    "value": "push_observations",
+                    "description": "X Tracker Push Observations action",
+                    "schema": {
+                        "title": "MockPushActionConfiguration",
+                        "type": "object",
+                        "properties": {},
+                        "definitions": {}
+                    },
+                    "ui_schema": {},
+                    "is_periodic_action": False
                 }
             ],
             "webhook": {
@@ -173,6 +240,11 @@ async def test_register_integration_with_slug_arg(
                     "title": "MockWebhookConfigModel",
                     "type": "object",
                     "properties": {
+                        "diagnostic_destination_url": {
+                            "title": "Diagnostic Destination URL",
+                            "description": "Optional URL to forward the raw incoming payload to for diagnostic purposes. When set, the original JSON payload is POST'd to this URL before any transformation.",
+                            "type": ["string", "null"],
+                        },
                         "allowed_devices_list": {
                             "title": "Allowed Devices List",
                             "type": "array",
@@ -183,10 +255,11 @@ async def test_register_integration_with_slug_arg(
                             "type": "boolean",
                         },
                     },
-                    "definitions": {},
                     "required": ["allowed_devices_list", "deduplication_enabled"],
+                    "definitions": {},
                 },
                 "ui_schema": {
+                    "diagnostic_destination_url": {"ui:placeholder": "https://your-diagnostic-app.example.com/webhook-dump", "ui:widget": "text"},
                     "allowed_devices_list": {"ui:widget": "list"},
                     "deduplication_enabled": {"ui:widget": "radio"},
                 },
@@ -229,6 +302,16 @@ async def test_register_integration_with_service_url_arg(
                         "title": "MockPullActionConfiguration",
                         "type": "object",
                         "properties": {
+                            "run_on_schedule": {
+                                "title": "Run On Schedule",
+                                "description": (
+                                    "When enabled, this action runs automatically on its configured "
+                                    "schedule. Turn it off to pause scheduled execution for this "
+                                    "integration without deleting the configuration."
+                                ),
+                                "default": True,
+                                "type": "boolean",
+                            },
                             "lookback_days": {
                                 "title": "Data lookback days",
                                 "description": "Number of days to look back for data.",
@@ -243,13 +326,17 @@ async def test_register_integration_with_service_url_arg(
                                 "default": False,
                                 "type": "boolean",
                             },
+                            "region_code": {
+                                "title": "Region Code",
+                                "type": ["string", "null"]
+                            },
                         },
                         "definitions": {},
                     },
                     "ui_schema": {
                         "lookback_days": {"ui:widget": "range"},
                         "force_fetch": {"ui:widget": "select"},
-                        "ui:order": ["lookback_days", "force_fetch"],
+                        "ui:order": ["region_code", "lookback_days", "force_fetch"],
                     },
                     "is_periodic_action": True,
                     "crontab_schedule": {
@@ -260,6 +347,20 @@ async def test_register_integration_with_service_url_arg(
                         "month_of_year": "*",
                         "tz_offset": -5
                     },
+                },
+                {
+                    "type": "push",
+                    "name": "Push Observations",
+                    "value": "push_observations",
+                    "description": "X Tracker Push Observations action",
+                    "schema": {
+                        "title": "MockPushActionConfiguration",
+                        "type": "object",
+                        "properties": {},
+                        "definitions": {}
+                    },
+                    "ui_schema": {},
+                    "is_periodic_action": False
                 }
             ],
             "webhook": {
@@ -270,6 +371,11 @@ async def test_register_integration_with_service_url_arg(
                     "title": "MockWebhookConfigModel",
                     "type": "object",
                     "properties": {
+                        "diagnostic_destination_url": {
+                            "title": "Diagnostic Destination URL",
+                            "description": "Optional URL to forward the raw incoming payload to for diagnostic purposes. When set, the original JSON payload is POST'd to this URL before any transformation.",
+                            "type": ["string", "null"],
+                        },
                         "allowed_devices_list": {
                             "title": "Allowed Devices List",
                             "type": "array",
@@ -280,10 +386,11 @@ async def test_register_integration_with_service_url_arg(
                             "type": "boolean",
                         },
                     },
-                    "definitions": {},
                     "required": ["allowed_devices_list", "deduplication_enabled"],
+                    "definitions": {},
                 },
                 "ui_schema": {
+                    "diagnostic_destination_url": {"ui:placeholder": "https://your-diagnostic-app.example.com/webhook-dump", "ui:widget": "text"},
                     "allowed_devices_list": {"ui:widget": "list"},
                     "deduplication_enabled": {"ui:widget": "radio"},
                 },
@@ -329,6 +436,16 @@ async def test_register_integration_with_service_url_setting(
                         "title": "MockPullActionConfiguration",
                         "type": "object",
                         "properties": {
+                            "run_on_schedule": {
+                                "title": "Run On Schedule",
+                                "description": (
+                                    "When enabled, this action runs automatically on its configured "
+                                    "schedule. Turn it off to pause scheduled execution for this "
+                                    "integration without deleting the configuration."
+                                ),
+                                "default": True,
+                                "type": "boolean",
+                            },
                             "lookback_days": {
                                 "title": "Data lookback days",
                                 "description": "Number of days to look back for data.",
@@ -343,13 +460,17 @@ async def test_register_integration_with_service_url_setting(
                                 "default": False,
                                 "type": "boolean",
                             },
+                            "region_code": {
+                                "title": "Region Code",
+                                "type": ["string", "null"]
+                            },
                         },
                         "definitions": {},
                     },
                     "ui_schema": {
                         "lookback_days": {"ui:widget": "range"},
                         "force_fetch": {"ui:widget": "select"},
-                        "ui:order": ["lookback_days", "force_fetch"],
+                        "ui:order": ["region_code", "lookback_days", "force_fetch"],
                     },
                     "is_periodic_action": True,
                     "crontab_schedule": {
@@ -360,6 +481,20 @@ async def test_register_integration_with_service_url_setting(
                         "month_of_year": "*",
                         "tz_offset": -5
                     },
+                },
+                {
+                    "type": "push",
+                    "name": "Push Observations",
+                    "value": "push_observations",
+                    "description": "X Tracker Push Observations action",
+                    "schema": {
+                        "title": "MockPushActionConfiguration",
+                        "type": "object",
+                        "properties": {},
+                        "definitions": {}
+                    },
+                    "ui_schema": {},
+                    "is_periodic_action": False
                 }
             ],
             "webhook": {
@@ -370,6 +505,11 @@ async def test_register_integration_with_service_url_setting(
                     "title": "MockWebhookConfigModel",
                     "type": "object",
                     "properties": {
+                        "diagnostic_destination_url": {
+                            "title": "Diagnostic Destination URL",
+                            "description": "Optional URL to forward the raw incoming payload to for diagnostic purposes. When set, the original JSON payload is POST'd to this URL before any transformation.",
+                            "type": ["string", "null"],
+                        },
                         "allowed_devices_list": {
                             "title": "Allowed Devices List",
                             "type": "array",
@@ -380,10 +520,11 @@ async def test_register_integration_with_service_url_setting(
                             "type": "boolean",
                         },
                     },
-                    "definitions": {},
                     "required": ["allowed_devices_list", "deduplication_enabled"],
+                    "definitions": {},
                 },
                 "ui_schema": {
+                    "diagnostic_destination_url": {"ui:placeholder": "https://your-diagnostic-app.example.com/webhook-dump", "ui:widget": "text"},
                     "allowed_devices_list": {"ui:widget": "list"},
                     "deduplication_enabled": {"ui:widget": "radio"},
                 },
@@ -451,6 +592,11 @@ async def test_register_integration_with_executable_action(
                     "title": "MockWebhookConfigModel",
                     "type": "object",
                     "properties": {
+                        "diagnostic_destination_url": {
+                            "title": "Diagnostic Destination URL",
+                            "description": "Optional URL to forward the raw incoming payload to for diagnostic purposes. When set, the original JSON payload is POST'd to this URL before any transformation.",
+                            "type": ["string", "null"],
+                        },
                         "allowed_devices_list": {
                             "title": "Allowed Devices List",
                             "type": "array",
@@ -465,12 +611,156 @@ async def test_register_integration_with_executable_action(
                     "definitions": {},
                 },
                 "ui_schema": {
+                    "diagnostic_destination_url": {"ui:placeholder": "https://your-diagnostic-app.example.com/webhook-dump", "ui:widget": "text"},
                     "allowed_devices_list": {"ui:widget": "list"},
                     "deduplication_enabled": {"ui:widget": "radio"},
                 },
             },
         }
     )
+
+
+@pytest.mark.asyncio
+async def test_register_integration_with_type_name_arg(
+    mocker,
+    mock_gundi_client_v2,
+    mock_action_handlers,
+    mock_get_webhook_handler_for_fixed_json_payload,
+):
+    mocker.patch("app.services.self_registration.action_handlers", mock_action_handlers)
+    mocker.patch(
+        "app.services.self_registration.get_webhook_handler",
+        mock_get_webhook_handler_for_fixed_json_payload,
+    )
+    await register_integration_in_gundi(
+        gundi_client=mock_gundi_client_v2,
+        type_slug="savannahtracking",
+        type_name="Savannah Tracking",
+    )
+    assert mock_gundi_client_v2.register_integration_type.called
+    data = mock_gundi_client_v2.register_integration_type.call_args.args[0]
+    assert data["name"] == "Savannah Tracking"
+    assert data["value"] == "savannahtracking"
+    assert data["description"] == "Default type for integrations with Savannah Tracking"
+    pull_action = next(a for a in data["actions"] if a["value"] == "pull_observations")
+    assert pull_action["description"] == "Savannah Tracking Pull Observations action"
+    assert data["webhook"]["name"] == "Savannah Tracking Webhook"
+    assert data["webhook"]["description"] == "Webhook Integration with Savannah Tracking"
+
+
+@pytest.mark.asyncio
+async def test_register_integration_with_type_name_setting(
+    mocker,
+    mock_gundi_client_v2,
+    mock_action_handlers,
+    mock_get_webhook_handler_for_fixed_json_payload,
+):
+    mocker.patch("app.services.self_registration.INTEGRATION_TYPE_SLUG", "savannahtracking")
+    mocker.patch("app.services.self_registration.INTEGRATION_TYPE_NAME", "Savannah Tracking")
+    mocker.patch("app.services.self_registration.action_handlers", mock_action_handlers)
+    mocker.patch(
+        "app.services.self_registration.get_webhook_handler",
+        mock_get_webhook_handler_for_fixed_json_payload,
+    )
+    await register_integration_in_gundi(gundi_client=mock_gundi_client_v2)
+    assert mock_gundi_client_v2.register_integration_type.called
+    data = mock_gundi_client_v2.register_integration_type.call_args.args[0]
+    assert data["name"] == "Savannah Tracking"
+    assert data["value"] == "savannahtracking"
+
+
+@pytest.mark.asyncio
+async def test_register_integration_with_action_title(
+    mocker,
+    mock_gundi_client_v2,
+    mock_action_handlers,
+    mock_get_webhook_handler_for_fixed_json_payload,
+):
+    mocker.patch("app.services.self_registration.INTEGRATION_TYPE_SLUG", "x_tracker")
+    mock_action_handlers["pull_observations"][0].action_title = "Fetch Collar Positions"
+    mocker.patch("app.services.self_registration.action_handlers", mock_action_handlers)
+    mocker.patch(
+        "app.services.self_registration.get_webhook_handler",
+        mock_get_webhook_handler_for_fixed_json_payload,
+    )
+    await register_integration_in_gundi(gundi_client=mock_gundi_client_v2)
+    assert mock_gundi_client_v2.register_integration_type.called
+    data = mock_gundi_client_v2.register_integration_type.call_args.args[0]
+    pull_action = next(a for a in data["actions"] if a["value"] == "pull_observations")
+    assert pull_action["name"] == "Fetch Collar Positions"
+    assert pull_action["description"] == "X Tracker Fetch Collar Positions action"
+    # Actions without a custom title keep the name derived from the action id
+    push_action = next(a for a in data["actions"] if a["value"] == "push_observations")
+    assert push_action["name"] == "Push Observations"
+
+
+def test_action_title_decorator():
+
+    @action_title("Fetch Collar Positions")
+    async def action_pull_observations(integration, action_config):
+        return {"observations_extracted": 10}
+
+    assert action_pull_observations.action_title == "Fetch Collar Positions"
+
+
+def test_action_title_decorator_stacks_with_crontab_schedule():
+
+    @action_title("Fetch Collar Positions")
+    @crontab_schedule("*/10 * * * *")
+    async def action_pull_observations(integration, action_config):
+        return {"observations_extracted": 10}
+
+    assert action_pull_observations.action_title == "Fetch Collar Positions"
+    assert action_pull_observations.crontab_schedule == CrontabSchedule.parse_obj_from_crontab("*/10 * * * *")
+
+
+def _discover_actions_in_fake_module(module):
+    module_name = "fake_handlers_module"
+    previous = sys.modules.get(module_name)
+    sys.modules[module_name] = module
+    try:
+        return discover_actions(module_name=module_name, prefix="action_")
+    finally:
+        if previous is not None:
+            sys.modules[module_name] = previous
+        else:
+            del sys.modules[module_name]
+
+
+def test_discover_actions_ignores_imported_action_title_decorator():
+    # Simulates handlers.py doing `from app.actions import action_title`
+    module = types.ModuleType("fake_handlers_module")
+    module.action_title = action_title
+
+    @action_title("Fetch Collar Positions")
+    async def action_pull_observations(integration, action_config: PullActionConfiguration):
+        return {"observations_extracted": 10}
+
+    module.action_pull_observations = action_pull_observations
+
+    handlers = _discover_actions_in_fake_module(module)
+
+    assert "title" not in handlers
+    assert list(handlers.keys()) == ["pull_observations"]
+    assert handlers["pull_observations"][0] is action_pull_observations
+
+
+def test_discover_actions_ignores_functions_without_action_config():
+    module = types.ModuleType("fake_handlers_module")
+
+    def action_helper(value):
+        return value
+
+    async def action_pull_observations(integration, action_config: PullActionConfiguration):
+        return {"observations_extracted": 10}
+
+    module.action_helper = action_helper
+    module.action_pull_observations = action_pull_observations
+
+    handlers = _discover_actions_in_fake_module(module)
+
+    assert "helper" not in handlers
+    assert list(handlers.keys()) == ["pull_observations"]
 
 
 @pytest.mark.asyncio
