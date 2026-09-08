@@ -347,6 +347,38 @@ async def test_get_skylight_events_stops_on_empty_page_before_total(mocker, inte
     assert [e["event_id"] for e in events["aoi1"]] == ["e1", "e2"]
 
 
+@pytest.mark.asyncio
+async def test_get_skylight_events_warns_when_total_hits_skylight_cap(mocker, integration, auth, patch_skylight_clients):
+    # meta.total at the 10k cap means Skylight most likely ignored an unknown AOI id
+    # and returned worldwide events; surface it with attention_needed.
+    mocker.patch(
+        "app.actions.client.execute_gql_query",
+        side_effect=[_page([{"event_id": "e1"}, {"event_id": "e2"}], total=10000), _page([], total=10000)],
+    )
+    log = mocker.patch("app.actions.client.logger")
+
+    await get_skylight_events(integration, _PullCfg(), auth)
+
+    cap_warnings = [
+        call for call in log.warning.call_args_list
+        if "result cap" in str(call) and call.kwargs.get("extra", {}).get("attention_needed")
+    ]
+    assert len(cap_warnings) == 1
+
+
+@pytest.mark.asyncio
+async def test_get_skylight_events_no_cap_warning_below_cap(mocker, integration, auth, patch_skylight_clients):
+    mocker.patch(
+        "app.actions.client.execute_gql_query",
+        side_effect=[_page([{"event_id": "e1"}], total=1)],
+    )
+    log = mocker.patch("app.actions.client.logger")
+
+    await get_skylight_events(integration, _PullCfg(), auth)
+
+    assert not any("result cap" in str(call) for call in log.warning.call_args_list)
+
+
 # --- normalize_v2_event (v2 record -> v1 layout) ---
 
 

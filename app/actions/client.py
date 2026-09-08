@@ -32,6 +32,11 @@ state_manager = IntegrationStateManager()
 DEFAULT_SKYLIGHT_API_URL = 'https://api.skylight.earth/graphql'
 GRAPHQL_EXECUTE_TIMEOUT_SECONDS = 60
 
+# searchEventsV2 refuses offset + limit > 10000 and caps meta.total there. An
+# unknown/invalid AOI id is silently ignored by Skylight, which then returns
+# worldwide events, so hitting this cap almost always means a misconfigured AOI.
+SKYLIGHT_RESULT_CAP = 10000
+
 # Refresh tokens this many seconds before their actual expiry to avoid races.
 _TOKEN_EXPIRY_SKEW_SECONDS = 60
 
@@ -597,6 +602,12 @@ async def get_skylight_events(integration, config_data, auth):
                         timedelta(days=initial_data_window_days)
                 ).isoformat()
 
+            logger.info(
+                f'Fetching Skylight events for AOI "{aoi}" since {start_time}. '
+                f'Event types: {event_types}. Page size: {page_size}.'
+            )
+            pages_fetched = 0
+            reported_total = None
             page_num = 1
             total_pages = None
             # v2 pins paging to a snapshot so results don't shift between
@@ -614,7 +625,10 @@ async def get_skylight_events(integration, config_data, auth):
                     "snapshotId": snapshot_id,
                 }
 
-                logger.info(f'Sending "searchEventsV2" query request. Params: "{params}"...')
+                logger.info(
+                    f'"searchEventsV2" page {page_num}'
+                    f'{f"/{total_pages}" if total_pages else ""} (offset {params["offset"]}) for AOI "{aoi}"...'
+                )
 
                 try:
                     response = await execute_gql_query(gql_client, query, params, integration, auth)
@@ -675,9 +689,23 @@ async def get_skylight_events(integration, config_data, auth):
                     snapshot_id = meta.get('snapshotId')
                 if total_pages is None:
                     total = meta.get('total') or 0
+                    reported_total = total
                     # Divide by our requested page size (always >= 1), which is
                     # also the offset step, so total_pages matches the offsets.
                     total_pages = (total + page_size - 1) // page_size
+                    if total >= SKYLIGHT_RESULT_CAP:
+                        logger.warning(
+                            f'Skylight reported {total} events for AOI "{aoi}" since {start_time}, '
+                            f'which is its result cap ({SKYLIGHT_RESULT_CAP}). Skylight ignores unknown '
+                            f'AOI ids and returns worldwide events, so check that this AOI id exists '
+                            f'in the Skylight account. Only the newest {SKYLIGHT_RESULT_CAP} events '
+                            f'can be fetched.',
+                            extra={
+                                "integration_id": str(integration.id),
+                                "aoi": aoi,
+                                "attention_needed": True,
+                            }
+                        )
 
                 if not events_response:
                     # Nothing left even though total_pages said otherwise
@@ -685,7 +713,12 @@ async def get_skylight_events(integration, config_data, auth):
                     break
 
                 response_list.extend(normalize_v2_event(record) for record in events_response)
+                pages_fetched += 1
                 page_num += 1
+            logger.info(
+                f'Fetched {len(response_list)} events for AOI "{aoi}" in {pages_fetched} page(s). '
+                f'Skylight reported total: {reported_total}. Window start: {start_time}.'
+            )
             events.update({aoi: response_list})
         except pydantic.ValidationError as ve:
             message = f'Validation error in Skylight "searchEventsV2" endpoint. {ve.json()}'

@@ -293,6 +293,14 @@ async def action_pull_events(integration, action_config: PullEventsConfig):
             result["events_updated"] = len(response)
             result["details"]["updated"] = response
 
+        # Logged here (not only returned) because the HTTP response is lost when
+        # a long run outlives the caller's timeout.
+        logger.info(
+            f"pull_events finished for integration '{str(integration.id)}': "
+            f"{result['events_extracted']} events extracted, "
+            f"{result['process_events_per_aoi_action_triggered']} process_events_per_aoi action(s) triggered, "
+            f"{result.get('events_updated', 0)} events updated."
+        )
         return result
 
 
