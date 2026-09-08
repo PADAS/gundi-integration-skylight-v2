@@ -1,11 +1,17 @@
 # Base dependencies. Don't edit or override this file.
 # Use requirements.in to add integration-specific dependencies instead.
+# imported directly by app/services/errors.py for exception classification
+aiohttp
 environs~=9.5.0
 pydantic~=1.10.15
 fastapi~=0.103.2
 uvicorn~=0.23.2
 gundi-core~=1.11.1
 gundi-client-v2~=2.4.0
+# httpx is imported directly by app/services/*; ~=0.24.1 keeps the resolver on
+# gundi-client-v2 2.4.0 — 2.4.1 requires httpx 0.28, which breaks the TestClient
+# shipped with starlette 0.27 (pinned via fastapi~=0.103.2)
+httpx~=0.24.1
 stamina~=23.2.0
 redis~=5.0.1
 gcloud-aio-pubsub~=6.0.0
