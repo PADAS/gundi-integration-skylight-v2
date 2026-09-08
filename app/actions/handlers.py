@@ -13,7 +13,8 @@ from dateparser import parse as dp
 
 from gql.transport.exceptions import TransportQueryError
 
-from app.actions.configurations import AuthenticateConfig, PullEventsConfig, ProcessEventsPerAOIConfig
+from app.actions.core import action_title
+from app.actions.configurations import AuthenticateConfig, PullEventsConfig, ProcessEventsPerAOIConfig, ListAOIsQuery, ReferenceDataResponse, ReferenceOption
 from app.services.action_scheduler import trigger_action
 from app.services.activity_logger import activity_logger, log_action_activity
 from app.services.state import IntegrationStateManager
@@ -187,6 +188,38 @@ async def action_auth(integration, action_config: AuthenticateConfig):
     except Exception as e:
         logger.info(f"An error occurred while fetching token for integration '{integration.id}'")
         return {"valid_credentials": None, "error": str(e)}
+
+
+@action_title("List AOIs")
+async def action_list_aois(integration, action_config: ListAOIsQuery):
+    """Reference action: AOI options for the portal's aoi_ids dropdown.
+
+    Read-only and stateless (safe on the ephemeral/draft path). Option values
+    are the Skylight AOI ids that pull_events.aoi_ids already stores, so
+    existing configurations keep working and hand-typed ids remain valid.
+    """
+    auth = client.get_auth_config(integration)
+    aois = await client.search_aois(integration, auth)
+    options = []
+    for aoi in aois:
+        aoi_id = aoi.get("id")
+        if not aoi_id:
+            continue
+        props = aoi.get("properties") or {}
+        details = []
+        if aoi.get("status") and aoi["status"] != "active":
+            details.append(aoi["status"])
+        if props.get("areaKm2"):
+            details.append(f"{props['areaKm2']:,.0f} km²")
+        if props.get("description"):
+            details.append(props["description"])
+        options.append(ReferenceOption(
+            value=aoi_id,
+            label=props.get("name") or aoi_id,
+            description=", ".join(details) or None,
+        ))
+    options.sort(key=lambda option: (option.label or "").lower())
+    return ReferenceDataResponse(options=options).dict()
 
 
 @activity_logger()

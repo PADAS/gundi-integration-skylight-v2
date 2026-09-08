@@ -1,9 +1,15 @@
 from enum import Enum
 from re import sub
-from app.actions.core import AuthActionConfiguration, PullActionConfiguration, ExecutableActionMixin, InternalActionConfiguration
+from app.actions.core import (
+    AuthActionConfiguration,
+    ExecutableActionMixin,
+    InternalActionConfiguration,
+    PullActionConfiguration,
+    ReferenceActionConfiguration,
+)
 from app.services.utils import GlobalUISchemaOptions
-from typing import List
-from pydantic import Field, validator, SecretStr
+from typing import List, Optional
+from pydantic import BaseModel, Field, validator, SecretStr
 
 
 # Labels shown in the portal's event-type picker. The format_string_case
@@ -32,6 +38,35 @@ class AuthenticateConfig(AuthActionConfiguration, ExecutableActionMixin):
     )
 
 
+# --- Reference data (portal live dropdowns) ---------------------------------
+# Response contract for reference actions, as consumed by the Gundi portal:
+# {options: [{value, label?, description?, group?}], cache_ttl_seconds, truncated}.
+
+class ReferenceOption(BaseModel):
+    value: str
+    label: Optional[str] = None        # portal defaults label to value
+    description: Optional[str] = None  # tooltip / help text
+    group: Optional[str] = None        # optional grouping for long lists
+
+
+class ReferenceDataResponse(BaseModel):
+    options: List[ReferenceOption]
+    cache_ttl_seconds: int = 300       # portal-side cache hint
+    truncated: bool = False            # true if the list was capped
+
+
+class ListAOIsQuery(ReferenceActionConfiguration):
+    """Reference action: the AOIs visible to the integration's Skylight account.
+    Takes no parameters; the portal calls it when the AOI dropdown opens."""
+
+
+def _reference(action: str, params: Optional[dict] = None) -> dict:
+    """Build a `gundi:reference` ui_schema annotation. Deliberately does NOT
+    set ui:widget: portals without reference support keep rendering the plain
+    text field, and allow_free_text keeps hand-typed AOI ids valid."""
+    return {"action": action, "target": "self", "params": params or {}, "allow_free_text": True}
+
+
 class ProcessEventsPerAOIConfig(InternalActionConfiguration):
     integration_id: str
     aoi: str
@@ -42,7 +77,7 @@ class ProcessEventsPerAOIConfig(InternalActionConfiguration):
 class PullEventsConfig(PullActionConfiguration):
     aoi_ids: List[str] = Field(
         title='Area of Interest (AOI) IDs',
-        description='IDs of the desired areas.',
+        description='Skylight AOIs to pull events for. Pick from the list or paste an AOI id.',
     )
     event_types: List[SkylightEventType] = Field(
         title='Event Types to Fetch',
@@ -59,6 +94,15 @@ class PullEventsConfig(PullActionConfiguration):
         title='Days to fetch data from',
         description='Number of days the integration will get data from if no startTime set.',
     )
+
+    @classmethod
+    def ui_schema(cls):
+        # aoi_ids stays a plain list of Skylight AOI ids (existing integrations
+        # are untouched); the annotation only tells the portal it can offer a
+        # live dropdown fed by the list_aois reference action.
+        ui = super().ui_schema()
+        ui.setdefault("aoi_ids", {}).setdefault("items", {})["gundi:reference"] = _reference("list_aois")
+        return ui
 
     @validator('event_types')
     def format_string_case(cls, v):

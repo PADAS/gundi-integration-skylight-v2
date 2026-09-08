@@ -37,6 +37,9 @@ GRAPHQL_EXECUTE_TIMEOUT_SECONDS = 60
 # worldwide events, so hitting this cap almost always means a misconfigured AOI.
 SKYLIGHT_RESULT_CAP = 10000
 
+# Page size for the searchAOIs reference lookup (accounts typically have a handful).
+AOI_SEARCH_PAGE_SIZE = 100
+
 # Refresh tokens this many seconds before their actual expiry to avoid races.
 _TOKEN_EXPIRY_SKEW_SECONDS = 60
 
@@ -430,7 +433,7 @@ async def execute_gql_query(gql_client, query, params, integration, auth):
             # hold the stale token, so retrying with the same client would fail
             # identically. The proactive _is_token_expired check in
             # build_request_header prevents this path in the common case.
-            logger.warning(f'"searchEventsV2" query returned {code}, clearing token for next run.')
+            logger.warning(f'Skylight query returned {code}, clearing token for next run.')
             await state_manager.delete_state(str(integration.id), "pull_events", auth.username)
         raise
 
@@ -754,3 +757,59 @@ async def get_skylight_events(integration, config_data, auth):
             continue
 
     return events, mapped_event_types
+
+
+async def search_aois(integration, auth) -> list:
+    """List the AOIs visible to the Skylight account behind `auth` (searchAOIs).
+
+    Returns raw records: {id, status, createdAt, updatedAt, properties {name,
+    description, areaKm2}}. Pages through meta.total; read-only, no state.
+    """
+    default_transport_dict = dict(
+        url=DEFAULT_SKYLIGHT_API_URL,
+        verify=True,
+    )
+    auth_client = build_graphql_client(default_transport_dict)
+    headers = await build_request_header(integration, auth, auth_client)
+    gql_client = build_events_client(default_transport_dict, headers)
+
+    query = gql(
+        """
+        query searchSkylightAOIs($limit: Int, $offset: Int) {
+            searchAOIs(input: { limit: $limit, offset: $offset }) {
+                records {
+                    id
+                    status
+                    createdAt
+                    updatedAt
+                    properties {
+                        name
+                        description
+                        areaKm2
+                    }
+                }
+                meta {
+                    total
+                }
+            }
+        }
+        """
+    )
+
+    aois = []
+    offset = 0
+    total = None
+    while total is None or offset < total:
+        params = {"limit": AOI_SEARCH_PAGE_SIZE, "offset": offset}
+        logger.info(f'"searchAOIs" query (offset {offset}) for integration "{str(integration.id)}"...')
+        response = await execute_gql_query(gql_client, query, params, integration, auth)
+        search_response = response.get("searchAOIs") or {}
+        records = search_response.get("records") or []
+        if total is None:
+            total = (search_response.get("meta") or {}).get("total") or 0
+        if not records:
+            break
+        aois.extend(records)
+        offset += len(records)
+    logger.info(f'"searchAOIs" returned {len(aois)} AOI(s) for integration "{str(integration.id)}".')
+    return aois

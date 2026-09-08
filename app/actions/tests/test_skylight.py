@@ -17,8 +17,9 @@ from app.actions.client import (
     PullEventsBadConfigException,
     _TOKEN_EXPIRY_SKEW_SECONDS,
     normalize_v2_event,
+    search_aois,
 )
-from app.actions.configurations import ProcessEventsPerAOIConfig
+from app.actions.configurations import ProcessEventsPerAOIConfig, PullEventsConfig, ListAOIsQuery
 from app.actions.handlers import (
     action_pull_events,
     action_process_events_per_aoi,
@@ -947,3 +948,93 @@ def test_transform_entry_alert_no_start_returns_empty():
     }
     result = transform(_ENTRY_ALERT_CONFIG, data)
     assert result == {}
+
+
+# --- list_aois reference action ---
+
+
+def _aoi(aoi_id, name, status="active", area=None, description=""):
+    return {"id": aoi_id, "status": status, "createdAt": "2026-06-12T09:02:16Z", "updatedAt": "2026-06-12T09:02:16Z",
+            "properties": {"name": name, "description": description, "areaKm2": area}}
+
+
+def _aoi_page(records, total):
+    return {"searchAOIs": {"records": records, "meta": {"total": total}}}
+
+
+@pytest.mark.asyncio
+async def test_search_aois_pages_through_total(mocker, integration, auth, patch_skylight_clients):
+    mocker.patch("app.actions.client.AOI_SEARCH_PAGE_SIZE", 2)
+    exec_mock = mocker.patch(
+        "app.actions.client.execute_gql_query",
+        side_effect=[
+            _aoi_page([_aoi("a1", "Alpha"), _aoi("a2", "Bravo")], total=3),
+            _aoi_page([_aoi("a3", "Charlie")], total=3),
+        ],
+    )
+
+    aois = await search_aois(integration, auth)
+
+    assert [a["id"] for a in aois] == ["a1", "a2", "a3"]
+    assert exec_mock.call_count == 2
+    first, second = [call.args[2] for call in exec_mock.call_args_list]
+    assert first == {"limit": 2, "offset": 0}
+    assert second == {"limit": 2, "offset": 2}
+
+
+@pytest.mark.asyncio
+async def test_search_aois_stops_on_empty_page(mocker, integration, auth, patch_skylight_clients):
+    exec_mock = mocker.patch(
+        "app.actions.client.execute_gql_query",
+        side_effect=[_aoi_page([], total=5)],
+    )
+
+    aois = await search_aois(integration, auth)
+
+    assert aois == []
+    assert exec_mock.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_action_list_aois_returns_portal_options(mocker, integration):
+    from app.actions.handlers import action_list_aois
+    mocker.patch("app.actions.client.get_auth_config", return_value=mocker.MagicMock())
+    mocker.patch(
+        "app.actions.client.search_aois",
+        return_value=[
+            _aoi("d8f26fe4", "Bintan - Nikoi Island", area=276338.1),
+            _aoi("0000-arch", "Archived Zone", status="archived", description="old"),
+            _aoi("no-name", None),
+        ],
+    )
+
+    result = await action_list_aois(integration, ListAOIsQuery())
+
+    assert result["cache_ttl_seconds"] == 300 and result["truncated"] is False
+    options = result["options"]
+    # Sorted by label; the id is the value so pull_events.aoi_ids keeps storing ids.
+    assert [o["value"] for o in options] == ["0000-arch", "d8f26fe4", "no-name"]
+    by_value = {o["value"]: o for o in options}
+    assert by_value["d8f26fe4"]["label"] == "Bintan - Nikoi Island"
+    assert by_value["d8f26fe4"]["description"] == "276,338 km²"
+    assert by_value["0000-arch"]["description"] == "archived, old"
+    assert by_value["no-name"]["label"] == "no-name" and by_value["no-name"]["description"] is None
+
+
+def test_pull_events_aoi_ids_carry_reference_annotation_for_registered_action():
+    # Mirrors the portal contract: annotation on the array items, no ui:widget
+    # (older portals keep the text input), free text allowed so pasted ids work,
+    # and the referenced action exists and is a reference action.
+    from app.actions.core import ReferenceActionConfiguration, discover_actions
+
+    ui = PullEventsConfig.ui_schema()
+    items = ui["aoi_ids"]["items"]
+    ref = items["gundi:reference"]
+    assert ref == {"action": "list_aois", "target": "self", "params": {}, "allow_free_text": True}
+    assert "ui:widget" not in items
+
+    handlers = discover_actions(module_name="app.actions.handlers", prefix="action_")
+    _, config_model, _ = handlers["list_aois"]
+    assert issubclass(config_model, ReferenceActionConfiguration)
+    # aoi_ids itself is unchanged: a plain list of strings in the JSON schema.
+    assert PullEventsConfig.schema()["properties"]["aoi_ids"]["items"] == {"type": "string"}
