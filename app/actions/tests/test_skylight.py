@@ -418,13 +418,14 @@ def test_normalize_v2_event_maps_record_and_vessel_to_v1_keys():
     assert vessel["type"] == "FISHING"
     assert vessel["display_country"] == "China"
     assert vessel["category"] == "fishing"
+    assert vessel["country_filter"] == ["CHN"]   # v1 country_filter == v2 countryCode
     # v2-only vessel fields pass through in snake_case.
-    assert vessel["country_code"] == ["CHN"]
     assert vessel["track_id"] == "B:412416076:1697504108"
     assert vessel["gfw_vessel_id"] == "78450769f"
     assert "vessel_type" not in vessel and "vesselId" not in vessel
     # v2-only detail fields pass through; GraphQL meta is dropped.
     assert result["event_details"]["fishing_score"] == 0.87
+    assert result["event_details"]["visit_type"] == "end"   # v1 constant, kept for parity
     assert result["event_details"]["created_at"] == "2026-09-08T22:37:36Z"
     assert result["event_details"]["updated_at"] == "2026-09-08T22:37:37Z"
     assert "__typename" not in result["event_details"]
@@ -435,23 +436,24 @@ def test_normalize_v2_event_maps_speed_range_and_aoi_visit_details_to_v1_keys():
         "eventId": "s1", "eventType": "speed_range", "vessels": {"vessel0": None, "vessel1": None},
         "eventDetails": {"averageSpeed": 3.22, "distance": 25.5, "durationSec": 16013},
     })
-    assert speed["event_details"] == {"average_speed": 3.22, "distance": 25.5, "duration": 16013}
+    assert speed["event_details"] == {"average_speed": 3.22, "distance": 25.5, "duration": 16013, "visit_type": "end"}
 
     visit = normalize_v2_event({
         "eventId": "a1", "eventType": "aoi_visit", "vessels": {"vessel0": None, "vessel1": None},
         "eventDetails": {"entrySpeed": 11.2, "entryHeading": 132, "endHeading": None},
     })
-    assert visit["event_details"] == {"entry_speed": 11.2, "entry_heading": 132, "end_heading": None}
+    # v1 serialised these as strings; end_heading None stays None (transform drops it).
+    assert visit["event_details"] == {"entry_speed": "11.2", "entry_heading": "132", "end_heading": None, "visit_type": "end"}
 
 
 def test_normalize_v2_event_detection_sets_v1_data_source_correlated_and_image_url():
     dark = normalize_v2_event({
         "eventId": "d1", "eventType": "eo_sentinel2", "vessels": {"vessel0": None, "vessel1": None},
-        "eventDetails": {"imageUrl": "https://cdn/x.png", "detectionType": "dark", "score": 0.99, "radianceNw": None},
+        "eventDetails": {"imageUrl": "https://cdn/x.png", "dataSource": "sentinel2", "detectionType": "dark", "score": 0.99, "radianceNw": None},
     })
     details = dark["event_details"]
     assert details["image_url"] == "https://cdn/x.png"
-    assert details["data_source"] == "eo_sentinel2"
+    assert details["data_source"] == "sentinel2"
     assert details["correlated"] is False
     assert details["detection_type"] == "dark"
     assert details["score"] == 0.99
@@ -460,10 +462,10 @@ def test_normalize_v2_event_detection_sets_v1_data_source_correlated_and_image_u
 
     ais = normalize_v2_event({
         "eventId": "d2", "eventType": "viirs", "vessels": {"vessel0": _v2_vessel(), "vessel1": None},
-        "eventDetails": {"imageUrl": "https://cdn/y.jpeg", "detectionType": "ais_correlated", "radianceNw": 26.5},
+        "eventDetails": {"imageUrl": "https://cdn/y.jpeg", "dataSource": "noaa_21", "detectionType": "ais_correlated", "radianceNw": 26.5},
     })
     assert ais["event_details"]["correlated"] is True
-    assert ais["event_details"]["data_source"] == "viirs"
+    assert ais["event_details"]["data_source"] == "noaa_21"
     assert ais["event_details"]["radiance_nw"] == 26.5
     assert ais["vessels"]["vessel_0"]["name"] == "23839"
 
@@ -477,13 +479,13 @@ def test_normalize_v2_event_rendezvous_keeps_second_vessel_as_vessel_1():
     assert result["vessels"]["vessel_0"]["name"] == "BIEN DONG"
     assert result["vessels"]["vessel_1"]["name"] == "LANH LX"
     assert result["vessels"]["vessel_1"]["mmsi"] == 574345679
-    assert result["event_details"] == {}
+    assert result["event_details"] == {"visit_type": "end"}
 
 
 def test_normalize_v2_event_handles_missing_vessels_and_details():
     result = normalize_v2_event({"eventId": "x", "eventType": "fishing_activity_history"})
     assert result["vessels"] == {"vessel_0": None}
-    assert result["event_details"] == {}
+    assert result["event_details"] == {"visit_type": "end"}
     assert result["start"] is None and result["end"] is None
 
 
@@ -495,7 +497,7 @@ def test_transform_of_normalized_v2_event_keeps_v1_er_keys(skylight_client):
         "start": {"point": {"lat": 43.04, "lon": 31.63}, "time": "2026-09-08T15:51:23Z"},
         "end": {"point": {"lat": 43.04, "lon": 31.63}, "time": "2026-09-08T15:51:23Z"},
         "vessels": {"vessel0": _v2_vessel(name="PSV YESILKOY", imo=9709130), "vessel1": None},
-        "eventDetails": {"imageUrl": "https://cdn/s1.png", "detectionType": "ais_correlated", "score": 0.99},
+        "eventDetails": {"imageUrl": "https://cdn/s1.png", "dataSource": "sentinel1", "detectionType": "ais_correlated", "score": 0.99},
     }
     config = [{"skylight_event_type": ["viirs", "sar_sentinel1"], "event_title": "Vessel Detection", "event_type": "detection_alert_rep"}]
 
@@ -510,7 +512,7 @@ def test_transform_of_normalized_v2_event_keeps_v1_er_keys(skylight_client):
     assert details["vessel_0_type"] == "FISHING"
     assert details["vessel_0_imo"] == 9709130
     assert details["image_url"] == "https://cdn/s1.png"
-    assert details["data_source"] == "sar_sentinel1"
+    assert details["data_source"] == "sentinel1"
     assert details["correlated"] is True
     assert details["event_id"] == "S1C_...SAFE_31"
     assert "entry_link" in details
@@ -948,6 +950,93 @@ def test_transform_entry_alert_no_start_returns_empty():
     }
     result = transform(_ENTRY_ALERT_CONFIG, data)
     assert result == {}
+
+
+# --- v1/v2 parity on real Skylight samples ---
+# Captured live on 2026-09-08 from both APIs for the same event ids (staging AOI).
+# Guards the contract: what EarthRanger receives from a v2 record must equal
+# what it received from the v1 record, for every key v1 produced.
+
+_V1_AOI_VISIT = {
+    "event_id": "B:511101710:1755308361:2868795:994615_d8f26fe4-4d81-4365-adf5-b8d3b2a8fcc8_1788890029_aoi_visit",
+    "event_type": "aoi_visit",
+    "start": {"point": {"lat": -0.7890933333333333, "lon": 107.67064666666667}, "time": "2026-09-08T17:53:49Z"},
+    "end": None,
+    "vessels": {"vessel_0": {"category": "cargo", "class": "vessel", "country_filter": ["PLW"], "display_country": "Palau",
+                             "mmsi": 511101710, "name": "GREEN BAY", "length": 79, "type": "CARGO", "vessel_id": "511101710"}},
+    "event_details": {"average_speed": None, "data_source": None, "distance": None, "duration": None, "correlated": None,
+                      "image_url": None, "entry_speed": "7.800000190734863", "entry_heading": "307", "end_heading": None,
+                      "visit_type": "end"},
+}
+_V2_AOI_VISIT = {
+    "eventId": _V1_AOI_VISIT["event_id"], "eventType": "aoi_visit",
+    "start": _V1_AOI_VISIT["start"], "end": None,
+    "vessels": {"vessel0": {"vesselId": "511101710", "name": "GREEN BAY", "mmsi": 511101710, "imo": 9373175, "countryCode": ["PLW"],
+                            "trackId": "B:511101710:1755308361:2868795:994615", "category": "cargo", "subcategory": None,
+                            "vesselType": "CARGO", "gfwVesselId": None, "displayCountry": "Palau", "length": 79, "class": "vessel"},
+                "vessel1": None},
+    "eventDetails": {"__typename": "AoiVisitEventDetails", "entrySpeed": 7.800000190734863, "entryHeading": 307, "endHeading": None},
+}
+_V1_SPEED_RANGE = {
+    "event_id": "B:563074580:1638492069:2663937:1087021_6a2e736f87c4e6d991424fe3_1788893817.0_speed_range",
+    "event_type": "speed_range",
+    "start": {"point": {"lat": 1.2555016666666667, "lon": 103.72687333333333}, "time": "2026-09-08T17:54:45Z"},
+    "end": {"point": {"lat": 1.2157116666666667, "lon": 103.68442666666667}, "time": "2026-09-08T20:25:26Z"},
+    "vessels": {"vessel_0": {"category": "service", "class": "vessel", "country_filter": ["SGP"], "display_country": "Singapore",
+                             "mmsi": 563074580, "name": "VISION 227", "length": 24, "type": "TUG", "vessel_id": "563074580"}},
+    "event_details": {"average_speed": 1.389130423898282, "data_source": None, "distance": 6.577, "duration": 9221, "correlated": None,
+                      "image_url": None, "entry_speed": None, "entry_heading": None, "end_heading": None, "visit_type": "end"},
+}
+_V2_SPEED_RANGE = {
+    "eventId": _V1_SPEED_RANGE["event_id"], "eventType": "speed_range",
+    "start": _V1_SPEED_RANGE["start"], "end": _V1_SPEED_RANGE["end"],
+    "vessels": {"vessel0": {"vesselId": "563074580", "name": "VISION 227", "mmsi": 563074580, "imo": 9907770, "countryCode": ["SGP"],
+                            "trackId": "B:563074580:1638492069:2663937:1087021", "category": "service", "subcategory": None,
+                            "vesselType": "TUG", "gfwVesselId": None, "displayCountry": "Singapore", "length": 24, "class": "vessel"},
+                "vessel1": None},
+    "eventDetails": {"__typename": "SpeedRangeEventDetails", "averageSpeed": 1.389130423898282, "distance": 6.577, "durationSec": 9221},
+}
+_V1_VIIRS = {
+    "event_id": "VJ102DNB_NRT.A2026251.1830.021.2026251220648_3.356_103.939", "event_type": "viirs",
+    "start": {"point": {"lat": 3.356, "lon": 103.939}, "time": "2026-09-08T18:30:00Z"},
+    "end": {"point": {"lat": 3.356, "lon": 103.939}, "time": "2026-09-08T18:30:00Z"},
+    "vessels": {"vessel_0": None},
+    "event_details": {"average_speed": None, "data_source": "noaa", "distance": None, "duration": None, "correlated": False,
+                      "image_url": "https://cdn.sky-prod-a.skylight.earth/sat-service/viirs-noaa/detections/2026/09/08/x.jpeg",
+                      "entry_speed": None, "entry_heading": None, "end_heading": None, "visit_type": "end"},
+}
+_V2_VIIRS = {
+    "eventId": _V1_VIIRS["event_id"], "eventType": "viirs", "start": _V1_VIIRS["start"], "end": _V1_VIIRS["end"],
+    "vessels": {"vessel0": None, "vessel1": None},
+    "eventDetails": {"__typename": "ViirsEventDetails", "imageUrl": _V1_VIIRS["event_details"]["image_url"], "dataSource": "noaa",
+                     "detectionType": "dark", "estimatedLength": None, "frameIds": ["abc"], "heading": None, "radianceNw": 16.67},
+}
+_PARITY_CONFIG = [
+    {"skylight_event_type": "aoi_visit", "event_title": "Marine Entry", "event_type": "entry_alert_rep"},
+    {"skylight_event_type": "speed_range", "event_title": "Speed Range", "event_type": "speed_range_alert_rep"},
+    {"skylight_event_type": ["viirs", "sar_sentinel1", "eo_sentinel2", "eo_landsat_8_9"], "event_title": "Vessel Detection", "event_type": "detection_alert_rep"},
+]
+
+
+@pytest.mark.parametrize("v1_item, v2_record", [
+    (_V1_AOI_VISIT, _V2_AOI_VISIT),
+    (_V1_SPEED_RANGE, _V2_SPEED_RANGE),
+    (_V1_VIIRS, _V2_VIIRS),
+])
+def test_v2_record_transforms_to_the_same_er_event_as_v1(v1_item, v2_record):
+    from_v1 = transform(_PARITY_CONFIG, v1_item)
+    from_v2 = transform(_PARITY_CONFIG, normalize_v2_event(v2_record))
+
+    assert from_v2["title"] == from_v1["title"]
+    assert from_v2["event_type"] == from_v1["event_type"]
+    assert from_v2["recorded_at"] == from_v1["recorded_at"]
+    assert from_v2["location"] == from_v1["location"]
+    # Every key v1 produced is present with the identical value (same type too);
+    # v2 may add extra keys on top (imo, track_id, radiance_nw, ...).
+    for key, value in from_v1["event_details"].items():
+        assert key in from_v2["event_details"], f"missing v1 key {key}"
+        assert from_v2["event_details"][key] == value, key
+        assert type(from_v2["event_details"][key]) is type(value), key
 
 
 # --- list_aois reference action ---

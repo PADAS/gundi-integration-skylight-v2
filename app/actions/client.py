@@ -65,36 +65,49 @@ EMPTY_VESSEL_DICT = {
 # is reshaped here into the v1 layout: fields with a v1 equivalent are written
 # under their v1 key, and v2-only fields are passed through in snake_case.
 
-# v1 vessel key <- v2 vessel field. v2 fields not listed here (imo,
-# countryCode, trackId, gfwVesselId) pass through as snake_case extras.
-# v1 `class` and `country_filter` have no v2 equivalent and are not emitted.
+# v1 vessel key <- v2 vessel field. Every v1 vessel key has a v2 source
+# (verified 2026-09-08 on 1,973 identical events: 0 mismatches). v2 fields not
+# listed here (imo, trackId, gfwVesselId) pass through as snake_case extras.
 _V2_VESSEL_FIELD_MAP = {
     "vessel_id": "vesselId",
     "name": "name",
     "mmsi": "mmsi",
     "category": "category",
     "subcategory": "subcategory",
+    "class": "class",
+    "country_filter": "countryCode",
     "type": "vesselType",
     "display_country": "displayCountry",
     "length": "length",
 }
 
-# v1 event_details key <- v2 eventDetails field. v2-only fields (fishingScore,
-# osrScore, detectionType, score, radianceNw, ...) pass through as snake_case.
-# v1 `visit_type` has no v2 equivalent and is not emitted.
+# v1 event_details key <- v2 eventDetails field (same verification). v2-only
+# fields (fishingScore, osrScore, detectionType, score, radianceNw, ...) pass
+# through as snake_case.
 _V2_DETAILS_FIELD_MAP = {
     "average_speed": "averageSpeed",
     "distance": "distance",
-    "duration": "durationSec",
+    "duration": "durationSec",   # v1 `duration` was already in seconds
     "image_url": "imageUrl",
+    "data_source": "dataSource",  # e.g. "sentinel2", "noaa_21"
     "entry_speed": "entrySpeed",
     "entry_heading": "entryHeading",
     "end_heading": "endHeading",
 }
 
-# Satellite detection event types. In v1 these carried `data_source` (the
-# sensor) and `correlated` (AIS-correlated or not); v2 expresses the same via
-# eventType and eventDetails.detectionType ("dark" | "ais_correlated").
+# v1 serialised these three as strings ("7.800000190734863", "307"); v2 returns
+# numbers. Stringified so EarthRanger keeps receiving the same value types.
+_V1_STRING_DETAILS = ("entry_speed", "entry_heading", "end_heading")
+
+# v1 returned visit_type == "end" on every event of every type (1,973/1,973 in
+# the verification sample). v2 has no such field; the constant is kept so the
+# event_details EarthRanger receives stay identical. Drop it once the ER event
+# schemas no longer reference it.
+_V1_CONSTANT_VISIT_TYPE = "end"
+
+# Satellite detection event types. v1 carried `correlated` (AIS-correlated or
+# not); v2 expresses the same via eventDetails.detectionType ("dark" |
+# "ais_correlated"). Verified equal on 556/556 detections.
 _DETECTION_EVENT_TYPES = {"viirs", "sar_sentinel1", "eo_sentinel2", "eo_landsat_8_9"}
 
 
@@ -120,8 +133,11 @@ def normalize_v2_event(record: dict) -> dict:
     event_type = record.get("eventType")
     v2_details = record.get("eventDetails") or {}
     details = _reshape_v2_fields(v2_details, _V2_DETAILS_FIELD_MAP)
+    for key in _V1_STRING_DETAILS:
+        if details.get(key) is not None:
+            details[key] = str(details[key])
+    details["visit_type"] = _V1_CONSTANT_VISIT_TYPE
     if event_type in _DETECTION_EVENT_TYPES:
-        details["data_source"] = event_type
         detection_type = v2_details.get("detectionType")
         if detection_type is not None:
             details["correlated"] = detection_type == "ais_correlated"
@@ -508,6 +524,7 @@ async def get_skylight_events(integration, config_data, auth):
                             gfwVesselId
                             displayCountry
                             length
+                            class
                         }
                         vessel1 {
                             vesselId
@@ -522,6 +539,7 @@ async def get_skylight_events(integration, config_data, auth):
                             gfwVesselId
                             displayCountry
                             length
+                            class
                         }
                     }
                     eventDetails {
@@ -543,6 +561,7 @@ async def get_skylight_events(integration, config_data, auth):
                         }
                         ... on ImageryMetadataEventDetails {
                             imageUrl
+                            dataSource
                             detectionType
                             score
                             estimatedLength
@@ -556,6 +575,7 @@ async def get_skylight_events(integration, config_data, auth):
                         }
                         ... on ViirsEventDetails {
                             imageUrl
+                            dataSource
                             detectionType
                             estimatedLength
                             estimatedSpeedKts
