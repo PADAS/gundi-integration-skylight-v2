@@ -1,6 +1,7 @@
 import base64
 import json
 import logging
+import re
 import pydantic
 
 import app.settings.integration as settings
@@ -45,6 +46,100 @@ EMPTY_VESSEL_DICT = {
     "subcategory": "N/A",
     "type": "N/A",
 }
+
+# --- searchEventsV2 -> v1 record shape -------------------------------------
+# The connector was written against Skylight's v1 `events` query. Everything
+# downstream of get_skylight_events (handlers.transform, get_clean_event_id,
+# attachments) and the EarthRanger event schemas expect that v1 layout:
+# snake_case keys and vessels keyed `vessel_0` / `vessel_1`. The v2
+# `searchEventsV2` query returns camelCase fields and `vessel0` / `vessel1`.
+# To swap the API without changing what EarthRanger receives, every v2 record
+# is reshaped here into the v1 layout: fields with a v1 equivalent are written
+# under their v1 key, and v2-only fields are passed through in snake_case.
+
+# v1 vessel key <- v2 vessel field. v2 fields not listed here (imo,
+# countryCode, trackId, gfwVesselId) pass through as snake_case extras.
+# v1 `class` and `country_filter` have no v2 equivalent and are not emitted.
+_V2_VESSEL_FIELD_MAP = {
+    "vessel_id": "vesselId",
+    "name": "name",
+    "mmsi": "mmsi",
+    "category": "category",
+    "subcategory": "subcategory",
+    "type": "vesselType",
+    "display_country": "displayCountry",
+    "length": "length",
+}
+
+# v1 event_details key <- v2 eventDetails field. v2-only fields (fishingScore,
+# osrScore, detectionType, score, radianceNw, ...) pass through as snake_case.
+# v1 `visit_type` has no v2 equivalent and is not emitted.
+_V2_DETAILS_FIELD_MAP = {
+    "average_speed": "averageSpeed",
+    "distance": "distance",
+    "duration": "durationSec",
+    "image_url": "imageUrl",
+    "entry_speed": "entrySpeed",
+    "entry_heading": "entryHeading",
+    "end_heading": "endHeading",
+}
+
+# Satellite detection event types. In v1 these carried `data_source` (the
+# sensor) and `correlated` (AIS-correlated or not); v2 expresses the same via
+# eventType and eventDetails.detectionType ("dark" | "ais_correlated").
+_DETECTION_EVENT_TYPES = {"viirs", "sar_sentinel1", "eo_sentinel2", "eo_landsat_8_9"}
+
+
+def _camel_to_snake(name: str) -> str:
+    return re.sub(r"(?<!^)(?=[A-Z])", "_", name).lower()
+
+
+def _reshape_v2_fields(source, field_map: dict) -> dict:
+    """Rename v2 fields to their v1 keys per `field_map`; pass every other
+    field through in snake_case. GraphQL meta fields (`__typename`) are dropped."""
+    source = source or {}
+    mapped_v2_names = set(field_map.values())
+    out = {v1_key: source[v2_key] for v1_key, v2_key in field_map.items() if v2_key in source}
+    for key, value in source.items():
+        if key in mapped_v2_names or key.startswith("__"):
+            continue
+        out[_camel_to_snake(key)] = value
+    return out
+
+
+def normalize_v2_event(record: dict) -> dict:
+    """Reshape one `searchEventsV2` record into the v1 `events` item layout."""
+    event_type = record.get("eventType")
+    v2_details = record.get("eventDetails") or {}
+    details = _reshape_v2_fields(v2_details, _V2_DETAILS_FIELD_MAP)
+    if event_type in _DETECTION_EVENT_TYPES:
+        details["data_source"] = event_type
+        detection_type = v2_details.get("detectionType")
+        if detection_type is not None:
+            details["correlated"] = detection_type == "ais_correlated"
+    for key in ("createdAt", "updatedAt"):
+        if record.get(key) is not None:
+            details[_camel_to_snake(key)] = record[key]
+
+    v2_vessels = record.get("vessels") or {}
+    vessel0 = v2_vessels.get("vessel0")
+    # vessel_0 is always present (None -> EMPTY_VESSEL_DICT in transform, as in
+    # v1). vessel_1 is only emitted when v2 actually returned a second vessel,
+    # so single-vessel events don't gain a set of "N/A" vessel_1 fields.
+    vessels = {"vessel_0": _reshape_v2_fields(vessel0, _V2_VESSEL_FIELD_MAP) if vessel0 else None}
+    vessel1 = v2_vessels.get("vessel1")
+    if vessel1:
+        vessels["vessel_1"] = _reshape_v2_fields(vessel1, _V2_VESSEL_FIELD_MAP)
+
+    return {
+        "event_id": record.get("eventId"),
+        "event_type": event_type,
+        "start": record.get("start"),
+        "end": record.get("end"),
+        "vessels": vessels,
+        "event_details": details,
+    }
+
 
 # Default mapping values (for ER destinations)
 # Maps a Skylight event type (the snake_case keys here) to its EarthRanger
@@ -330,7 +425,7 @@ async def execute_gql_query(gql_client, query, params, integration, auth):
             # hold the stale token, so retrying with the same client would fail
             # identically. The proactive _is_token_expired check in
             # build_request_header prevents this path in the common case.
-            logger.warning(f'"getRendedzvousExternal" query returned {code}, clearing token for next run.')
+            logger.warning(f'"searchEventsV2" query returned {code}, clearing token for next run.')
             await state_manager.delete_state(str(integration.id), "pull_events", auth.username)
         raise
 
@@ -351,58 +446,38 @@ async def get_skylight_events(integration, config_data, auth):
 
     events = {}
 
-    # GetEvents query (external)
+    # searchEventsV2 query. Records are reshaped into the v1 layout by
+    # normalize_v2_event before they leave this function.
     query = gql(
         """
-        query getRendedzvousExternal(
-            $eventTypes:[EventType]!
+        query searchSkylightEventsV2(
+            $eventTypes: [String!]!
             $aoiId: String
             $startTime: String
-            $pageSize: Int
-            $pageNum: Int
+            $limit: Int
+            $offset: Int
+            $snapshotId: String
         )
         {
-            events(
-                eventTypes: $eventTypes,
-                aoiId: $aoiId,
-                startTime: $startTime
-                pageSize: $pageSize
-                pageNum: $pageNum
-            ) {
-                items {
-                    event_id
-                    event_type  
+            searchEventsV2(input: {
+                eventType: { inc: $eventTypes }
+                intersectsAoiId: $aoiId
+                startTime: { gte: $startTime }
+                limit: $limit
+                offset: $offset
+                snapshotId: $snapshotId
+            }) {
+                records {
+                    eventId
+                    eventType
+                    createdAt
+                    updatedAt
                     start {
                         point {
                             lat
                             lon
                         }
                         time
-                    }
-                    vessels {
-                        vessel_0 {
-                            category
-                            class
-                            country_filter
-                            display_country
-                            mmsi
-                            name
-                            length
-                            type
-                            vessel_id
-                        }
-                    }
-                    event_details {
-                        average_speed
-                        data_source
-                        distance
-                        duration
-                        correlated
-                        image_url
-                        entry_speed
-                        entry_heading
-                        end_heading
-                        visit_type
                     }
                     end {
                         point {
@@ -411,11 +486,81 @@ async def get_skylight_events(integration, config_data, auth):
                         }
                         time
                     }
+                    vessels {
+                        vessel0 {
+                            vesselId
+                            name
+                            mmsi
+                            imo
+                            countryCode
+                            trackId
+                            category
+                            subcategory
+                            vesselType
+                            gfwVesselId
+                            displayCountry
+                            length
+                        }
+                        vessel1 {
+                            vesselId
+                            name
+                            mmsi
+                            imo
+                            countryCode
+                            trackId
+                            category
+                            subcategory
+                            vesselType
+                            gfwVesselId
+                            displayCountry
+                            length
+                        }
+                    }
+                    eventDetails {
+                        ... on FishingEventDetails {
+                            fishingScore
+                        }
+                        ... on DarkRendezvousEventDetails {
+                            osrScore
+                        }
+                        ... on SpeedRangeEventDetails {
+                            averageSpeed
+                            distance
+                            durationSec
+                        }
+                        ... on AoiVisitEventDetails {
+                            entrySpeed
+                            entryHeading
+                            endHeading
+                        }
+                        ... on ImageryMetadataEventDetails {
+                            imageUrl
+                            detectionType
+                            score
+                            estimatedLength
+                            estimatedSpeedKts
+                            estimatedVesselCategory
+                            frameIds
+                            heading
+                            distanceToCoastM
+                            orientation
+                            metersPerPixel
+                        }
+                        ... on ViirsEventDetails {
+                            imageUrl
+                            detectionType
+                            estimatedLength
+                            estimatedSpeedKts
+                            estimatedVesselCategory
+                            frameIds
+                            heading
+                            radianceNw
+                        }
+                    }
                 }
                 meta {
+                    snapshotId
                     total
-                    pageSize
-                    pageNum
                 }
             }
         }
@@ -454,17 +599,22 @@ async def get_skylight_events(integration, config_data, auth):
 
             page_num = 1
             total_pages = None
+            # v2 pins paging to a snapshot so results don't shift between
+            # pages. The id comes back with the first page and is echoed on
+            # every following one.
+            snapshot_id = None
 
             while total_pages is None or page_num <= total_pages:
                 params = {
                     "eventTypes": event_types,
                     "aoiId": aoi,
                     "startTime": start_time,
-                    "pageSize": page_size,
-                    "pageNum": page_num
+                    "limit": page_size,
+                    "offset": (page_num - 1) * page_size,
+                    "snapshotId": snapshot_id,
                 }
 
-                logger.info(f'Sending "getRendedzvousExternal" query request. Params: "{params}"...')
+                logger.info(f'Sending "searchEventsV2" query request. Params: "{params}"...')
 
                 try:
                     response = await execute_gql_query(gql_client, query, params, integration, auth)
@@ -473,7 +623,7 @@ async def get_skylight_events(integration, config_data, auth):
                     # failure is logged — query errors, 500s (TransportServerError),
                     # protocol errors, etc.
                     logger.error(
-                        f'"getRendedzvousExternal" page {page_num} failed for AOI "{aoi}": '
+                        f'"searchEventsV2" page {page_num} failed for AOI "{aoi}": '
                         f'{type(te).__name__}: {te}. '
                         f'Request params: {params}. '
                         f'Keeping {len(response_list)} events collected so far.',
@@ -496,16 +646,17 @@ async def get_skylight_events(integration, config_data, auth):
                     page_num += 1
                     continue
 
-                events_response = response['events']['items']
+                search_response = response['searchEventsV2'] or {}
+                events_response = search_response.get('records')
 
                 if events_response is None:
                     if none_retries >= 1:
                         logger.error(
-                            f'"getRendedzvousExternal" returned None twice for AOI "{aoi}", giving up.',
+                            f'"searchEventsV2" returned None twice for AOI "{aoi}", giving up.',
                             extra={"integration_id": str(integration.id), "aoi": aoi, "attention_needed": True}
                         )
                         break
-                    logger.info(f'"getRendedzvousExternal" query returned None, retrying with a new token...')
+                    logger.info(f'"searchEventsV2" query returned None, retrying with a new token...')
                     await state_manager.delete_state(str(integration.id), "pull_events", auth.username)
                     headers = await build_request_header(integration, auth, auth_client)
                     gql_client = build_events_client(default_transport_dict, headers)
@@ -519,19 +670,25 @@ async def get_skylight_events(integration, config_data, auth):
                 # Guard against a null/absent meta: without this, meta.get()
                 # would raise AttributeError, fall through to the broad except
                 # below, and drop the AOI *including events already collected*.
-                meta = response['events'].get('meta') or {}
+                meta = search_response.get('meta') or {}
+                if snapshot_id is None:
+                    snapshot_id = meta.get('snapshotId')
                 if total_pages is None:
                     total = meta.get('total') or 0
-                    # Use our requested page_size as the divisor (always >= 1),
-                    # not the echoed meta['pageSize'], to avoid a ZeroDivisionError
-                    # if Skylight ever returns pageSize: 0.
+                    # Divide by our requested page size (always >= 1), which is
+                    # also the offset step, so total_pages matches the offsets.
                     total_pages = (total + page_size - 1) // page_size
 
-                response_list.extend(events_response)
+                if not events_response:
+                    # Nothing left even though total_pages said otherwise
+                    # (Skylight caps meta.total). Don't request empty pages.
+                    break
+
+                response_list.extend(normalize_v2_event(record) for record in events_response)
                 page_num += 1
             events.update({aoi: response_list})
         except pydantic.ValidationError as ve:
-            message = f'Validation error in Skylight "getRendedzvousExternal" endpoint. {ve.json()}'
+            message = f'Validation error in Skylight "searchEventsV2" endpoint. {ve.json()}'
             logger.exception(
                 message,
                 extra={

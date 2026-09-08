@@ -16,6 +16,7 @@ from app.actions.client import (
     _log_skylight_error_response,
     PullEventsBadConfigException,
     _TOKEN_EXPIRY_SKEW_SECONDS,
+    normalize_v2_event,
 )
 from app.actions.configurations import ProcessEventsPerAOIConfig
 from app.actions.handlers import (
@@ -137,8 +138,11 @@ class _PullCfg:
     initial_data_window_days = 1
 
 
-def _page(items, total, page_size=2, page_num=1):
-    return {"events": {"items": items, "meta": {"total": total, "pageSize": page_size, "pageNum": page_num}}}
+def _page(items, total, page_size=2, page_num=1, snapshot_id="snap-1"):
+    # v2 records use camelCase; get_skylight_events reshapes them to the v1
+    # layout (event_id, ...) so downstream assertions use v1 keys.
+    records = None if items is None else [{"eventId": i["event_id"]} for i in items]
+    return {"searchEventsV2": {"records": records, "meta": {"total": total, "snapshotId": snapshot_id}}}
 
 
 @pytest.fixture
@@ -292,13 +296,192 @@ async def test_get_skylight_events_handles_null_meta(mocker, integration, auth, 
     # A null meta must not crash the AOI or discard events already collected.
     exec_mock = mocker.patch(
         "app.actions.client.execute_gql_query",
-        side_effect=[{"events": {"items": [{"event_id": "e1"}], "meta": None}}],
+        side_effect=[{"searchEventsV2": {"records": [{"eventId": "e1"}], "meta": None}}],
     )
 
     events, _ = await get_skylight_events(integration, _PullCfg(), auth)
 
     assert exec_mock.call_count == 1
-    assert events["aoi1"] == [{"event_id": "e1"}]
+    assert [e["event_id"] for e in events["aoi1"]] == ["e1"]
+
+
+@pytest.mark.asyncio
+async def test_get_skylight_events_sends_v2_paging_params_and_snapshot(mocker, integration, auth, patch_skylight_clients):
+    # total=3, pageSize=2 -> 2 pages. Page 1 has no snapshotId yet; page 2 must
+    # echo the snapshotId from page 1 and advance the offset by pageSize.
+    exec_mock = mocker.patch(
+        "app.actions.client.execute_gql_query",
+        side_effect=[
+            _page([{"event_id": "e1"}, {"event_id": "e2"}], total=3, snapshot_id="snap-abc"),
+            _page([{"event_id": "e3"}], total=3, snapshot_id="snap-abc"),
+        ],
+    )
+
+    await get_skylight_events(integration, _PullCfg(), auth)
+
+    first, second = [call.args[2] for call in exec_mock.call_args_list]
+    assert first["eventTypes"] == ["fishing_activity_history"]
+    assert first["aoiId"] == "aoi1"
+    assert first["limit"] == 2 and first["offset"] == 0 and first["snapshotId"] is None
+    assert second["limit"] == 2 and second["offset"] == 2 and second["snapshotId"] == "snap-abc"
+    for params in (first, second):
+        assert "pageSize" not in params and "pageNum" not in params
+
+
+@pytest.mark.asyncio
+async def test_get_skylight_events_stops_on_empty_page_before_total(mocker, integration, auth, patch_skylight_clients):
+    # Skylight caps meta.total, so total_pages can overshoot. An empty page must
+    # end the AOI instead of requesting the remaining (empty) pages.
+    exec_mock = mocker.patch(
+        "app.actions.client.execute_gql_query",
+        side_effect=[
+            _page([{"event_id": "e1"}, {"event_id": "e2"}], total=10),
+            _page([], total=10),
+            _page([{"event_id": "never"}], total=10),
+        ],
+    )
+
+    events, _ = await get_skylight_events(integration, _PullCfg(), auth)
+
+    assert exec_mock.call_count == 2
+    assert [e["event_id"] for e in events["aoi1"]] == ["e1", "e2"]
+
+
+# --- normalize_v2_event (v2 record -> v1 layout) ---
+
+
+def _v2_vessel(**overrides):
+    vessel = {
+        "vesselId": "412416076", "name": "23839", "mmsi": 412416076, "imo": None,
+        "countryCode": ["CHN"], "trackId": "B:412416076:1697504108", "category": "fishing",
+        "subcategory": None, "vesselType": "FISHING", "gfwVesselId": "78450769f", "displayCountry": "China",
+        "length": None,
+    }
+    vessel.update(overrides)
+    return vessel
+
+
+def test_normalize_v2_event_maps_record_and_vessel_to_v1_keys():
+    record = {
+        "eventId": "12bb22aa", "eventType": "fishing_activity_history",
+        "createdAt": "2026-09-08T22:37:36Z", "updatedAt": "2026-09-08T22:37:37Z",
+        "start": {"point": {"lat": 31.1, "lon": 126.1}, "time": "2026-09-08T10:53:18Z"},
+        "end": {"point": {"lat": 30.9, "lon": 126.3}, "time": "2026-09-08T19:56:52Z"},
+        "vessels": {"vessel0": _v2_vessel(), "vessel1": None},
+        "eventDetails": {"__typename": "FishingEventDetails", "fishingScore": 0.87},
+    }
+
+    result = normalize_v2_event(record)
+
+    assert result["event_id"] == "12bb22aa"
+    assert result["event_type"] == "fishing_activity_history"
+    assert result["start"] == record["start"] and result["end"] == record["end"]
+    # v1 vessel key names, keyed vessel_0; vessel_1 omitted when v2 returned none.
+    assert set(result["vessels"]) == {"vessel_0"}
+    vessel = result["vessels"]["vessel_0"]
+    assert vessel["vessel_id"] == "412416076"
+    assert vessel["name"] == "23839"
+    assert vessel["mmsi"] == 412416076
+    assert vessel["type"] == "FISHING"
+    assert vessel["display_country"] == "China"
+    assert vessel["category"] == "fishing"
+    # v2-only vessel fields pass through in snake_case.
+    assert vessel["country_code"] == ["CHN"]
+    assert vessel["track_id"] == "B:412416076:1697504108"
+    assert vessel["gfw_vessel_id"] == "78450769f"
+    assert "vessel_type" not in vessel and "vesselId" not in vessel
+    # v2-only detail fields pass through; GraphQL meta is dropped.
+    assert result["event_details"]["fishing_score"] == 0.87
+    assert result["event_details"]["created_at"] == "2026-09-08T22:37:36Z"
+    assert result["event_details"]["updated_at"] == "2026-09-08T22:37:37Z"
+    assert "__typename" not in result["event_details"]
+
+
+def test_normalize_v2_event_maps_speed_range_and_aoi_visit_details_to_v1_keys():
+    speed = normalize_v2_event({
+        "eventId": "s1", "eventType": "speed_range", "vessels": {"vessel0": None, "vessel1": None},
+        "eventDetails": {"averageSpeed": 3.22, "distance": 25.5, "durationSec": 16013},
+    })
+    assert speed["event_details"] == {"average_speed": 3.22, "distance": 25.5, "duration": 16013}
+
+    visit = normalize_v2_event({
+        "eventId": "a1", "eventType": "aoi_visit", "vessels": {"vessel0": None, "vessel1": None},
+        "eventDetails": {"entrySpeed": 11.2, "entryHeading": 132, "endHeading": None},
+    })
+    assert visit["event_details"] == {"entry_speed": 11.2, "entry_heading": 132, "end_heading": None}
+
+
+def test_normalize_v2_event_detection_sets_v1_data_source_correlated_and_image_url():
+    dark = normalize_v2_event({
+        "eventId": "d1", "eventType": "eo_sentinel2", "vessels": {"vessel0": None, "vessel1": None},
+        "eventDetails": {"imageUrl": "https://cdn/x.png", "detectionType": "dark", "score": 0.99, "radianceNw": None},
+    })
+    details = dark["event_details"]
+    assert details["image_url"] == "https://cdn/x.png"
+    assert details["data_source"] == "eo_sentinel2"
+    assert details["correlated"] is False
+    assert details["detection_type"] == "dark"
+    assert details["score"] == 0.99
+    # No vessel -> vessel_0 is None so transform fills EMPTY_VESSEL_DICT, as in v1.
+    assert dark["vessels"] == {"vessel_0": None}
+
+    ais = normalize_v2_event({
+        "eventId": "d2", "eventType": "viirs", "vessels": {"vessel0": _v2_vessel(), "vessel1": None},
+        "eventDetails": {"imageUrl": "https://cdn/y.jpeg", "detectionType": "ais_correlated", "radianceNw": 26.5},
+    })
+    assert ais["event_details"]["correlated"] is True
+    assert ais["event_details"]["data_source"] == "viirs"
+    assert ais["event_details"]["radiance_nw"] == 26.5
+    assert ais["vessels"]["vessel_0"]["name"] == "23839"
+
+
+def test_normalize_v2_event_rendezvous_keeps_second_vessel_as_vessel_1():
+    result = normalize_v2_event({
+        "eventId": "r1", "eventType": "standard_rendezvous",
+        "vessels": {"vessel0": _v2_vessel(name="BIEN DONG"), "vessel1": _v2_vessel(name="LANH LX", mmsi=574345679)},
+        "eventDetails": {"__typename": "StandardRendezvousEventDetails"},
+    })
+    assert result["vessels"]["vessel_0"]["name"] == "BIEN DONG"
+    assert result["vessels"]["vessel_1"]["name"] == "LANH LX"
+    assert result["vessels"]["vessel_1"]["mmsi"] == 574345679
+    assert result["event_details"] == {}
+
+
+def test_normalize_v2_event_handles_missing_vessels_and_details():
+    result = normalize_v2_event({"eventId": "x", "eventType": "fishing_activity_history"})
+    assert result["vessels"] == {"vessel_0": None}
+    assert result["event_details"] == {}
+    assert result["start"] is None and result["end"] is None
+
+
+def test_transform_of_normalized_v2_event_keeps_v1_er_keys(skylight_client):
+    # End-to-end contract: a v2 record, once normalized, produces the same
+    # event_details key names EarthRanger received from the v1 API.
+    record = {
+        "eventId": "S1C_...SAFE_31", "eventType": "sar_sentinel1",
+        "start": {"point": {"lat": 43.04, "lon": 31.63}, "time": "2026-09-08T15:51:23Z"},
+        "end": {"point": {"lat": 43.04, "lon": 31.63}, "time": "2026-09-08T15:51:23Z"},
+        "vessels": {"vessel0": _v2_vessel(name="PSV YESILKOY", imo=9709130), "vessel1": None},
+        "eventDetails": {"imageUrl": "https://cdn/s1.png", "detectionType": "ais_correlated", "score": 0.99},
+    }
+    config = [{"skylight_event_type": ["viirs", "sar_sentinel1"], "event_title": "Vessel Detection", "event_type": "detection_alert_rep"}]
+
+    result = transform(config, normalize_v2_event(record))
+
+    assert result["title"] == "Vessel Detection"
+    assert result["event_type"] == "detection_alert_rep"
+    details = result["event_details"]
+    assert details["vessel_0_name"] == "PSV YESILKOY"
+    assert details["vessel_0_mmsi"] == 412416076
+    assert details["vessel_0_display_country"] == "China"
+    assert details["vessel_0_type"] == "FISHING"
+    assert details["vessel_0_imo"] == 9709130
+    assert details["image_url"] == "https://cdn/s1.png"
+    assert details["data_source"] == "sar_sentinel1"
+    assert details["correlated"] is True
+    assert details["event_id"] == "S1C_...SAFE_31"
+    assert "entry_link" in details
+    assert not any(k.startswith("vessel_1_") for k in details)
 
 
 # --- map_event_type ---
