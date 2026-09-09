@@ -1141,6 +1141,24 @@ async def test_action_auth_success_does_not_log_token(mocker, integration):
 
 
 @pytest.mark.asyncio
+async def test_action_auth_reports_invalid_credentials_without_echoing_input(mocker, integration):
+    # Skylight answers a bad password with UNAUTHENTICATED; the portal should see
+    # a definitive "invalid" plus a readable reason, and never the raw error.
+    from app.actions.handlers import action_auth
+    from gql.transport.exceptions import TransportQueryError
+    mocker.patch("app.actions.client.build_graphql_client", return_value=mocker.MagicMock())
+    mocker.patch(
+        "app.actions.client.get_authentication_token",
+        side_effect=TransportQueryError("boom", errors=[{"message": "Invalid username or password",
+                                                         "extensions": {"code": "UNAUTHENTICATED"}}]),
+    )
+
+    result = await action_auth(integration, mocker.MagicMock())
+
+    assert result == {"valid_credentials": False, "error": "Skylight rejected the username or password."}
+
+
+@pytest.mark.asyncio
 async def test_action_auth_failure_returns_redacted_error(mocker, integration):
     from app.actions.handlers import action_auth
     mocker.patch("app.actions.client.build_graphql_client", return_value=mocker.MagicMock())

@@ -189,10 +189,16 @@ async def action_auth(integration, action_config: AuthenticateConfig):
         logger.info(f"Auth successful for integration '{integration.id}'.")
         return {"valid_credentials": True}
     except Exception as e:
-        # Full detail stays server-side. The caller gets the classified title
-        # only (e.g. "Could not reach the provider (HTTP 503)") or the exception
-        # type, never str(e): httpx messages can embed the request URL.
+        # Full detail stays server-side. The caller gets a fixed, non-echoing
+        # message, never str(e): httpx messages can embed the request URL.
         logger.exception(f"An error occurred while fetching token for integration '{integration.id}'")
+        if isinstance(e, TransportQueryError) and client._gql_error_code(e) in client._AUTH_ERROR_CODES:
+            # Skylight rejected the credentials outright, so this is a definitive
+            # answer ("invalid"), not an inconclusive one ("could not check").
+            return {
+                "valid_credentials": False,
+                "error": "Skylight rejected the username or password.",
+            }
         classified = classify_error(e)
         error_text = format_classified_error(classified, include_message=False) if classified else type(e).__name__
         return {"valid_credentials": None, "error": error_text}
