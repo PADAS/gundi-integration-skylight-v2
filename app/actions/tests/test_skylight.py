@@ -391,22 +391,29 @@ async def test_get_skylight_events_stops_on_empty_page_before_total(mocker, inte
 
 
 @pytest.mark.asyncio
-async def test_get_skylight_events_warns_when_total_hits_skylight_cap(mocker, integration, auth, patch_skylight_clients):
-    # meta.total at the 10k cap means Skylight most likely ignored an unknown AOI id
-    # and returned worldwide events; surface it with attention_needed.
-    mocker.patch(
+async def test_get_skylight_events_skips_the_aoi_when_total_hits_skylight_cap(mocker, integration, auth, patch_skylight_clients):
+    # Hitting the cap means the result is truncated and probably unrepresentative
+    # (an unknown AOI id makes Skylight return worldwide events). Rather than
+    # pushing 10,000 arbitrary events downstream, the AOI is skipped entirely and
+    # flagged for an operator.
+    exec_mock = mocker.patch(
         "app.actions.client.execute_gql_query",
         side_effect=[_page([{"event_id": "e1"}, {"event_id": "e2"}], total=10000), _page([], total=10000)],
     )
     log = mocker.patch("app.actions.client.logger")
 
-    await get_skylight_events(integration, _PullCfg(), auth)
+    events, _ = await get_skylight_events(integration, _PullCfg(), auth)
 
+    # Stopped after the first page; nothing collected, so nothing is sent and
+    # (via latest_update_cursor) no cursor is advanced for this AOI.
+    assert exec_mock.call_count == 1
+    assert events["aoi1"] == []
     cap_warnings = [
         call for call in log.warning.call_args_list
-        if "result cap" in str(call) and call.kwargs.get("extra", {}).get("attention_needed")
+        if "Skipping AOI" in str(call) and call.kwargs.get("extra", {}).get("attention_needed")
     ]
     assert len(cap_warnings) == 1
+    assert "needs review" in str(cap_warnings[0])
 
 
 @pytest.mark.asyncio
@@ -424,13 +431,14 @@ async def test_get_skylight_events_no_cap_warning_below_cap(mocker, integration,
 
 @pytest.mark.asyncio
 async def test_get_skylight_events_clamps_last_page_to_result_cap(mocker, integration, auth, patch_skylight_clients):
-    # Skylight rejects offset + limit > 10000. With page size 3000 and total 10000
-    # the 4th page must ask for limit 1000 at offset 9000, and no 5th request.
+    # Skylight rejects offset + limit > 10000. A total just under the cap (so the
+    # skip-the-AOI guardrail does not fire) with page size 3000 still spans four
+    # pages, and the last must ask for limit 1000 at offset 9000, not 3000.
     class _BigPageCfg(_PullCfg):
         pageSize = 3000
 
     def page(n):
-        return _page([{"event_id": f"e{n}"}], total=10000)
+        return _page([{"event_id": f"e{n}"}], total=9999)
     exec_mock = mocker.patch("app.actions.client.execute_gql_query", side_effect=[page(1), page(2), page(3), page(4)])
 
     await get_skylight_events(integration, _BigPageCfg(), auth)

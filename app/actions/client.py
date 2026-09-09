@@ -750,18 +750,28 @@ async def get_skylight_events(integration, config_data, auth):
                     # also the offset step, so total_pages matches the offsets.
                     total_pages = (total + page_size - 1) // page_size
                     if total >= SKYLIGHT_RESULT_CAP:
+                        # Hitting the cap means the query matched at least as many
+                        # events as Skylight will ever return, so the result is
+                        # both truncated and unrepresentative. Rather than pushing
+                        # an arbitrary 10,000 events (potentially worldwide) into
+                        # the destination, skip the AOI and leave it to an operator.
                         logger.warning(
-                            f'Skylight reported {total} events for AOI "{aoi}" (started since {start_time}, '
-                            f'updated since {updated_since}), which is its result cap ({SKYLIGHT_RESULT_CAP}). '
-                            f'Skylight ignores unknown AOI ids and returns worldwide events, so check that '
-                            f'this AOI id exists in the Skylight account. Only {SKYLIGHT_RESULT_CAP} events '
-                            f'are fetched per run; the rest are picked up by later runs.',
+                            f'Skipping AOI "{aoi}": Skylight returned its maximum of {SKYLIGHT_RESULT_CAP} '
+                            f'events (started since {start_time}, updated since {updated_since}). '
+                            f'This configuration needs review — the AOI id may be invalid (Skylight ignores '
+                            f'unknown AOI ids and returns worldwide events), or the configuration may be too '
+                            f'loose (time window or event types too broad). No events were processed for this '
+                            f'AOI; narrow the configuration or correct the AOI id and run again.',
                             extra={
                                 "integration_id": str(integration.id),
                                 "aoi": aoi,
                                 "attention_needed": True,
                             }
                         )
+                        # Nothing collected yet (this is the first page), but be
+                        # explicit: the AOI contributes no events and no cursor.
+                        response_list = []
+                        break
 
                 if not events_response:
                     # Nothing left even though total_pages said otherwise
