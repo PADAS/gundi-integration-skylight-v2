@@ -380,6 +380,24 @@ async def test_get_skylight_events_no_cap_warning_below_cap(mocker, integration,
     assert not any("result cap" in str(call) for call in log.warning.call_args_list)
 
 
+@pytest.mark.asyncio
+async def test_get_skylight_events_clamps_last_page_to_result_cap(mocker, integration, auth, patch_skylight_clients):
+    # Skylight rejects offset + limit > 10000. With page size 3000 and total 10000
+    # the 4th page must ask for limit 1000 at offset 9000, and no 5th request.
+    class _BigPageCfg(_PullCfg):
+        pageSize = 3000
+
+    def page(n):
+        return _page([{"event_id": f"e{n}"}], total=10000)
+    exec_mock = mocker.patch("app.actions.client.execute_gql_query", side_effect=[page(1), page(2), page(3), page(4)])
+
+    await get_skylight_events(integration, _BigPageCfg(), auth)
+
+    requests = [(c.args[2]["offset"], c.args[2]["limit"]) for c in exec_mock.call_args_list]
+    assert requests == [(0, 3000), (3000, 3000), (6000, 3000), (9000, 1000)]
+    assert all(offset + limit <= 10000 for offset, limit in requests)
+
+
 # --- normalize_v2_event (v2 record -> v1 layout) ---
 
 

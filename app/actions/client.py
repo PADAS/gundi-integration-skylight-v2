@@ -639,12 +639,19 @@ async def get_skylight_events(integration, config_data, auth):
             snapshot_id = None
 
             while total_pages is None or page_num <= total_pages:
+                offset = (page_num - 1) * page_size
+                # Skylight rejects offset + limit > SKYLIGHT_RESULT_CAP, so the
+                # last page is clamped to the remaining window (e.g. page size
+                # 3000 -> offsets 0/3000/6000/9000 with the last limit 1000).
+                limit = min(page_size, SKYLIGHT_RESULT_CAP - offset)
+                if limit <= 0:
+                    break
                 params = {
                     "eventTypes": event_types,
                     "aoiId": aoi,
                     "startTime": start_time,
-                    "limit": page_size,
-                    "offset": (page_num - 1) * page_size,
+                    "limit": limit,
+                    "offset": offset,
                     "snapshotId": snapshot_id,
                 }
 
