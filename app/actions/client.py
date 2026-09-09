@@ -23,7 +23,7 @@ from app.services.errors import ConfigurationNotFound
 from app.services.utils import find_config_for_action
 from app.services.state import IntegrationStateManager
 
-from typing import Any
+from typing import Any, Optional
 
 
 logger = logging.getLogger(__name__)
@@ -99,11 +99,8 @@ _V2_DETAILS_FIELD_MAP = {
 # numbers. Stringified so EarthRanger keeps receiving the same value types.
 _V1_STRING_DETAILS = ("entry_speed", "entry_heading", "end_heading")
 
-# v1 returned visit_type == "end" on every event of every type (1,973/1,973 in
-# the verification sample). v2 has no such field; the constant is kept so the
-# event_details EarthRanger receives stay identical. Drop it once the ER event
-# schemas no longer reference it.
-_V1_CONSTANT_VISIT_TYPE = "end"
+# v1 also returned `visit_type: "end"` on every event of every type; it carried
+# no information and v2 has no such field, so it is intentionally not emitted.
 
 # Satellite detection event types. v1 carried `correlated` (AIS-correlated or
 # not); v2 expresses the same via eventDetails.detectionType ("dark" |
@@ -136,7 +133,6 @@ def normalize_v2_event(record: dict) -> dict:
     for key in _V1_STRING_DETAILS:
         if details.get(key) is not None:
             details[key] = str(details[key])
-    details["visit_type"] = _V1_CONSTANT_VISIT_TYPE
     if event_type in _DETECTION_EVENT_TYPES:
         detection_type = v2_details.get("detectionType")
         if detection_type is not None:
@@ -162,7 +158,23 @@ def normalize_v2_event(record: dict) -> dict:
         "end": record.get("end"),
         "vessels": vessels,
         "event_details": details,
+        # Top-level copy for the pull cursor (transform ignores unknown keys).
+        "updated_at": record.get("updatedAt"),
     }
+
+
+def latest_update_cursor(events) -> Optional[str]:
+    """The newest `updated_at` among normalized events, or None.
+
+    Saved per AOI as the pull cursor: the next run asks Skylight for events
+    *updated* at or after it. Skylight publishes many events hours after
+    their start time (satellite detections ~6 h, some entries/speed events a
+    day later), so a cursor on event start time silently skipped them; one on
+    update time does not, and it also picks up edits (e.g. an entry alert
+    gaining its exit time) for the patch path.
+    """
+    stamps = [e.get("updated_at") for e in events if e.get("updated_at")]
+    return max(stamps) if stamps else None
 
 
 # Default mapping values (for ER destinations)
@@ -478,6 +490,7 @@ async def get_skylight_events(integration, config_data, auth):
             $eventTypes: [String!]!
             $aoiId: String
             $startTime: String
+            $updated: DateFilter
             $limit: Int
             $offset: Int
             $snapshotId: String
@@ -487,6 +500,9 @@ async def get_skylight_events(integration, config_data, auth):
                 eventType: { inc: $eventTypes }
                 intersectsAoiId: $aoiId
                 startTime: { gte: $startTime }
+                updated: $updated
+                sortBy: updated
+                sortDirection: asc
                 limit: $limit
                 offset: $offset
                 snapshotId: $snapshotId
@@ -616,17 +632,26 @@ async def get_skylight_events(integration, config_data, auth):
         try:
             response_list = []
             none_retries = 0
-            saved_aoi_start_time = await state_manager.get_state(str(integration.id), "pull_events", aoi)
-            if saved_aoi_start_time:
-                start_time = dp(saved_aoi_start_time.get("start_time")).isoformat()
-            else:
-                start_time = (
-                        datetime.now(tz=timezone.utc).replace(hour=0, minute=0, second=0) -
-                        timedelta(days=initial_data_window_days)
-                ).isoformat()
+            # Outer bound on how old an event may be: only events that STARTED
+            # inside the configured window are considered, on every run.
+            start_time = (
+                    datetime.now(tz=timezone.utc).replace(hour=0, minute=0, second=0) -
+                    timedelta(days=initial_data_window_days)
+            ).isoformat()
+            # Cursor: events UPDATED at/after the newest update seen last run
+            # (see latest_update_cursor). Results are sorted oldest-update-first
+            # so a run that hits Skylight's result cap keeps the oldest events
+            # and the next run continues from where it stopped. A pre-existing
+            # `start_time` (the old start-time cursor) is used as the starting
+            # point once, then replaced by `updated_since`.
+            saved_state = await state_manager.get_state(str(integration.id), "pull_events", aoi) or {}
+            updated_since = saved_state.get("updated_since") or saved_state.get("start_time")
+            if updated_since:
+                updated_since = dp(updated_since).isoformat()
 
             logger.info(
-                f'Fetching Skylight events for AOI "{aoi}" since {start_time}. '
+                f'Fetching Skylight events for AOI "{aoi}" started since {start_time}'
+                f'{f" and updated since {updated_since}" if updated_since else " (no cursor yet)"}. '
                 f'Event types: {event_types}. Page size: {page_size}.'
             )
             pages_fetched = 0
@@ -650,6 +675,7 @@ async def get_skylight_events(integration, config_data, auth):
                     "eventTypes": event_types,
                     "aoiId": aoi,
                     "startTime": start_time,
+                    "updated": {"gte": updated_since} if updated_since else None,
                     "limit": limit,
                     "offset": offset,
                     "snapshotId": snapshot_id,
@@ -725,11 +751,11 @@ async def get_skylight_events(integration, config_data, auth):
                     total_pages = (total + page_size - 1) // page_size
                     if total >= SKYLIGHT_RESULT_CAP:
                         logger.warning(
-                            f'Skylight reported {total} events for AOI "{aoi}" since {start_time}, '
-                            f'which is its result cap ({SKYLIGHT_RESULT_CAP}). Skylight ignores unknown '
-                            f'AOI ids and returns worldwide events, so check that this AOI id exists '
-                            f'in the Skylight account. Only the newest {SKYLIGHT_RESULT_CAP} events '
-                            f'can be fetched.',
+                            f'Skylight reported {total} events for AOI "{aoi}" (started since {start_time}, '
+                            f'updated since {updated_since}), which is its result cap ({SKYLIGHT_RESULT_CAP}). '
+                            f'Skylight ignores unknown AOI ids and returns worldwide events, so check that '
+                            f'this AOI id exists in the Skylight account. Only {SKYLIGHT_RESULT_CAP} events '
+                            f'are fetched per run; the rest are picked up by later runs.',
                             extra={
                                 "integration_id": str(integration.id),
                                 "aoi": aoi,
@@ -747,7 +773,8 @@ async def get_skylight_events(integration, config_data, auth):
                 page_num += 1
             logger.info(
                 f'Fetched {len(response_list)} events for AOI "{aoi}" in {pages_fetched} page(s). '
-                f'Skylight reported total: {reported_total}. Window start: {start_time}.'
+                f'Skylight reported total: {reported_total}. Window start: {start_time}. '
+                f'Cursor: {updated_since}.'
             )
             events.update({aoi: response_list})
         except pydantic.ValidationError as ve:

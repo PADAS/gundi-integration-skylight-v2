@@ -327,6 +327,48 @@ async def test_get_skylight_events_sends_v2_paging_params_and_snapshot(mocker, i
     assert second["limit"] == 2 and second["offset"] == 2 and second["snapshotId"] == "snap-abc"
     for params in (first, second):
         assert "pageSize" not in params and "pageNum" not in params
+        assert params["updated"] is None   # first run: no cursor yet
+
+
+@pytest.mark.asyncio
+async def test_get_skylight_events_uses_updated_since_cursor(mocker, integration, auth, patch_skylight_clients):
+    patch_skylight_clients["state_manager"].get_state.return_value = {"updated_since": "2026-09-08T10:00:00+00:00"}
+    exec_mock = mocker.patch("app.actions.client.execute_gql_query", side_effect=[_page([{"event_id": "e1"}], total=1)])
+
+    await get_skylight_events(integration, _PullCfg(), auth)
+
+    params = exec_mock.call_args.args[2]
+    assert params["updated"] == {"gte": "2026-09-08T10:00:00+00:00"}
+    # The start-time window is still applied as the outer bound (never the cursor).
+    assert params["startTime"] < "2026-09-08T10:00:00+00:00" or params["startTime"] > "2026-09-08"
+
+
+@pytest.mark.asyncio
+async def test_get_skylight_events_migrates_legacy_start_time_cursor(mocker, integration, auth, patch_skylight_clients):
+    # State written by the previous version only has start_time; use it as the
+    # initial `updated` cursor instead of re-pulling the whole window.
+    patch_skylight_clients["state_manager"].get_state.return_value = {"start_time": "2026-09-08 09:30:00+00:00"}
+    exec_mock = mocker.patch("app.actions.client.execute_gql_query", side_effect=[_page([{"event_id": "e1"}], total=1)])
+
+    await get_skylight_events(integration, _PullCfg(), auth)
+
+    assert exec_mock.call_args.args[2]["updated"] == {"gte": "2026-09-08T09:30:00+00:00"}
+
+
+def test_query_sorts_oldest_update_first_and_filters_on_updated():
+    import app.actions.client as skylight_client
+    import inspect
+    src = inspect.getsource(skylight_client.get_skylight_events)
+    assert "updated: $updated" in src and "sortBy: updated" in src and "sortDirection: asc" in src
+
+
+def test_latest_update_cursor_picks_newest_and_ignores_missing():
+    from app.actions.client import latest_update_cursor
+    assert latest_update_cursor([]) is None
+    assert latest_update_cursor([{"event_id": "x"}]) is None
+    assert latest_update_cursor([
+        {"updated_at": "2026-09-08T10:00:00Z"}, {"updated_at": "2026-09-08T12:00:00Z"}, {"event_id": "no-stamp"},
+    ]) == "2026-09-08T12:00:00Z"
 
 
 @pytest.mark.asyncio
@@ -426,6 +468,7 @@ def test_normalize_v2_event_maps_record_and_vessel_to_v1_keys():
 
     assert result["event_id"] == "12bb22aa"
     assert result["event_type"] == "fishing_activity_history"
+    assert result["updated_at"] == "2026-09-08T22:37:37Z"   # top-level copy used for the pull cursor
     assert result["start"] == record["start"] and result["end"] == record["end"]
     # v1 vessel key names, keyed vessel_0; vessel_1 omitted when v2 returned none.
     assert set(result["vessels"]) == {"vessel_0"}
@@ -443,7 +486,7 @@ def test_normalize_v2_event_maps_record_and_vessel_to_v1_keys():
     assert "vessel_type" not in vessel and "vesselId" not in vessel
     # v2-only detail fields pass through; GraphQL meta is dropped.
     assert result["event_details"]["fishing_score"] == 0.87
-    assert result["event_details"]["visit_type"] == "end"   # v1 constant, kept for parity
+    assert "visit_type" not in result["event_details"]   # v1 constant carried no info; not emitted
     assert result["event_details"]["created_at"] == "2026-09-08T22:37:36Z"
     assert result["event_details"]["updated_at"] == "2026-09-08T22:37:37Z"
     assert "__typename" not in result["event_details"]
@@ -454,14 +497,14 @@ def test_normalize_v2_event_maps_speed_range_and_aoi_visit_details_to_v1_keys():
         "eventId": "s1", "eventType": "speed_range", "vessels": {"vessel0": None, "vessel1": None},
         "eventDetails": {"averageSpeed": 3.22, "distance": 25.5, "durationSec": 16013},
     })
-    assert speed["event_details"] == {"average_speed": 3.22, "distance": 25.5, "duration": 16013, "visit_type": "end"}
+    assert speed["event_details"] == {"average_speed": 3.22, "distance": 25.5, "duration": 16013}
 
     visit = normalize_v2_event({
         "eventId": "a1", "eventType": "aoi_visit", "vessels": {"vessel0": None, "vessel1": None},
         "eventDetails": {"entrySpeed": 11.2, "entryHeading": 132, "endHeading": None},
     })
     # v1 serialised these as strings; end_heading None stays None (transform drops it).
-    assert visit["event_details"] == {"entry_speed": "11.2", "entry_heading": "132", "end_heading": None, "visit_type": "end"}
+    assert visit["event_details"] == {"entry_speed": "11.2", "entry_heading": "132", "end_heading": None}
 
 
 def test_normalize_v2_event_detection_sets_v1_data_source_correlated_and_image_url():
@@ -497,13 +540,13 @@ def test_normalize_v2_event_rendezvous_keeps_second_vessel_as_vessel_1():
     assert result["vessels"]["vessel_0"]["name"] == "BIEN DONG"
     assert result["vessels"]["vessel_1"]["name"] == "LANH LX"
     assert result["vessels"]["vessel_1"]["mmsi"] == 574345679
-    assert result["event_details"] == {"visit_type": "end"}
+    assert result["event_details"] == {}
 
 
 def test_normalize_v2_event_handles_missing_vessels_and_details():
     result = normalize_v2_event({"eventId": "x", "eventType": "fishing_activity_history"})
     assert result["vessels"] == {"vessel_0": None}
-    assert result["event_details"] == {"visit_type": "end"}
+    assert result["event_details"] == {}
     assert result["start"] is None and result["end"] is None
 
 
@@ -763,6 +806,24 @@ async def test_action_pull_events_triggers_process_events_per_aoi(mocker, integr
             updated_config_data=[]
         )
     )
+
+
+@pytest.mark.asyncio
+async def test_action_pull_events_saves_updated_since_cursor_per_aoi(mocker, integration, pull_events_config, mock_publish_event):
+    mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
+    mocker.patch("app.actions.client.get_skylight_events", return_value=({
+        "aoi1": [{"event_id": "a", "updated_at": "2026-09-08T10:00:00Z"}, {"event_id": "b", "updated_at": "2026-09-08T11:00:00Z"}],
+        "aoi2": [{"event_id": "c"}],   # no update stamps -> no cursor written
+    }, []))
+    mocker.patch("app.actions.client.get_auth_config", return_value=None)
+    mocker.patch("app.services.state.IntegrationStateManager.get_state", return_value=None)
+    set_state = mocker.patch("app.services.state.IntegrationStateManager.set_state", return_value=None)
+    mocker.patch("app.actions.handlers.trigger_action", return_value=None)
+
+    result = await action_pull_events(integration, pull_events_config)
+
+    set_state.assert_called_once_with(str(integration.id), "pull_events", {"updated_since": "2026-09-08T11:00:00Z"}, "aoi1")
+    assert result["details"]["cursors"] == {"aoi1": "2026-09-08T11:00:00Z"}
 
 
 def test_batch_events_by_payload_size_keeps_small_lists_in_one_batch():
@@ -1052,6 +1113,8 @@ def test_v2_record_transforms_to_the_same_er_event_as_v1(v1_item, v2_record):
     # Every key v1 produced is present with the identical value (same type too);
     # v2 may add extra keys on top (imo, track_id, radiance_nw, ...).
     for key, value in from_v1["event_details"].items():
+        if key == "visit_type":
+            continue  # v1 constant "end" on every event; deliberately dropped (no v2 source, no information)
         assert key in from_v2["event_details"], f"missing v1 key {key}"
         assert from_v2["event_details"][key] == value, key
         assert type(from_v2["event_details"][key]) is type(value), key

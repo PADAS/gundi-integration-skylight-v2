@@ -291,6 +291,10 @@ async def action_pull_events(integration, action_config: PullEventsConfig):
             result["message"] = f"No events were pulled for integration: '{str(integration.id)}'."
             return result
 
+        # Cursor per AOI, from the raw batch (before the patch split below
+        # removes already-known events from the lists).
+        cursors = {aoi: client.latest_update_cursor(aoi_events) for aoi, aoi_events in events.items()}
+
         event_ids = []
         async def get_skylight_events_to_patch():
             # Get through the events and check if state_manager has it recorded from a previous execution
@@ -333,6 +337,14 @@ async def action_pull_events(integration, action_config: PullEventsConfig):
             )
             result["events_updated"] = len(response)
             result["details"]["updated"] = response
+
+        # Advance the per-AOI cursor. Saved here (not in process_events_per_aoi)
+        # so it also moves when a run yields only patches, and so parallel
+        # sub-action chunks can't overwrite each other's value.
+        for aoi, cursor in cursors.items():
+            if cursor:
+                await state_manager.set_state(str(integration.id), "pull_events", {"updated_since": cursor}, aoi)
+                result["details"].setdefault("cursors", {})[aoi] = cursor
 
         # Logged here (not only returned) because the HTTP response is lost when
         # a long run outlives the caller's timeout.
@@ -392,20 +404,9 @@ async def action_process_events_per_aoi(integration, action_config: ProcessEvent
                 }
             )
             raise e
-        else:
-            # Update states
-            state = {
-                "start_time": transformed_data[0].get("recorded_at")
-            }
-            await state_manager.set_state(
-                str(integration.id),
-                "pull_events",
-                state,
-                action_config.aoi
-            )
-            return result
-    else:
+        # The per-AOI cursor is owned by action_pull_events (updated_since).
         return result
+    return result
 
 
 async def process_attachments(transformed_data, response, integration):
