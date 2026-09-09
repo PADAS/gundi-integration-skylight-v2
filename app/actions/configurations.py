@@ -96,12 +96,34 @@ class PullEventsConfig(PullActionConfiguration):
     )
 
     @classmethod
+    def schema(cls, **kwargs):
+        # Inline the SkylightEventType enum into the array items. Pydantic emits
+        # `items: {"$ref": "#/definitions/..."}`, but the portal does not resolve
+        # a $ref inside array items, so the field falls back to a plain grey
+        # multi-select instead of the labelled checkbox list.
+        json_schema = super().schema(**kwargs)
+        event_types = (json_schema.get("properties") or {}).get("event_types") or {}
+        ref = (event_types.get("items") or {}).get("$ref")
+        if ref:
+            name = ref.rsplit("/", 1)[-1]
+            definition = (json_schema.get("definitions") or {}).get(name) or {}
+            if definition.get("enum"):
+                event_types["items"] = {"type": "string", "enum": list(definition["enum"])}
+                json_schema["definitions"] = {
+                    k: v for k, v in json_schema.get("definitions", {}).items() if k != name
+                }
+        return json_schema
+
+    @classmethod
     def ui_schema(cls):
         # aoi_ids stays a plain list of Skylight AOI ids (existing integrations
         # are untouched); the annotation only tells the portal it can offer a
         # live dropdown fed by the list_aois reference action.
         ui = super().ui_schema()
         ui.setdefault("aoi_ids", {}).setdefault("items", {})["gundi:reference"] = _reference("list_aois")
+        # Without this the portal renders the event-type list as a multi-select
+        # box; the operator-facing form has always shown checkboxes.
+        ui.setdefault("event_types", {})["ui:widget"] = "checkboxes"
         return ui
 
     @validator('event_types')

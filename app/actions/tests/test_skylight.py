@@ -1245,6 +1245,33 @@ async def test_action_list_aois_returns_portal_options(mocker, integration):
     assert by_value["no-name"]["label"] == "no-name" and by_value["no-name"]["description"] is None
 
 
+def test_event_types_render_as_checkboxes_with_an_inlined_enum():
+    # The portal renders this field from the registered schema. A $ref inside
+    # array items is not resolved there (falls back to a grey multi-select), and
+    # the checkbox list needs an explicit widget, so both are pinned here.
+    from app.actions.configurations import SkylightEventType
+
+    schema = PullEventsConfig.schema()
+    items = schema["properties"]["event_types"]["items"]
+    assert "$ref" not in items, "a $ref here silently degrades the portal form"
+    assert items == {"type": "string", "enum": [e.value for e in SkylightEventType]}
+    assert "SkylightEventType" not in (schema.get("definitions") or {})
+    assert PullEventsConfig.ui_schema()["event_types"]["ui:widget"] == "checkboxes"
+    # The inherited schedule toggle must keep rendering alongside it.
+    assert "run_on_schedule" in schema["properties"]
+
+
+def test_event_types_labels_still_validate_into_mapping_keys():
+    # The displayed labels must survive the validator and resolve to a key in
+    # DEFAULT_EVENT_MAPPING, otherwise the form saves values the pull rejects.
+    from app.actions.client import DEFAULT_EVENT_MAPPING
+    from app.actions.configurations import SkylightEventType
+
+    config = PullEventsConfig(aoi_ids=["aoi"], event_types=[e.value for e in SkylightEventType])
+
+    assert all(key in DEFAULT_EVENT_MAPPING for key in config.event_types)
+
+
 def test_pull_events_aoi_ids_carry_reference_annotation_for_registered_action():
     # Mirrors the portal contract: annotation on the array items, no ui:widget
     # (older portals keep the text input), free text allowed so pasted ids work,
