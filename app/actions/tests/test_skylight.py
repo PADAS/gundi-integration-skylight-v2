@@ -1057,6 +1057,42 @@ def test_v2_record_transforms_to_the_same_er_event_as_v1(v1_item, v2_record):
         assert type(from_v2["event_details"][key]) is type(value), key
 
 
+# --- action_auth: no secrets in logs or responses ---
+
+
+@pytest.mark.asyncio
+async def test_action_auth_success_does_not_log_token(mocker, integration):
+    from app.actions.handlers import action_auth
+    from app.actions.client import SkylightGetTokenResponse
+    mocker.patch("app.actions.client.build_graphql_client", return_value=mocker.MagicMock())
+    mocker.patch(
+        "app.actions.client.get_authentication_token",
+        return_value=SkylightGetTokenResponse(access_token="SECRET-TOKEN-XYZ", expires_in=3600, token_type="Bearer"),
+    )
+    log = mocker.patch("app.actions.handlers.logger")
+
+    result = await action_auth(integration, mocker.MagicMock())
+
+    assert result == {"valid_credentials": True}
+    assert "SECRET-TOKEN-XYZ" not in " ".join(str(c) for c in log.mock_calls)
+
+
+@pytest.mark.asyncio
+async def test_action_auth_failure_returns_redacted_error(mocker, integration):
+    from app.actions.handlers import action_auth
+    mocker.patch("app.actions.client.build_graphql_client", return_value=mocker.MagicMock())
+    mocker.patch(
+        "app.actions.client.get_authentication_token",
+        side_effect=httpx.ConnectError("boom https://api.skylight.earth/graphql?user=x&password=hunter2"),
+    )
+
+    result = await action_auth(integration, mocker.MagicMock())
+
+    assert result["valid_credentials"] is None
+    assert "hunter2" not in result["error"] and "graphql" not in result["error"]
+    assert result["error"]  # still says something useful (classified text or the exception type)
+
+
 # --- list_aois reference action ---
 
 

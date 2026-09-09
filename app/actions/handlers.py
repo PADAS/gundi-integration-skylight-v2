@@ -17,6 +17,7 @@ from app.actions.core import action_title
 from app.actions.configurations import AuthenticateConfig, PullEventsConfig, ProcessEventsPerAOIConfig, ListAOIsQuery, ReferenceDataResponse, ReferenceOption
 from app.services.action_scheduler import trigger_action
 from app.services.activity_logger import activity_logger, log_action_activity
+from app.services.errors import classify_error, format_classified_error
 from app.services.state import IntegrationStateManager
 from app.services.utils import generate_batches
 
@@ -183,11 +184,18 @@ async def action_auth(integration, action_config: AuthenticateConfig):
             logger.error(f"Auth unsuccessful for integration '{integration.id}'.")
             return {"valid_credentials": False}
 
-        logger.info(f"Auth successful for integration '{integration.id}'. Token: {token.access_token}")
+        # Never log the token itself: this handler also runs on the ephemeral
+        # (draft-credentials) path and logs are persistent.
+        logger.info(f"Auth successful for integration '{integration.id}'.")
         return {"valid_credentials": True}
     except Exception as e:
-        logger.info(f"An error occurred while fetching token for integration '{integration.id}'")
-        return {"valid_credentials": None, "error": str(e)}
+        # Full detail stays server-side. The caller gets the classified title
+        # only (e.g. "Could not reach the provider (HTTP 503)") or the exception
+        # type, never str(e): httpx messages can embed the request URL.
+        logger.exception(f"An error occurred while fetching token for integration '{integration.id}'")
+        classified = classify_error(e)
+        error_text = format_classified_error(classified, include_message=False) if classified else type(e).__name__
+        return {"valid_credentials": None, "error": error_text}
 
 
 @action_title("List AOIs")
