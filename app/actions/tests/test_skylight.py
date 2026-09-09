@@ -179,8 +179,10 @@ async def test_get_skylight_events_stops_at_last_page_via_meta(mocker, integrati
 
 
 @pytest.mark.asyncio
-async def test_get_skylight_events_skips_failed_page_and_continues(mocker, integration, auth, patch_skylight_clients):
-    # total=6, pageSize=2 -> 3 pages. Page 2 fails; page 1 and 3 are still collected.
+async def test_get_skylight_events_stops_the_aoi_at_the_first_failed_page(mocker, integration, auth, patch_skylight_clients):
+    # total=6, pageSize=2 -> 3 pages, oldest-update-first. Page 2 fails, so the run
+    # must stop with only page 1: carrying on to page 3 would push the saved cursor
+    # (the newest updatedAt collected) past every page-2 event and lose them for good.
     exec_mock = mocker.patch(
         "app.actions.client.execute_gql_query",
         side_effect=[
@@ -192,9 +194,9 @@ async def test_get_skylight_events_skips_failed_page_and_continues(mocker, integ
 
     events, _ = await get_skylight_events(integration, _PullCfg(), auth)
 
-    assert exec_mock.call_count == 3
+    assert exec_mock.call_count == 2, "must not request page 3 after page 2 failed"
     collected = [e["event_id"] for e in events["aoi1"]]
-    assert collected == ["e1", "e2", "e5", "e6"]
+    assert collected == ["e1", "e2"], "only the contiguous prefix is kept"
 
 
 @pytest.mark.asyncio
@@ -227,7 +229,7 @@ async def test_get_skylight_events_logs_and_skips_server_error(mocker, integrati
 
     assert exec_mock.call_count == 2
     assert [e["event_id"] for e in events["aoi1"]] == ["e1", "e2"]
-    # The skipped page must be logged with attention_needed so it surfaces in activity logs.
+    # The failed page must be logged with attention_needed so it surfaces in activity logs.
     assert any(
         "failed for AOI" in str(call) and call.kwargs.get("extra", {}).get("attention_needed")
         for call in log.error.call_args_list
@@ -1126,6 +1128,30 @@ def test_v2_record_transforms_to_the_same_er_event_as_v1(v1_item, v2_record):
         assert key in from_v2["event_details"], f"missing v1 key {key}"
         assert from_v2["event_details"][key] == value, key
         assert type(from_v2["event_details"][key]) is type(value), key
+
+
+@pytest.mark.asyncio
+async def test_handlers_never_log_the_integration_or_action_config(mocker, integration, pull_events_config, mock_publish_event):
+    # On the ephemeral path the integration model and the action config carry the
+    # draft's submitted credentials verbatim, so neither may be interpolated into
+    # a log line. Pin the entry logs of both operator-triggered actions.
+    from app.actions.handlers import action_auth, action_pull_events
+    mocker.patch("app.actions.client.build_graphql_client", return_value=mocker.MagicMock())
+    mocker.patch("app.actions.client.get_authentication_token", return_value=None)
+    mocker.patch("app.actions.client.get_skylight_events", return_value=({}, []))
+    mocker.patch("app.actions.client.get_auth_config", return_value=None)
+    mocker.patch("app.services.state.IntegrationStateManager.get_state", return_value=None)
+    mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
+    mocker.patch("app.services.action_runner.publish_event", mock_publish_event)
+    log = mocker.patch("app.actions.handlers.logger")
+
+    await action_auth(integration, mocker.MagicMock())
+    await action_pull_events(integration, pull_events_config)
+
+    logged = " ".join(str(c) for c in log.mock_calls)
+    assert "action_config" not in logged
+    for forbidden in ("configurations", "AuthenticateConfig(", "password"):
+        assert forbidden not in logged, forbidden
 
 
 # --- action_auth: no secrets in logs or responses ---

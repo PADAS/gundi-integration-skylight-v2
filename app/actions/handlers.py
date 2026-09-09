@@ -170,7 +170,9 @@ def transform(config, data: dict) -> dict:
 
 async def action_auth(integration, action_config: AuthenticateConfig):
     logger.info(
-        f"Executing auth action with integration {integration} and action_config {action_config}..."
+        # Never interpolate the integration or the action config: on the
+        # ephemeral path both carry the draft's submitted credentials verbatim.
+        f"Executing auth action for integration '{integration.id}'..."
     )
     try:
         # GraphQL Client
@@ -239,7 +241,8 @@ async def action_list_aois(integration, action_config: ListAOIsQuery):
 @activity_logger()
 async def action_pull_events(integration, action_config: PullEventsConfig):
     logger.info(
-        f"Executing pull_events action with integration {integration} and action_config {action_config}..."
+        # Same here: the integration model embeds every action's config data.
+        f"Executing pull_events action for integration '{integration.id}'..."
     )
     result = {"events_extracted": 0, "process_events_per_aoi_action_triggered": 0, "details": {}}
     try:

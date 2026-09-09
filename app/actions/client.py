@@ -696,25 +696,23 @@ async def get_skylight_events(integration, config_data, auth):
                         f'"searchEventsV2" page {page_num} failed for AOI "{aoi}": '
                         f'{type(te).__name__}: {te}. '
                         f'Request params: {params}. '
-                        f'Keeping {len(response_list)} events collected so far.',
+                        f'Stopping this AOI and keeping the {len(response_list)} events '
+                        f'collected so far; the rest are picked up by the next run.',
                         extra={
                             "integration_id": str(integration.id),
                             "aoi": aoi,
                             "attention_needed": True,
                         }
                     )
-                    # The loop is bounded by total_pages, which we can only learn
-                    # from a SUCCESSFUL response's meta.total — and the first
-                    # success is normally page 1. If we fail before ever getting
-                    # that bound (total_pages is None, i.e. page 1 itself failed),
-                    # there is nothing to stop the loop, so we must give up this
-                    # AOI rather than retry an unknown number of pages forever.
-                    # Once total_pages IS known, a later failed page is safe to
-                    # skip — page_num is still capped by the while condition.
-                    if total_pages is None:
-                        break
-                    page_num += 1
-                    continue
+                    # Stop the AOI here rather than skipping to the next page.
+                    # Pages come back oldest-update-first, and the cursor saved
+                    # after the run is the newest updatedAt collected, so keeping
+                    # a later page while dropping this one would advance the
+                    # cursor past every event on the failed page and they would
+                    # never be fetched again. Keeping only the contiguous prefix
+                    # leaves the cursor just before the gap, so the next run
+                    # resumes exactly where this one stopped.
+                    break
 
                 search_response = response['searchEventsV2'] or {}
                 events_response = search_response.get('records')
