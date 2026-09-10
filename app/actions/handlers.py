@@ -3,6 +3,7 @@ import httpx
 import json
 import logging
 import stamina
+import uuid
 
 import app.actions.client as client
 import app.services.gundi as gundi_tools
@@ -34,6 +35,186 @@ state_manager = IntegrationStateManager()
 # PubSub base64-encodes message data (~33% overhead), so the events payload
 # per message must stay well under that limit.
 MAX_TRIGGER_PAYLOAD_BYTES = 2 * 1024 * 1024
+
+# How long a chunk plan and its completion markers survive. They only need to
+# outlive the gap between two pull_events runs; the generous window is so a
+# paused or slow-scheduled integration still gets its cursor advanced instead
+# of silently re-pulling the same window forever.
+CHUNK_PLAN_TTL_SECONDS = 7 * 24 * 60 * 60
+
+
+def _plan_source_id(aoi):
+    # Prefixed so it can't collide with the AOI cursor key (bare aoi id), the
+    # per-event dedupe keys (bare Skylight event id) or the token key
+    # (the Skylight username), which all share this action's key namespace.
+    return f"_plan.{aoi}"
+
+
+def _chunk_source_id(chunk_id):
+    return f"_chunk.{chunk_id}"
+
+
+def _updated_at(event):
+    """The event's Skylight updatedAt as a comparable, timezone-aware datetime."""
+    raw = event.get("updated_at") if isinstance(event, dict) else None
+    parsed = dp(raw) if raw else None
+    if parsed is None:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+    return parsed
+
+
+def _is_after(candidate, current):
+    """True when the candidate cursor is strictly newer than the current one.
+
+    Cursors are compared as parsed timestamps, not as strings: Skylight has
+    returned both `...Z` and `...+00:00`, which sort differently as text.
+    """
+    if not candidate:
+        return False
+    if not current:
+        return True
+    new = _updated_at({"updated_at": candidate})
+    old = _updated_at({"updated_at": current})
+    if new is None:
+        return False
+    if old is None:
+        return True
+    return new > old
+
+
+def build_chunk_plan(chunk_prefix, aoi_events, max_payload_bytes):
+    """Split an AOI's new events into ordered chunks and describe each one.
+
+    Returns (chunks, batches) where chunks[i] describes batches[i]:
+    an id the sub-action reports completion under, and the newest updatedAt
+    the chunk contains. Events are sorted oldest-update-first so that
+    "every chunk up to here is delivered" also means "every event up to this
+    timestamp is delivered" — the property the cursor relies on.
+
+    `chunk_prefix` must be unique per AOI per run: completion markers live in
+    one flat keyspace, so two AOIs numbering their chunks from zero under the
+    same prefix would read each other's markers.
+    """
+    ordered = sorted(
+        aoi_events,
+        key=lambda event: _updated_at(event) or datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)
+    )
+    chunks = []
+    batches = batch_events_by_payload_size(ordered, max_payload_bytes)
+    for index, batch in enumerate(batches):
+        chunks.append({
+            "id": f"{chunk_prefix}-{index}",
+            "cursor": client.latest_update_cursor(batch),
+            "events": len(batch),
+        })
+    return chunks, batches
+
+
+async def advance_aoi_cursors(integration, aoi_ids):
+    """Move each AOI cursor over the work the *previous* run actually delivered.
+
+    pull_events never advances the cursor for its own run: triggering a
+    sub-action only confirms the command was published, not that its events
+    reached EarthRanger, so a sub-action that exhausts its retries would leave
+    its events stranded behind an already-advanced cursor. Instead the run
+    records the chunk plan it handed out, each sub-action writes a completion
+    marker once its events are delivered, and this function — the only writer
+    of the cursor — walks the plan in order, stops at the first chunk with no
+    marker, and advances to the end of the last contiguous completed chunk.
+
+    Consequence, accepted: the cursor lags one run behind, so each run re-fetches
+    the previous run's events. Delivered ones are recognised by their per-event
+    state and patched rather than duplicated.
+    """
+    advanced = {}
+    for aoi in aoi_ids:
+        plan = await state_manager.get_state(str(integration.id), "pull_events", _plan_source_id(aoi))
+        if not plan:
+            continue
+        chunks = plan.get("chunks") or []
+        completed_through = None
+        pending = None
+        for chunk in chunks:
+            marker = await state_manager.get_state(
+                str(integration.id), "pull_events", _chunk_source_id(chunk.get("id"))
+            )
+            if not marker:
+                pending = chunk
+                break
+            completed_through = chunk.get("cursor") or completed_through
+        if pending is None:
+            # Every chunk delivered, so the whole of the previous run is
+            # accounted for: the cursor may pass its last event. `final` covers
+            # the tail of events the parent handled itself (patches), including
+            # the case of a run that had no new events and so no chunks at all.
+            new_cursor = plan.get("final") or completed_through
+        else:
+            new_cursor = completed_through
+            logger.warning(
+                f'AOI "{aoi}": the previous pull left chunk {pending.get("id")} '
+                f'({pending.get("events")} event(s)) undelivered, so the cursor stops at '
+                f'{new_cursor or "its previous value"}. Those events are fetched again next run.',
+                extra={
+                    "integration_id": str(integration.id),
+                    "aoi": aoi,
+                    "attention_needed": True,
+                }
+            )
+
+        saved_state = await state_manager.get_state(str(integration.id), "pull_events", aoi) or {}
+        current = saved_state.get("updated_since") or saved_state.get("start_time")
+        if _is_after(new_cursor, current):
+            await state_manager.set_state(
+                str(integration.id), "pull_events", {"updated_since": new_cursor}, aoi
+            )
+            advanced[aoi] = new_cursor
+            logger.info(f'AOI "{aoi}": cursor advanced to {new_cursor}.')
+
+        # The plan is always cleared, complete or not. A chunk still in flight
+        # is covered by the next run's own plan, because the cursor did not move
+        # past it and its events are fetched again.
+        await state_manager.delete_state(str(integration.id), "pull_events", _plan_source_id(aoi))
+        for chunk in chunks:
+            await state_manager.delete_state(
+                str(integration.id), "pull_events", _chunk_source_id(chunk.get("id"))
+            )
+    return advanced
+
+
+async def save_chunk_plan(integration, aoi, chunks, final_cursor):
+    await state_manager.set_state(
+        str(integration.id),
+        "pull_events",
+        {
+            "chunks": [{k: v for k, v in chunk.items()} for chunk in chunks],
+            # The newest updatedAt across everything this run pulled for the
+            # AOI, new and already-known alike. Reached only once every chunk
+            # has reported in.
+            "final": final_cursor,
+        },
+        _plan_source_id(aoi),
+        expire=CHUNK_PLAN_TTL_SECONDS,
+    )
+
+
+async def mark_chunk_delivered(integration, action_config):
+    """Record that this batch's events reached EarthRanger.
+
+    One sub-action per chunk id, so there is exactly one writer per key and no
+    race. The next pull_events run reads these to decide how far the AOI cursor
+    may move.
+    """
+    if not action_config.chunk_id:
+        return
+    await state_manager.set_state(
+        str(integration.id),
+        "pull_events",
+        {"delivered_at": datetime.datetime.now(tz=datetime.timezone.utc).isoformat()},
+        _chunk_source_id(action_config.chunk_id),
+        expire=CHUNK_PLAN_TTL_SECONDS,
+    )
 
 
 def batch_events_by_payload_size(events, max_payload_bytes):
@@ -245,6 +426,16 @@ async def action_pull_events(integration, action_config: PullEventsConfig):
         f"Executing pull_events action for integration '{integration.id}'..."
     )
     result = {"events_extracted": 0, "process_events_per_aoi_action_triggered": 0, "details": {}}
+
+    # Before anything is fetched: settle the previous run. This reads the chunk
+    # plan that run recorded plus the completion markers its sub-actions wrote,
+    # and advances each AOI cursor over the work that actually reached
+    # EarthRanger. It has to happen first because the fetch below reads the
+    # cursor it writes.
+    advanced = await advance_aoi_cursors(integration, action_config.aoi_ids)
+    if advanced:
+        result["details"]["cursors"] = advanced
+
     try:
         async for attempt in stamina.retry_context(
                 on=httpx.HTTPError,
@@ -300,9 +491,11 @@ async def action_pull_events(integration, action_config: PullEventsConfig):
             result["message"] = f"No events were pulled for integration: '{str(integration.id)}'."
             return result
 
-        # Cursor per AOI, from the raw batch (before the patch split below
-        # removes already-known events from the lists).
-        cursors = {aoi: client.latest_update_cursor(aoi_events) for aoi, aoi_events in events.items()}
+        # The far end of everything this run pulled per AOI, taken from the raw
+        # batch (before the patch split below removes already-known events).
+        # Recorded in the chunk plan as `final`; the next run only advances the
+        # cursor this far once every chunk has reported delivery.
+        final_cursors = {aoi: client.latest_update_cursor(aoi_events) for aoi, aoi_events in events.items()}
 
         event_ids = []
         async def get_skylight_events_to_patch():
@@ -329,21 +522,31 @@ async def action_pull_events(integration, action_config: PullEventsConfig):
 
         events, events_to_patch = await get_skylight_events_to_patch()
 
-        # trigger "process_events_per_aoi" action for each AOI
-        for aoi, aoi_events in events.items():
-            if aoi_events:
-                result["events_extracted"] += len(aoi_events)
-                logger.info(f"Triggering 'process_events_per_aoi' action for AOI: '{aoi}' Events: '{len(aoi_events)}'")
-                for events_batch in batch_events_by_payload_size(aoi_events, MAX_TRIGGER_PAYLOAD_BYTES):
-                    parsed_config = ProcessEventsPerAOIConfig(
-                        integration_id=str(integration.id),
-                        aoi=aoi,
-                        events=events_batch,
-                        updated_config_data=[config.dict() for config in updated_config_data]
-                    )
-                    await trigger_action(integration.id, "process_events_per_aoi", config=parsed_config)
-                    result["process_events_per_aoi_action_triggered"] += 1
-                logger.info(f"Triggered 'process_events_per_aoi' action for AOI: '{aoi}'")
+        # Plan the work per AOI, then hand it out. Each chunk carries the id it
+        # must report completion under; the plan is saved after the patches
+        # below so a run that fails partway leaves the cursor where it was.
+        run_id = uuid.uuid4().hex[:12]
+        plans = {}
+        for aoi_index, (aoi, aoi_events) in enumerate(events.items()):
+            chunks, batches = build_chunk_plan(
+                f"{run_id}-{aoi_index}", aoi_events, MAX_TRIGGER_PAYLOAD_BYTES
+            )
+            plans[aoi] = chunks
+            if not batches:
+                continue
+            result["events_extracted"] += len(aoi_events)
+            logger.info(f"Triggering 'process_events_per_aoi' action for AOI: '{aoi}' Events: '{len(aoi_events)}'")
+            for chunk, events_batch in zip(chunks, batches):
+                parsed_config = ProcessEventsPerAOIConfig(
+                    integration_id=str(integration.id),
+                    aoi=aoi,
+                    events=events_batch,
+                    updated_config_data=[config.dict() for config in updated_config_data],
+                    chunk_id=chunk["id"],
+                )
+                await trigger_action(integration.id, "process_events_per_aoi", config=parsed_config)
+                result["process_events_per_aoi_action_triggered"] += 1
+            logger.info(f"Triggered 'process_events_per_aoi' action for AOI: '{aoi}'")
 
         if events_to_patch:
             # Process events to patch
@@ -355,13 +558,18 @@ async def action_pull_events(integration, action_config: PullEventsConfig):
             result["events_updated"] = len(response)
             result["details"]["updated"] = response
 
-        # Advance the per-AOI cursor. Saved here (not in process_events_per_aoi)
-        # so it also moves when a run yields only patches, and so parallel
-        # sub-action chunks can't overwrite each other's value.
-        for aoi, cursor in cursors.items():
-            if cursor:
-                await state_manager.set_state(str(integration.id), "pull_events", {"updated_since": cursor}, aoi)
-                result["details"].setdefault("cursors", {})[aoi] = cursor
+        # Record the plan, but do not touch the cursor: at this point the
+        # sub-actions have only been *published*, not confirmed. The next run
+        # reads this back alongside the markers they write and moves the cursor
+        # over whatever actually arrived. Saved after the patches so a failed
+        # patch leaves no plan and the cursor simply stays put.
+        # An AOI with no new events still gets a plan (zero chunks, `final`
+        # set), which is what lets a patch-only run move its cursor forward.
+        for aoi, chunks in plans.items():
+            await save_chunk_plan(integration, aoi, chunks, final_cursors.get(aoi))
+        result["details"]["chunk_plan"] = {
+            aoi: [chunk["id"] for chunk in chunks] for aoi, chunks in plans.items()
+        }
 
         # Logged here (not only returned) because the HTTP response is lost when
         # a long run outlives the caller's timeout.
@@ -378,6 +586,10 @@ async def action_pull_events(integration, action_config: PullEventsConfig):
 async def action_process_events_per_aoi(integration, action_config: ProcessEventsPerAOIConfig):
     result = {"events_processed": 0, "details": {}}
     all_responses = []
+    # Cleared by any batch Gundi did not accept. Only a fully delivered chunk
+    # gets its completion marker, and only marked chunks let the next
+    # pull_events run move the AOI cursor past them.
+    delivered = True
     # Kept aligned 1:1 so the event -> Gundi object mapping is saved against the
     # event that actually produced each response. The transformed list is both
     # sorted and filtered below, so pairing responses back against
@@ -412,6 +624,21 @@ async def action_process_events_per_aoi(integration, action_config: ProcessEvent
                     integration_id=integration.id
                 )
 
+                if not response:
+                    # Nothing came back for a non-empty batch, so these events
+                    # did not reach EarthRanger. Leave the chunk unmarked: the
+                    # AOI cursor then stops short of it and the next run pulls
+                    # these events again.
+                    delivered = False
+                    logger.warning(
+                        f'Gundi returned no response for batch #{i} of {len(batch_pairs)} event(s). '
+                        f'Treating this chunk as undelivered; its events are pulled again next run.',
+                        extra={
+                            "integration_id": str(integration.id),
+                            "aoi": action_config.aoi,
+                            "attention_needed": True,
+                        }
+                    )
                 if response:
                     all_responses.extend(response)
                     result["events_processed"] += len(response)
@@ -450,8 +677,19 @@ async def action_process_events_per_aoi(integration, action_config: ProcessEvent
                 }
             )
             raise e
-        # The per-AOI cursor is owned by action_pull_events (updated_since).
+        # The per-AOI cursor is owned by action_pull_events. This only reports
+        # that the chunk's events are in EarthRanger; the next pull_events run
+        # decides what that means for the cursor.
+        if delivered:
+            await mark_chunk_delivered(integration, action_config)
+        result["details"]["chunk_delivered"] = delivered
         return result
+
+    # Nothing survived transform() (unsupported types, entry alerts with no
+    # start point). There is nothing left to deliver, so the chunk is complete
+    # and must not hold the cursor back.
+    await mark_chunk_delivered(integration, action_config)
+    result["details"]["chunk_delivered"] = True
     return result
 
 

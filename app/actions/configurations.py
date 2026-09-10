@@ -72,6 +72,12 @@ class ProcessEventsPerAOIConfig(InternalActionConfiguration):
     aoi: str
     events: List[dict]
     updated_config_data: List[dict]
+    # Identifies this batch inside the chunk plan pull_events recorded for the
+    # AOI. The sub-action writes a completion marker under it once its events
+    # have reached EarthRanger, and the next pull_events run uses those markers
+    # to decide how far the AOI cursor may move. Optional so a command already
+    # queued by an older revision still deserializes.
+    chunk_id: Optional[str] = None
 
 
 class PullEventsConfig(PullActionConfiguration):

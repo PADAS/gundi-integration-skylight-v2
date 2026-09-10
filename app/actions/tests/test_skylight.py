@@ -1,4 +1,5 @@
 import base64
+import datetime
 import json
 import time
 import pytest
@@ -24,7 +25,9 @@ from app.actions.configurations import ProcessEventsPerAOIConfig, PullEventsConf
 from app.actions.handlers import (
     action_pull_events,
     action_process_events_per_aoi,
+    advance_aoi_cursors,
     batch_events_by_payload_size,
+    build_chunk_plan,
     patch_events,
     process_attachments,
     transform,
@@ -865,28 +868,33 @@ async def test_action_pull_events_triggers_process_events_per_aoi(mocker, integr
     mocker.patch("app.actions.client.get_skylight_events", return_value=({"aoi": [{"event_id": "event1"}]}, []))
     mocker.patch("app.actions.client.get_auth_config", return_value=None)
     mocker.patch("app.services.state.IntegrationStateManager.get_state", return_value=None)
+    mocker.patch("app.services.state.IntegrationStateManager.set_state", return_value=None)
     mock_trigger_action = mocker.patch("app.actions.handlers.trigger_action", return_value=None)
 
     result = await action_pull_events(integration, pull_events_config)
     assert result["process_events_per_aoi_action_triggered"] == 1
-    mock_trigger_action.assert_called_once_with(
-        integration.id,
-        "process_events_per_aoi",
-        config=ProcessEventsPerAOIConfig(
-            integration_id=integration.id,
-            aoi="aoi",
-            events=[{"event_id": "event1"}],
-            updated_config_data=[]
-        )
+    config = mock_trigger_action.call_args.kwargs["config"]
+    assert (config.integration_id, config.aoi, config.events, config.updated_config_data) == (
+        integration.id, "aoi", [{"event_id": "event1"}], []
     )
+    # The batch is handed out with the id it must report delivery under, and
+    # that id is the one recorded in the AOI's chunk plan.
+    assert config.chunk_id
+    assert result["details"]["chunk_plan"] == {"aoi": [config.chunk_id]}
 
 
 @pytest.mark.asyncio
-async def test_action_pull_events_saves_updated_since_cursor_per_aoi(mocker, integration, pull_events_config, mock_publish_event):
+async def test_action_pull_events_records_a_plan_and_never_advances_its_own_cursor(
+        mocker, integration, pull_events_config, mock_publish_event
+):
+    # Triggering a sub-action only confirms the command was published, not that
+    # its events reached EarthRanger. So this run writes no cursor at all: it
+    # records the plan it handed out, and the NEXT run advances the cursor over
+    # whatever the sub-actions confirmed.
     mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
     mocker.patch("app.actions.client.get_skylight_events", return_value=({
         "aoi1": [{"event_id": "a", "updated_at": "2026-09-08T10:00:00Z"}, {"event_id": "b", "updated_at": "2026-09-08T11:00:00Z"}],
-        "aoi2": [{"event_id": "c"}],   # no update stamps -> no cursor written
+        "aoi2": [{"event_id": "c"}],   # no update stamps -> nothing to advance to
     }, []))
     mocker.patch("app.actions.client.get_auth_config", return_value=None)
     mocker.patch("app.services.state.IntegrationStateManager.get_state", return_value=None)
@@ -895,8 +903,37 @@ async def test_action_pull_events_saves_updated_since_cursor_per_aoi(mocker, int
 
     result = await action_pull_events(integration, pull_events_config)
 
-    set_state.assert_called_once_with(str(integration.id), "pull_events", {"updated_since": "2026-09-08T11:00:00Z"}, "aoi1")
-    assert result["details"]["cursors"] == {"aoi1": "2026-09-08T11:00:00Z"}
+    written = {call.args[3]: call.args[2] for call in set_state.call_args_list}
+    assert set(written) == {"_plan.aoi1", "_plan.aoi2"}
+    assert not any("updated_since" in state for state in written.values())
+    assert written["_plan.aoi1"]["final"] == "2026-09-08T11:00:00Z"
+    assert [chunk["cursor"] for chunk in written["_plan.aoi1"]["chunks"]] == ["2026-09-08T11:00:00Z"]
+    assert written["_plan.aoi2"]["final"] is None
+    assert "cursors" not in result["details"]
+
+
+@pytest.mark.asyncio
+async def test_action_pull_events_gives_each_aoi_distinct_chunk_ids(
+        mocker, integration, pull_events_config, mock_publish_event
+):
+    # Completion markers live in one flat keyspace, so if two AOIs numbered
+    # their chunks from zero under the same run id they would read each other's
+    # markers and a delivered chunk in one AOI would advance the other's cursor.
+    mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
+    mocker.patch("app.actions.client.get_skylight_events", return_value=({
+        "aoi1": [{"event_id": "a", "updated_at": "2026-09-08T10:00:00Z"}],
+        "aoi2": [{"event_id": "b", "updated_at": "2026-09-08T10:00:00Z"}],
+    }, []))
+    mocker.patch("app.actions.client.get_auth_config", return_value=None)
+    mocker.patch("app.services.state.IntegrationStateManager.get_state", return_value=None)
+    mocker.patch("app.services.state.IntegrationStateManager.set_state", return_value=None)
+    mocker.patch("app.actions.handlers.trigger_action", return_value=None)
+
+    result = await action_pull_events(integration, pull_events_config)
+
+    ids = [chunk_id for chunk_ids in result["details"]["chunk_plan"].values() for chunk_id in chunk_ids]
+    assert len(ids) == 2
+    assert len(set(ids)) == 2
 
 
 def test_batch_events_by_payload_size_keeps_small_lists_in_one_batch():
@@ -938,6 +975,7 @@ async def test_action_pull_events_splits_large_aoi_into_multiple_triggers(
     mocker.patch("app.actions.client.get_skylight_events", return_value=({"aoi": events}, []))
     mocker.patch("app.actions.client.get_auth_config", return_value=None)
     mocker.patch("app.services.state.IntegrationStateManager.get_state", return_value=None)
+    mocker.patch("app.services.state.IntegrationStateManager.set_state", return_value=None)
     mock_trigger_action = mocker.patch("app.actions.handlers.trigger_action", return_value=None)
     mocker.patch("app.actions.handlers.MAX_TRIGGER_PAYLOAD_BYTES", 500)
 
@@ -952,6 +990,10 @@ async def test_action_pull_events_splits_large_aoi_into_multiple_triggers(
     assert dispatched_events == events
     assert result["events_extracted"] == 10
     assert result["process_events_per_aoi_action_triggered"] == mock_trigger_action.call_count
+    # Every dispatched batch is in the plan, in the same order, under the id the
+    # batch was told to report against.
+    dispatched_chunk_ids = [call.kwargs["config"].chunk_id for call in mock_trigger_action.call_args_list]
+    assert result["details"]["chunk_plan"]["aoi"] == dispatched_chunk_ids
 
 
 @pytest.mark.asyncio
@@ -1468,7 +1510,10 @@ async def test_pull_events_checks_every_event_against_saved_state(
     mocker.patch("app.actions.client.get_auth_config", return_value=None)
     mocker.patch(
         "app.services.state.IntegrationStateManager.get_state",
-        side_effect=lambda *args, **kwargs: {"object_id": f"obj_{args[2]}"},
+        # Only the per-event dedupe keys answer; plan/cursor lookups find nothing.
+        side_effect=lambda *args, **kwargs: (
+            {"object_id": f"obj_{args[2]}"} if args[2].startswith("event") else None
+        ),
     )
     mocker.patch("app.services.state.IntegrationStateManager.set_state", return_value=None)
     trigger = mocker.patch("app.actions.handlers.trigger_action", return_value=None)
@@ -1541,4 +1586,414 @@ async def test_get_skylight_events_no_snapshot_warning_when_pinned(mocker, integ
     await get_skylight_events(integration, _PullCfg(), auth)
 
     assert not any("no snapshotId" in str(call) for call in log.warning.call_args_list)
+
+
+# --- Option A: the cursor only moves over work that reached EarthRanger ---
+#
+# Publishing a sub-action command is not delivery. If the parent advanced the
+# cursor at trigger time, a sub-action that exhausted its retries would leave
+# its events stranded behind the new cursor: permanent, silent loss. So the
+# parent records the chunk plan it handed out, each sub-action marks its own
+# chunk once its events are in EarthRanger, and the *next* parent run walks the
+# plan in order and advances the cursor to the end of the last contiguous
+# completed chunk. The parent is the only writer of the cursor.
+
+
+def _plan_state(chunks, final):
+    return {"chunks": chunks, "final": final}
+
+
+def _state_reader(states):
+    """get_state stand-in backed by a {source_id: value} dict."""
+    async def _get_state(integration_id, action_id, source_id="no-source"):
+        return states.get(source_id)
+    return _get_state
+
+
+@pytest.mark.asyncio
+async def test_advance_aoi_cursors_moves_to_the_end_of_the_last_completed_chunk(mocker, integration):
+    # Chunks 0 and 1 delivered, chunk 2 did not. The cursor stops at the end of
+    # chunk 1: advancing to chunk 2's end would strand its events forever.
+    states = {
+        "_plan.aoi1": _plan_state(
+            [
+                {"id": "run-0", "cursor": "2026-09-08T10:00:00Z", "events": 2},
+                {"id": "run-1", "cursor": "2026-09-08T11:00:00Z", "events": 2},
+                {"id": "run-2", "cursor": "2026-09-08T12:00:00Z", "events": 2},
+            ],
+            final="2026-09-08T12:00:00Z",
+        ),
+        "_chunk.run-0": {"delivered_at": "x"},
+        "_chunk.run-1": {"delivered_at": "x"},
+    }
+    mocker.patch("app.actions.handlers.state_manager.get_state", side_effect=_state_reader(states))
+    set_state = mocker.patch("app.actions.handlers.state_manager.set_state", return_value=None)
+    mocker.patch("app.actions.handlers.state_manager.delete_state", return_value=None)
+
+    advanced = await advance_aoi_cursors(integration, ["aoi1"])
+
+    assert advanced == {"aoi1": "2026-09-08T11:00:00Z"}
+    set_state.assert_called_once_with(
+        str(integration.id), "pull_events", {"updated_since": "2026-09-08T11:00:00Z"}, "aoi1"
+    )
+
+
+@pytest.mark.asyncio
+async def test_advance_aoi_cursors_stops_at_the_first_gap_not_the_last_marker(mocker, integration):
+    # Chunk 1 is missing but chunk 2 completed. The walk must stop at the gap:
+    # taking the newest marker instead would jump the cursor over chunk 1.
+    states = {
+        "_plan.aoi1": _plan_state(
+            [
+                {"id": "run-0", "cursor": "2026-09-08T10:00:00Z", "events": 1},
+                {"id": "run-1", "cursor": "2026-09-08T11:00:00Z", "events": 1},
+                {"id": "run-2", "cursor": "2026-09-08T12:00:00Z", "events": 1},
+            ],
+            final="2026-09-08T12:00:00Z",
+        ),
+        "_chunk.run-0": {"delivered_at": "x"},
+        "_chunk.run-2": {"delivered_at": "x"},
+    }
+    mocker.patch("app.actions.handlers.state_manager.get_state", side_effect=_state_reader(states))
+    mocker.patch("app.actions.handlers.state_manager.set_state", return_value=None)
+    mocker.patch("app.actions.handlers.state_manager.delete_state", return_value=None)
+
+    advanced = await advance_aoi_cursors(integration, ["aoi1"])
+
+    assert advanced == {"aoi1": "2026-09-08T10:00:00Z"}
+
+
+@pytest.mark.asyncio
+async def test_advance_aoi_cursors_holds_the_cursor_when_the_first_chunk_never_arrived(mocker, integration):
+    states = {
+        "_plan.aoi1": _plan_state(
+            [{"id": "run-0", "cursor": "2026-09-08T10:00:00Z", "events": 1}],
+            final="2026-09-08T10:00:00Z",
+        ),
+    }
+    mocker.patch("app.actions.handlers.state_manager.get_state", side_effect=_state_reader(states))
+    set_state = mocker.patch("app.actions.handlers.state_manager.set_state", return_value=None)
+    mocker.patch("app.actions.handlers.state_manager.delete_state", return_value=None)
+
+    advanced = await advance_aoi_cursors(integration, ["aoi1"])
+
+    assert advanced == {}
+    assert not set_state.called
+
+
+@pytest.mark.asyncio
+async def test_advance_aoi_cursors_reaches_final_only_when_every_chunk_delivered(mocker, integration):
+    # `final` is the newest updatedAt of everything the run pulled, including
+    # events the parent patched itself after the last chunk. It is only safe
+    # once nothing is outstanding.
+    states = {
+        "_plan.aoi1": _plan_state(
+            [{"id": "run-0", "cursor": "2026-09-08T10:00:00Z", "events": 1}],
+            final="2026-09-08T13:00:00Z",
+        ),
+        "_chunk.run-0": {"delivered_at": "x"},
+    }
+    mocker.patch("app.actions.handlers.state_manager.get_state", side_effect=_state_reader(states))
+    mocker.patch("app.actions.handlers.state_manager.set_state", return_value=None)
+    mocker.patch("app.actions.handlers.state_manager.delete_state", return_value=None)
+
+    advanced = await advance_aoi_cursors(integration, ["aoi1"])
+
+    assert advanced == {"aoi1": "2026-09-08T13:00:00Z"}
+
+
+@pytest.mark.asyncio
+async def test_advance_aoi_cursors_moves_a_patch_only_run_with_no_chunks(mocker, integration):
+    # Reason the cursor lives in the parent at all (b): a run that finds only
+    # already-known events starts no sub-action, so there is no chunk to wait
+    # on. The parent patched those events synchronously, so `final` is reached.
+    states = {"_plan.aoi1": _plan_state([], final="2026-09-08T11:00:00Z")}
+    mocker.patch("app.actions.handlers.state_manager.get_state", side_effect=_state_reader(states))
+    mocker.patch("app.actions.handlers.state_manager.set_state", return_value=None)
+    mocker.patch("app.actions.handlers.state_manager.delete_state", return_value=None)
+
+    advanced = await advance_aoi_cursors(integration, ["aoi1"])
+
+    assert advanced == {"aoi1": "2026-09-08T11:00:00Z"}
+
+
+@pytest.mark.asyncio
+async def test_advance_aoi_cursors_never_moves_the_cursor_backwards(mocker, integration):
+    # A stale or replayed plan must not rewind a cursor that is already ahead,
+    # which would re-pull and re-patch a whole window for nothing.
+    states = {
+        "_plan.aoi1": _plan_state(
+            [{"id": "run-0", "cursor": "2026-09-08T10:00:00Z", "events": 1}],
+            final="2026-09-08T10:00:00Z",
+        ),
+        "_chunk.run-0": {"delivered_at": "x"},
+        "aoi1": {"updated_since": "2026-09-09T00:00:00Z"},
+    }
+    mocker.patch("app.actions.handlers.state_manager.get_state", side_effect=_state_reader(states))
+    set_state = mocker.patch("app.actions.handlers.state_manager.set_state", return_value=None)
+    mocker.patch("app.actions.handlers.state_manager.delete_state", return_value=None)
+
+    advanced = await advance_aoi_cursors(integration, ["aoi1"])
+
+    assert advanced == {}
+    assert not set_state.called
+
+
+@pytest.mark.asyncio
+async def test_advance_aoi_cursors_compares_cursors_as_timestamps_not_text(mocker, integration):
+    # Skylight has returned both `...Z` and `...+00:00`. "2026-09-08T11:00:00Z"
+    # sorts *after* "2026-09-08T12:00:00+00:00" as text, so a string compare
+    # would let an older cursor overwrite a newer one.
+    states = {
+        "_plan.aoi1": _plan_state(
+            [{"id": "run-0", "cursor": "2026-09-08T11:00:00Z", "events": 1}],
+            final="2026-09-08T11:00:00Z",
+        ),
+        "_chunk.run-0": {"delivered_at": "x"},
+        "aoi1": {"updated_since": "2026-09-08T12:00:00+00:00"},
+    }
+    mocker.patch("app.actions.handlers.state_manager.get_state", side_effect=_state_reader(states))
+    set_state = mocker.patch("app.actions.handlers.state_manager.set_state", return_value=None)
+    mocker.patch("app.actions.handlers.state_manager.delete_state", return_value=None)
+
+    assert await advance_aoi_cursors(integration, ["aoi1"]) == {}
+    assert not set_state.called
+
+
+@pytest.mark.asyncio
+async def test_advance_aoi_cursors_clears_the_plan_and_its_markers(mocker, integration):
+    # The plan is one run's bookkeeping. Leaving it behind would let the next
+    # run read a marker from two runs ago; leaving markers behind would make a
+    # recycled id look already delivered.
+    states = {
+        "_plan.aoi1": _plan_state(
+            [
+                {"id": "run-0", "cursor": "2026-09-08T10:00:00Z", "events": 1},
+                {"id": "run-1", "cursor": "2026-09-08T11:00:00Z", "events": 1},
+            ],
+            final="2026-09-08T11:00:00Z",
+        ),
+        "_chunk.run-0": {"delivered_at": "x"},
+    }
+    mocker.patch("app.actions.handlers.state_manager.get_state", side_effect=_state_reader(states))
+    mocker.patch("app.actions.handlers.state_manager.set_state", return_value=None)
+    delete_state = mocker.patch("app.actions.handlers.state_manager.delete_state", return_value=None)
+
+    await advance_aoi_cursors(integration, ["aoi1"])
+
+    deleted = [call.args[2] for call in delete_state.call_args_list]
+    assert deleted == ["_plan.aoi1", "_chunk.run-0", "_chunk.run-1"]
+
+
+@pytest.mark.asyncio
+async def test_advance_aoi_cursors_is_a_no_op_without_a_plan(mocker, integration):
+    mocker.patch("app.actions.handlers.state_manager.get_state", side_effect=_state_reader({}))
+    set_state = mocker.patch("app.actions.handlers.state_manager.set_state", return_value=None)
+    delete_state = mocker.patch("app.actions.handlers.state_manager.delete_state", return_value=None)
+
+    assert await advance_aoi_cursors(integration, ["aoi1", "aoi2"]) == {}
+    assert not set_state.called and not delete_state.called
+
+
+def test_build_chunk_plan_orders_chunks_oldest_update_first():
+    # The whole scheme rests on this: "chunks 0..k delivered" may only mean
+    # "everything up to chunk k's cursor delivered" if the chunks are in
+    # updatedAt order. Skylight already returns them that way; this pins it so
+    # a change upstream cannot silently break the cursor.
+    events = [
+        {"event_id": "c", "updated_at": "2026-09-08T12:00:00Z"},
+        {"event_id": "a", "updated_at": "2026-09-08T10:00:00Z"},
+        {"event_id": "b", "updated_at": "2026-09-08T11:00:00Z"},
+    ]
+
+    chunks, batches = build_chunk_plan("run-0", events, max_payload_bytes=60)
+
+    assert [event["event_id"] for batch in batches for event in batch] == ["a", "b", "c"]
+    cursors = [chunk["cursor"] for chunk in chunks]
+    assert cursors == sorted(cursors)
+    assert [chunk["id"] for chunk in chunks] == [f"run-0-{i}" for i in range(len(chunks))]
+    assert sum(chunk["events"] for chunk in chunks) == 3
+
+
+def test_build_chunk_plan_puts_events_without_an_update_stamp_first():
+    # An event with no updatedAt cannot move the cursor. Sorting it first keeps
+    # it behind every real cursor value rather than capping a chunk at None.
+    events = [
+        {"event_id": "a", "updated_at": "2026-09-08T10:00:00Z"},
+        {"event_id": "b"},
+    ]
+
+    _, batches = build_chunk_plan("run-0", events, max_payload_bytes=10_000)
+
+    assert [event["event_id"] for event in batches[0]] == ["b", "a"]
+
+
+@pytest.mark.asyncio
+async def test_action_pull_events_settles_the_previous_run_before_fetching(
+        mocker, integration, pull_events_config, mock_publish_event
+):
+    # The fetch reads the cursor that reconciliation writes, so reconciliation
+    # has to run first or the run would query from the stale value.
+    mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
+    calls = []
+    async def _advance(_integration, _aoi_ids):
+        calls.append("advance")
+        return {"aoi1": "2026-09-08T09:00:00Z"}
+    async def _fetch(**kwargs):
+        calls.append("fetch")
+        return {}, []
+    mocker.patch("app.actions.handlers.advance_aoi_cursors", side_effect=_advance)
+    mocker.patch("app.actions.client.get_skylight_events", side_effect=_fetch)
+    mocker.patch("app.actions.client.get_auth_config", return_value=None)
+
+    result = await action_pull_events(integration, pull_events_config)
+
+    assert calls == ["advance", "fetch"]
+    assert result["details"]["cursors"] == {"aoi1": "2026-09-08T09:00:00Z"}
+
+
+@pytest.mark.asyncio
+async def test_action_process_events_per_aoi_marks_its_chunk_delivered(
+        mocker, integration, process_events_config, mock_publish_event
+):
+    mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
+    process_events_config.chunk_id = "run-0-0"
+    mocker.patch("app.actions.handlers.transform", side_effect=lambda c, e: {"event_id": e["event_id"]})
+    mocker.patch(
+        "app.actions.handlers.gundi_tools.send_events_to_gundi",
+        return_value=[{"object_id": "o1"}, {"object_id": "o2"}],
+    )
+    mocker.patch("app.actions.handlers.process_attachments", return_value=None)
+    mocker.patch("app.actions.handlers.save_events_state", return_value=None)
+    set_state = mocker.patch("app.actions.handlers.state_manager.set_state", return_value=None)
+
+    result = await action_process_events_per_aoi(integration, process_events_config)
+
+    assert result["details"]["chunk_delivered"] is True
+    set_state.assert_called_once()
+    assert set_state.call_args.args[3] == "_chunk.run-0-0"
+    assert set_state.call_args.kwargs["expire"] == 604800
+
+
+@pytest.mark.asyncio
+async def test_action_process_events_per_aoi_marks_a_chunk_that_transformed_to_nothing(
+        mocker, integration, process_events_config, mock_publish_event
+):
+    # Every event was skipped by transform (unsupported type, entry alert with
+    # no start point). There is nothing left to deliver, so the chunk must not
+    # hold the AOI cursor back forever.
+    mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
+    process_events_config.chunk_id = "run-0-0"
+    mocker.patch("app.actions.handlers.transform", return_value={})
+    send_mock = mocker.patch("app.actions.handlers.gundi_tools.send_events_to_gundi", return_value=[])
+    set_state = mocker.patch("app.actions.handlers.state_manager.set_state", return_value=None)
+
+    result = await action_process_events_per_aoi(integration, process_events_config)
+
+    assert not send_mock.called
+    assert result["details"]["chunk_delivered"] is True
+    assert set_state.call_args.args[3] == "_chunk.run-0-0"
+
+
+@pytest.mark.asyncio
+async def test_action_process_events_per_aoi_leaves_the_chunk_unmarked_when_gundi_returns_nothing(
+        mocker, integration, process_events_config, mock_publish_event
+):
+    # An empty response means those events are not in EarthRanger. Without a
+    # marker the cursor stops short of this chunk and the next run re-pulls it.
+    mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
+    process_events_config.chunk_id = "run-0-0"
+    mocker.patch("app.actions.handlers.transform", side_effect=lambda c, e: {"event_id": e["event_id"]})
+    mocker.patch("app.actions.handlers.gundi_tools.send_events_to_gundi", return_value=[])
+    mocker.patch("app.actions.handlers.save_events_state", return_value=None)
+    set_state = mocker.patch("app.actions.handlers.state_manager.set_state", return_value=None)
+
+    result = await action_process_events_per_aoi(integration, process_events_config)
+
+    assert result["details"]["chunk_delivered"] is False
+    assert not set_state.called
+
+
+@pytest.mark.asyncio
+async def test_action_process_events_per_aoi_leaves_the_chunk_unmarked_when_it_raises(
+        mocker, integration, process_events_config, mock_publish_event
+):
+    mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
+    mocker.patch("app.services.action_runner.publish_event", mock_publish_event)
+    mocker.patch("app.services.action_scheduler.publish_event", mock_publish_event)
+    process_events_config.chunk_id = "run-0-0"
+    mocker.patch("app.actions.handlers.transform", return_value={"event_id": "event1"})
+    mocker.patch("app.actions.handlers.gundi_tools.send_events_to_gundi", side_effect=httpx.HTTPError("boom"))
+    set_state = mocker.patch("app.actions.handlers.state_manager.set_state", return_value=None)
+
+    with pytest.raises(httpx.HTTPError):
+        await action_process_events_per_aoi(integration, process_events_config)
+
+    assert not set_state.called
+
+
+@pytest.mark.asyncio
+async def test_process_events_per_aoi_without_a_chunk_id_writes_no_marker(
+        mocker, integration, process_events_config, mock_publish_event
+):
+    # A command queued by an older revision carries no chunk_id. It must still
+    # run; it simply has no plan entry to report against.
+    mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
+    assert process_events_config.chunk_id is None
+    mocker.patch("app.actions.handlers.transform", side_effect=lambda c, e: {"event_id": e["event_id"]})
+    mocker.patch(
+        "app.actions.handlers.gundi_tools.send_events_to_gundi",
+        return_value=[{"object_id": "o1"}, {"object_id": "o2"}],
+    )
+    mocker.patch("app.actions.handlers.process_attachments", return_value=None)
+    mocker.patch("app.actions.handlers.save_events_state", return_value=None)
+    set_state = mocker.patch("app.actions.handlers.state_manager.set_state", return_value=None)
+
+    result = await action_process_events_per_aoi(integration, process_events_config)
+
+    assert result["events_processed"] == 2
+    assert not set_state.called
+
+
+@pytest.mark.asyncio
+async def test_cursor_survives_a_sub_action_that_never_delivers(
+        mocker, integration, pull_events_config, mock_publish_event
+):
+    # End to end for the [P1]: run 1 hands out two chunks and the second one
+    # never lands. Run 2 must resume from the end of chunk 1, not from the end
+    # of the batch, so the lost events are fetched again instead of skipped.
+    mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
+    mocker.patch("app.actions.client.get_auth_config", return_value=None)
+    mocker.patch("app.actions.handlers.trigger_action", return_value=None)
+
+    store = {}
+    async def _get_state(integration_id, action_id, source_id="no-source"):
+        return store.get(source_id)
+    async def _set_state(integration_id, action_id, state, source_id="no-source", expire=None):
+        store[source_id] = state
+    async def _delete_state(integration_id, action_id, source_id="no-source"):
+        store.pop(source_id, None)
+    mocker.patch("app.actions.handlers.state_manager.get_state", side_effect=_get_state)
+    mocker.patch("app.actions.handlers.state_manager.set_state", side_effect=_set_state)
+    mocker.patch("app.actions.handlers.state_manager.delete_state", side_effect=_delete_state)
+
+    events = [
+        {"event_id": "a", "updated_at": "2026-09-08T10:00:00Z", "pad": "x" * 200},
+        {"event_id": "b", "updated_at": "2026-09-08T11:00:00Z", "pad": "x" * 200},
+    ]
+    mocker.patch("app.actions.client.get_skylight_events", return_value=({"aoi1": events}, []))
+    mocker.patch("app.actions.handlers.MAX_TRIGGER_PAYLOAD_BYTES", 250)
+
+    run1 = await action_pull_events(integration, pull_events_config)
+    chunk_ids = run1["details"]["chunk_plan"]["aoi1"]
+    assert len(chunk_ids) == 2
+
+    # Only the first chunk reaches EarthRanger; the second exhausts its retries.
+    store[f"_chunk.{chunk_ids[0]}"] = {"delivered_at": "x"}
+
+    run2 = await action_pull_events(integration, pull_events_config)
+
+    # Resumed at event "a", so event "b" is still in range of the next fetch.
+    assert run2["details"]["cursors"] == {"aoi1": "2026-09-08T10:00:00Z"}
+    assert store["aoi1"] == {"updated_since": "2026-09-08T10:00:00Z"}
 
