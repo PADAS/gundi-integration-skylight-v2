@@ -1,10 +1,13 @@
 import base64
 import datetime
 import json
+import os
 import time
 import pytest
 import httpx
 import pydantic
+
+from dateparser import parse as dp
 
 from gql.transport.exceptions import TransportQueryError, TransportServerError
 
@@ -20,6 +23,7 @@ from app.actions.client import (
     _TOKEN_EXPIRY_SKEW_SECONDS,
     normalize_v2_event,
     search_aois,
+    DEFAULT_EVENT_MAPPING,
 )
 from app.actions.configurations import ProcessEventsPerAOIConfig, PullEventsConfig, ListAOIsQuery
 from app.actions.handlers import (
@@ -1997,3 +2001,179 @@ async def test_cursor_survives_a_sub_action_that_never_delivers(
     assert run2["details"]["cursors"] == {"aoi1": "2026-09-08T10:00:00Z"}
     assert store["aoi1"] == {"updated_since": "2026-09-08T10:00:00Z"}
 
+
+# --- Contract tests against real Skylight v2 responses -----------------------
+#
+# app/actions/tests/fixtures/skylight_v2_records.json holds one record per
+# Skylight event type, captured live from searchEventsV2 on 2026-09-10 using
+# exactly the query in client.py. Vessel identities (mmsi/imo/name/vesselId/
+# trackId/gfwVesselId), coordinates, event ids and image URLs are replaced with
+# synthetic values — this repo is public. Every field NAME, TYPE and null /
+# non-null pattern is exactly as Skylight returned it, which is what these
+# tests assert on, so the pseudonymisation costs nothing in drift detection.
+#
+# What these catch that the hand-written tests do not: Skylight renaming or
+# dropping a field, changing a type, or moving something between eventDetails
+# and the record. Re-capture them when the query changes or Skylight ships a
+# schema change.
+#
+# NOT covered: `speed_range`. Confirmed live on 2026-09-10 that the type is
+# valid in Skylight's enum but has zero events worldwide across the whole
+# retained window (~18 months). There is no real record to capture, and an
+# invented one would defeat the purpose of these tests.
+
+FIXTURES_PATH = os.path.join(os.path.dirname(__file__), "fixtures", "skylight_v2_records.json")
+
+with open(FIXTURES_PATH) as _fixtures_file:
+    REAL_V2_RECORDS = json.load(_fixtures_file)
+
+# Every Skylight type the connector is configured to pull, and the ER event
+# type DEFAULT_EVENT_MAPPING must resolve it to.
+EXPECTED_ER_EVENT_TYPE = {
+    "fishing_activity_history": "fishing_alert_rep",
+    "dark_rendezvous": "dark_rendezvous_alert_rep",
+    "standard_rendezvous": "standard_rendezvous_alert_rep",
+    "aoi_visit": "entry_alert_rep",
+    "viirs": "detection_alert_rep",
+    "sar_sentinel1": "detection_alert_rep",
+    "eo_sentinel2": "detection_alert_rep",
+    "eo_landsat_8_9": "detection_alert_rep",
+}
+
+DEFAULT_MAPPING_AS_CONFIG = list(DEFAULT_EVENT_MAPPING.values())
+
+
+def test_real_fixtures_cover_every_pullable_event_type():
+    # A new event type added to DEFAULT_EVENT_MAPPING without a captured
+    # record would otherwise go untested here and drift unnoticed.
+    mapped = set()
+    for entry in DEFAULT_EVENT_MAPPING.values():
+        skylight_type = entry["skylight_event_type"]
+        mapped.update(skylight_type if isinstance(skylight_type, list) else [skylight_type])
+    # speed_range has no events in Skylight's retained window; see the note above.
+    assert mapped - set(REAL_V2_RECORDS) == {"speed_range"}
+    assert set(EXPECTED_ER_EVENT_TYPE) == set(REAL_V2_RECORDS)
+
+
+@pytest.mark.parametrize("skylight_type", sorted(REAL_V2_RECORDS))
+def test_real_record_normalizes_and_transforms(skylight_type):
+    """Each real record survives the full v2 -> ER path with usable output."""
+    record = REAL_V2_RECORDS[skylight_type]
+
+    normalized = normalize_v2_event(record)
+
+    assert normalized["event_id"] == record["eventId"]
+    assert normalized["event_type"] == skylight_type
+    # The pull cursor reads this top-level copy; without it the cursor never moves.
+    assert normalized["updated_at"] == record["updatedAt"]
+
+    transformed = transform(DEFAULT_MAPPING_AS_CONFIG, normalized)
+
+    assert transformed, f"{skylight_type} produced no ER event"
+    assert transformed["event_type"] == EXPECTED_ER_EVENT_TYPE[skylight_type]
+    assert transformed["title"]
+    # recorded_at must parse: an unparsed timestamp is rejected by Gundi.
+    assert isinstance(transformed["recorded_at"], datetime.datetime)
+    # Real coordinates, not the None that a renamed point field would give.
+    assert isinstance(transformed["location"]["lat"], (int, float))
+    assert isinstance(transformed["location"]["lon"], (int, float))
+    assert transformed["event_details"]["event_id"] == record["eventId"]
+    assert record["eventId"] in transformed["event_details"]["entry_link"]
+
+
+@pytest.mark.parametrize("skylight_type", sorted(REAL_V2_RECORDS))
+def test_real_record_flattens_its_vessels(skylight_type):
+    # Vessels arrive as vessel0/vessel1 objects and must end up as flat
+    # vessel_N_* keys. A renamed vessel field would silently stop reaching ER.
+    record = REAL_V2_RECORDS[skylight_type]
+    details = transform(DEFAULT_MAPPING_AS_CONFIG, normalize_v2_event(record))["event_details"]
+
+    # Real records show a vessel can be partly unidentified: a SAR detection
+    # may carry an mmsi and a country with no name, vesselId or vesselType at
+    # all. transform() drops None values rather than emitting empty fields, so
+    # only the fields Skylight actually populated are expected here.
+    v1_key = {"name": "name", "mmsi": "mmsi", "vesselType": "type", "countryCode": "country_filter"}
+    checked = 0
+    for index, key in enumerate(("vessel0", "vessel1")):
+        vessel = (record.get("vessels") or {}).get(key)
+        if not vessel:
+            continue
+        for v2_field, v1_field in v1_key.items():
+            if vessel.get(v2_field) is None:
+                assert f"vessel_{index}_{v1_field}" not in details
+                continue
+            assert details[f"vessel_{index}_{v1_field}"] == vessel[v2_field]
+            checked += 1
+    assert checked or not any((record.get("vessels") or {}).values())
+
+    # An event with no vessel at all still gets the placeholder block, so the
+    # ER event schema is the same shape either way.
+    if not any((record.get("vessels") or {}).values()):
+        assert details["vessel_0_name"] == "N/A"
+
+
+def test_real_fishing_record_carries_its_score():
+    details = transform(
+        DEFAULT_MAPPING_AS_CONFIG, normalize_v2_event(REAL_V2_RECORDS["fishing_activity_history"])
+    )["event_details"]
+
+    assert isinstance(details["fishing_score"], float)
+
+
+def test_real_dark_rendezvous_record_carries_its_osr_score():
+    details = transform(
+        DEFAULT_MAPPING_AS_CONFIG, normalize_v2_event(REAL_V2_RECORDS["dark_rendezvous"])
+    )["event_details"]
+
+    assert details["osr_score"] is not None
+
+
+def test_real_standard_rendezvous_has_two_vessels_and_no_event_details():
+    # Verified live: StandardRendezvousEventDetails exposes no fields at all, so
+    # the record's own detail block is empty and everything useful about the
+    # event is the pair of vessels. If Skylight ever adds fields here, this
+    # fails and the query needs a fragment for them.
+    record = REAL_V2_RECORDS["standard_rendezvous"]
+    assert record["eventDetails"] == {}
+    assert record["vessels"]["vessel0"] and record["vessels"]["vessel1"]
+
+    details = transform(DEFAULT_MAPPING_AS_CONFIG, normalize_v2_event(record))["event_details"]
+
+    assert details["vessel_0_mmsi"] != details["vessel_1_mmsi"]
+    assert details["vessel_0_name"] and details["vessel_1_name"]
+
+
+def test_real_aoi_visit_record_gets_its_exit_time_and_duration():
+    # The entry alert is the only type that reads `start` for position/time and
+    # `end` for the exit, and the only one that computes a duration.
+    record = REAL_V2_RECORDS["aoi_visit"]
+    transformed = transform(DEFAULT_MAPPING_AS_CONFIG, normalize_v2_event(record))
+
+    assert transformed["recorded_at"] == dp(record["start"]["time"])
+    assert transformed["event_details"]["exit_date"] == record["end"]["time"]
+    assert transformed["event_details"]["duration_in_area"] > 0
+
+
+@pytest.mark.parametrize("skylight_type", ["viirs", "sar_sentinel1", "eo_sentinel2", "eo_landsat_8_9"])
+def test_real_detection_records_carry_the_fields_the_attachment_path_needs(skylight_type):
+    # process_attachments reads event_details.image_url; detectionType drives
+    # the dark / ais_correlated distinction operators filter on in ER.
+    details = transform(
+        DEFAULT_MAPPING_AS_CONFIG, normalize_v2_event(REAL_V2_RECORDS[skylight_type])
+    )["event_details"]
+
+    assert details["image_url"].startswith("https://")
+    assert details["detection_type"] in {"dark", "ais_correlated"}
+    assert details["data_source"]
+
+
+def test_real_records_use_only_snake_case_detail_keys():
+    # normalize_v2_event's job is v2 camelCase -> v1 snake_case. A key that
+    # slips through in camelCase reaches ER as an unmapped field and is dropped.
+    for skylight_type, record in REAL_V2_RECORDS.items():
+        details = normalize_v2_event(record)["event_details"]
+        camel = [key for key in details if any(char.isupper() for char in key)]
+        assert not camel, f"{skylight_type} leaked camelCase detail keys: {camel}"
+        for vessel in (normalize_v2_event(record)["vessels"] or {}).values():
+            camel = [key for key in (vessel or {}) if any(char.isupper() for char in key)]
+            assert not camel, f"{skylight_type} leaked camelCase vessel keys: {camel}"
