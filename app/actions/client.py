@@ -42,6 +42,16 @@ GRAPHQL_EXECUTE_TIMEOUT_SECONDS = 60
 # worldwide events, so hitting this cap almost always means a misconfigured AOI.
 SKYLIGHT_RESULT_CAP = 10000
 
+# searchEventsV2 rejects a startTime older than a rolling retention boundary
+# with a 400 ("start_time.gte must be greater than ..."), which fails the whole
+# run for that AOI. Verified live on 2026-09-10: 540 days back was accepted and
+# 545 was not, and the boundary tracks the clock (two probes 38 seconds apart
+# moved it by 38 seconds), so it is a rolling window rather than a fixed date.
+# initial_data_window_days is operator-configurable with no upper bound, so it
+# is clamped to this. Conservative on purpose: the exact interval is Skylight's
+# to change, and asking for slightly less history is harmless where a 400 is not.
+SKYLIGHT_MAX_WINDOW_DAYS = 540
+
 # Page size for the searchAOIs reference lookup (accounts typically have a handful).
 AOI_SEARCH_PAGE_SIZE = 100
 
@@ -645,6 +655,18 @@ async def get_skylight_events(integration, config_data, auth):
     aoi_ids = config_data.aoi_ids
     page_size = config_data.pageSize
     initial_data_window_days = config_data.initial_data_window_days or settings.DEFAULT_WINDOW_DAYS
+    if initial_data_window_days > SKYLIGHT_MAX_WINDOW_DAYS:
+        logger.warning(
+            f'Configured window of {initial_data_window_days} days exceeds the furthest back '
+            f'Skylight will accept ({SKYLIGHT_MAX_WINDOW_DAYS} days); asking for '
+            f'{SKYLIGHT_MAX_WINDOW_DAYS} instead. Without this the query is rejected outright '
+            f'and the integration returns nothing at all.',
+            extra={
+                "integration_id": str(integration.id),
+                "attention_needed": True,
+            }
+        )
+        initial_data_window_days = SKYLIGHT_MAX_WINDOW_DAYS
 
     # Skylight silently ignores an unknown aoiId and returns *worldwide* events,
     # so a single typo would flood the destination. Drop ids the account can't

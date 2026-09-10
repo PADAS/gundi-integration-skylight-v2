@@ -24,6 +24,7 @@ from app.actions.client import (
     normalize_v2_event,
     search_aois,
     DEFAULT_EVENT_MAPPING,
+    SKYLIGHT_MAX_WINDOW_DAYS,
 )
 from app.actions.configurations import ProcessEventsPerAOIConfig, PullEventsConfig, ListAOIsQuery
 from app.actions.handlers import (
@@ -2177,3 +2178,41 @@ def test_real_records_use_only_snake_case_detail_keys():
         for vessel in (normalize_v2_event(record)["vessels"] or {}).values():
             camel = [key for key in (vessel or {}) if any(char.isupper() for char in key)]
             assert not camel, f"{skylight_type} leaked camelCase vessel keys: {camel}"
+
+
+@pytest.mark.asyncio
+async def test_get_skylight_events_clamps_a_window_beyond_skylight_retention(
+        mocker, integration, auth, patch_skylight_clients
+):
+    # searchEventsV2 400s on a startTime older than its rolling retention
+    # boundary, which fails the whole AOI. initial_data_window_days has no
+    # upper bound in the portal, so an operator asking for "3 years" would get
+    # nothing at all rather than three years of events.
+    class _WideWindowCfg(_PullCfg):
+        initial_data_window_days = 1095
+
+    exec_mock = mocker.patch("app.actions.client.execute_gql_query", side_effect=[_page([], total=0)])
+
+    await get_skylight_events(integration, _WideWindowCfg(), auth)
+
+    requested = dp(exec_mock.call_args.args[2]["startTime"])
+    oldest_allowed = datetime.datetime.now(tz=datetime.timezone.utc) - datetime.timedelta(
+        days=SKYLIGHT_MAX_WINDOW_DAYS
+    )
+    assert requested >= oldest_allowed - datetime.timedelta(days=1)
+
+
+@pytest.mark.asyncio
+async def test_get_skylight_events_leaves_a_window_within_retention_alone(
+        mocker, integration, auth, patch_skylight_clients
+):
+    class _NormalCfg(_PullCfg):
+        initial_data_window_days = 30
+
+    exec_mock = mocker.patch("app.actions.client.execute_gql_query", side_effect=[_page([], total=0)])
+
+    await get_skylight_events(integration, _NormalCfg(), auth)
+
+    requested = dp(exec_mock.call_args.args[2]["startTime"])
+    expected = datetime.datetime.now(tz=datetime.timezone.utc) - datetime.timedelta(days=30)
+    assert abs((requested - expected).total_seconds()) < 86400
