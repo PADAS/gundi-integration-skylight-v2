@@ -27,6 +27,11 @@ from typing import Any, Optional
 
 
 logger = logging.getLogger(__name__)
+
+# gql's httpx transport logs every request payload at DEBUG, which would put the
+# plaintext Skylight password from the `getToken` mutation into the logs whenever
+# LOGGING_LEVEL is DEBUG. Nothing here needs that detail, so hold it at INFO.
+logging.getLogger("gql.transport.httpx").setLevel(logging.INFO)
 state_manager = IntegrationStateManager()
 
 DEFAULT_SKYLIGHT_API_URL = 'https://api.skylight.earth/graphql'
@@ -559,6 +564,19 @@ async def get_skylight_events(integration, config_data, auth):
                         }
                     }
                     eventDetails {
+                        # Reviewed 2026-09-10: fishing, dark rendezvous and standard
+                        # rendezvous look thin next to v1, which asked for
+                        # average_speed/distance/duration on every type. They are not
+                        # a regression — v1 *returned* those as null for these types
+                        # (checked live over 200 events of each; only visit_type, a
+                        # constant, was ever populated). v2 has no field for them
+                        # either: probing ~75 candidate names against the schema
+                        # validator found only the ones selected here, and
+                        # StandardRendezvousEventDetails exposes nothing at all, which
+                        # is why its fragment is absent. Introspection is disabled on
+                        # the Skylight API, so re-check by probing, not by reading a
+                        # schema. (DarkRendezvousEventDetails also accepts
+                        # `fishingScore`; not requested, as v1 never carried it.)
                         ... on FishingEventDetails {
                             fishingScore
                         }
@@ -627,6 +645,34 @@ async def get_skylight_events(integration, config_data, auth):
     aoi_ids = config_data.aoi_ids
     page_size = config_data.pageSize
     initial_data_window_days = config_data.initial_data_window_days or settings.DEFAULT_WINDOW_DAYS
+
+    # Skylight silently ignores an unknown aoiId and returns *worldwide* events,
+    # so a single typo would flood the destination. Drop ids the account can't
+    # see before querying (this is the real guard the result-cap check used to
+    # stand in for). If searchAOIs itself fails or comes back empty, the list is
+    # unusable rather than authoritative, so the pull proceeds unfiltered.
+    try:
+        known_aoi_ids = {record.get("id") for record in await search_aois(integration, auth)}
+    except Exception as e:
+        logger.warning(
+            f'Could not list Skylight AOIs to validate the configured ids '
+            f'({type(e).__name__}: {e}). Continuing without validation.',
+            extra={"integration_id": str(integration.id)}
+        )
+        known_aoi_ids = set()
+    if known_aoi_ids:
+        unknown_aoi_ids = [aoi for aoi in aoi_ids if aoi not in known_aoi_ids]
+        if unknown_aoi_ids:
+            logger.error(
+                f'Skipping unknown AOI id(s) {unknown_aoi_ids}: they are not visible to this '
+                f'Skylight account. Skylight ignores an unknown aoiId and would return worldwide '
+                f'events, so these are not queried. Correct the ids in the integration configuration.',
+                extra={
+                    "integration_id": str(integration.id),
+                    "attention_needed": True,
+                }
+            )
+            aoi_ids = [aoi for aoi in aoi_ids if aoi in known_aoi_ids]
 
     for aoi in aoi_ids:
         try:
@@ -741,6 +787,25 @@ async def get_skylight_events(integration, config_data, auth):
                 meta = search_response.get('meta') or {}
                 if snapshot_id is None:
                     snapshot_id = meta.get('snapshotId')
+                    if snapshot_id is None and page_num == 1:
+                        # Without a snapshot the pages aren't pinned: sorting is by
+                        # `updated`, so an event updated mid-run moves to the end and
+                        # whatever slid into its offset is never returned. Its
+                        # updatedAt is below the saved cursor, so it is lost rather
+                        # than retried. Paging continues (one page is still fine, and
+                        # a later page may supply the id), but this is worth knowing
+                        # about when events go missing.
+                        logger.warning(
+                            f'Skylight returned no snapshotId on the first page for AOI "{aoi}". '
+                            f'Paging is not pinned to a snapshot, so concurrent updates could shift '
+                            f'the result window between pages and events at the shifted offsets may '
+                            f'be missed for this run.',
+                            extra={
+                                "integration_id": str(integration.id),
+                                "aoi": aoi,
+                                "attention_needed": True,
+                            }
+                        )
                 if total_pages is None:
                     total = meta.get('total') or 0
                     reported_total = total
@@ -748,28 +813,29 @@ async def get_skylight_events(integration, config_data, auth):
                     # also the offset step, so total_pages matches the offsets.
                     total_pages = (total + page_size - 1) // page_size
                     if total >= SKYLIGHT_RESULT_CAP:
-                        # Hitting the cap means the query matched at least as many
-                        # events as Skylight will ever return, so the result is
-                        # both truncated and unrepresentative. Rather than pushing
-                        # an arbitrary 10,000 events (potentially worldwide) into
-                        # the destination, skip the AOI and leave it to an operator.
+                        # The backlog is larger than Skylight will return in one
+                        # query. Results are sorted oldest-update-first, so this
+                        # run keeps the oldest SKYLIGHT_RESULT_CAP events and the
+                        # cursor saved from them lets the next run continue from
+                        # where this one stopped, draining the backlog run by run.
+                        # (Skipping the AOI instead would never advance the cursor,
+                        # so the identical query would hit the cap forever and the
+                        # AOI would never deliver anything. The unknown-AOI case
+                        # that concern was really about is caught up front by
+                        # validating the ids against searchAOIs.)
                         logger.warning(
-                            f'Skipping AOI "{aoi}": Skylight returned its maximum of {SKYLIGHT_RESULT_CAP} '
-                            f'events (started since {start_time}, updated since {updated_since}). '
-                            f'This configuration needs review — the AOI id may be invalid (Skylight ignores '
-                            f'unknown AOI ids and returns worldwide events), or the configuration may be too '
-                            f'loose (time window or event types too broad). No events were processed for this '
-                            f'AOI; narrow the configuration or correct the AOI id and run again.',
+                            f'AOI "{aoi}" has a backlog at or beyond Skylight\'s maximum of '
+                            f'{SKYLIGHT_RESULT_CAP} events (started since {start_time}, updated '
+                            f'since {updated_since}). Taking the oldest {SKYLIGHT_RESULT_CAP} this '
+                            f'run and continuing from the cursor on the next one. If this repeats '
+                            f'every run the configuration may be too loose (time window or event '
+                            f'types too broad).',
                             extra={
                                 "integration_id": str(integration.id),
                                 "aoi": aoi,
                                 "attention_needed": True,
                             }
                         )
-                        # Nothing collected yet (this is the first page), but be
-                        # explicit: the AOI contributes no events and no cursor.
-                        response_list = []
-                        break
 
                 if not events_response:
                     # Nothing left even though total_pages said otherwise

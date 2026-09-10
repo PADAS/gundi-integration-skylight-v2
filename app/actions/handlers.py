@@ -309,14 +309,22 @@ async def action_pull_events(integration, action_config: PullEventsConfig):
             # Get through the events and check if state_manager has it recorded from a previous execution
             patch_these_events = []
             for aoi, events_list in events.items():
+                # Build a keep-list rather than removing from the list being
+                # iterated: removing shifts the index, so the event right after
+                # an already-known one was never checked and would be re-sent to
+                # Gundi as new. With the `updated >= cursor` boundary that is
+                # routine — Skylight batch-updates give several events the same
+                # updatedAt, so the boundary regularly holds more than one.
+                new_events = []
                 for event in events_list:
                     event_id = get_clean_event_id(event)
                     event_ids.append(event_id)
                     if saved_event := await state_manager.get_state(str(integration.id), "pull_events", event_id):
                         # Event already exists, will patch it
                         patch_these_events.append((saved_event.get("object_id"), event))
-                        events_list.remove(event)
-                events[aoi] = events_list
+                    else:
+                        new_events.append(event)
+                events[aoi] = new_events
             return events, patch_these_events
 
         events, events_to_patch = await get_skylight_events_to_patch()
@@ -370,23 +378,34 @@ async def action_pull_events(integration, action_config: PullEventsConfig):
 async def action_process_events_per_aoi(integration, action_config: ProcessEventsPerAOIConfig):
     result = {"events_processed": 0, "details": {}}
     all_responses = []
+    # Kept aligned 1:1 so the event -> Gundi object mapping is saved against the
+    # event that actually produced each response. The transformed list is both
+    # sorted and filtered below, so pairing responses back against
+    # `action_config.events` would cross the mappings and later patches would
+    # overwrite the wrong EarthRanger event.
+    state_responses = []
+    state_events = []
 
     # Filter out falsy results: transform() returns {} for events it skips
     # (e.g. an entry alert with no start point). An empty dict is truthy inside
     # a list, so it must be filtered here or it would leak into the Gundi batch.
-    transformed_data = sorted(
+    # Each transformed event is carried with the raw Skylight event it came from
+    # so identity survives the filtering and sorting.
+    transformed_pairs = sorted(
         [
-            transformed
+            (transformed, event)
             for event in action_config.events
             if (transformed := transform(action_config.updated_config_data, event))
         ],
-        key=lambda x: x.get("recorded_at") or datetime.datetime.min, reverse=True
+        key=lambda pair: pair[0].get("recorded_at") or datetime.datetime.min, reverse=True
     )
+    transformed_data = [transformed for transformed, _ in transformed_pairs]
 
     if transformed_data:
         # Send transformed data to Sensors API V2
         try:
-            for i, batch in enumerate(generate_batches(transformed_data, 200)):
+            for i, batch_pairs in enumerate(generate_batches(transformed_pairs, 200)):
+                batch = [transformed for transformed, _ in batch_pairs]
                 logger.info(f'Sending observations batch #{i}: {len(batch)} observations. AOI: {action_config.aoi}')
                 response = await gundi_tools.send_events_to_gundi(
                     events=batch,
@@ -399,7 +418,25 @@ async def action_process_events_per_aoi(integration, action_config: ProcessEvent
                     # Send images as attachments (if available)
                     await process_attachments(batch, response, integration)
                     # Process events to patch
-            await save_events_state(all_responses, action_config.events, integration)
+                    if len(response) == len(batch_pairs):
+                        state_responses.extend(response)
+                        state_events.extend(event for _, event in batch_pairs)
+                    else:
+                        # Without one response per event sent there is no way to
+                        # tell which event each object id belongs to. Saving a
+                        # guessed mapping is worse than saving none: a wrong
+                        # mapping makes a later patch overwrite another event.
+                        logger.warning(
+                            f'Gundi returned {len(response)} response(s) for a batch of '
+                            f'{len(batch_pairs)} event(s). Skipping the event-state mapping for '
+                            f'this batch; those events may be re-sent as new on a later run.',
+                            extra={
+                                "integration_id": str(integration.id),
+                                "aoi": action_config.aoi,
+                                "attention_needed": True,
+                            }
+                        )
+            await save_events_state(state_responses, state_events, integration)
         except (httpx.ConnectTimeout, httpx.ReadTimeout) as e:
             msg = (f'Timeout exception. AOI: {action_config.aoi}. Integration: {str(integration.id)}. '
                    f'Exception: {e}, Type: {str(type(e))}, Request: {str(e.request)}')
@@ -486,6 +523,18 @@ async def patch_events(events, updated_config_data, integration):
                 event_id=gundi_object_id
             )
             responses.append(response)
+            # Refresh the dedupe key's 72h TTL. The cursor is inclusive
+            # (`updated >= cursor`), so the boundary event comes back on every
+            # run and lands here. Without this refresh its key would expire on a
+            # quiet AOI, the event would look new again, and a duplicate would be
+            # created in EarthRanger.
+            await state_manager.set_state(
+                integration_id=str(integration.id),
+                action_id="pull_events",
+                state={"object_id": gundi_object_id},
+                source_id=get_clean_event_id(new_event),
+                expire=259200  # 72 hrs
+            )
     return responses
 
 

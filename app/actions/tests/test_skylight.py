@@ -3,6 +3,7 @@ import json
 import time
 import pytest
 import httpx
+import pydantic
 
 from gql.transport.exceptions import TransportQueryError, TransportServerError
 
@@ -24,6 +25,7 @@ from app.actions.handlers import (
     action_pull_events,
     action_process_events_per_aoi,
     batch_events_by_payload_size,
+    patch_events,
     process_attachments,
     transform,
 )
@@ -158,7 +160,14 @@ def patch_skylight_clients(mocker, state_manager):
         "app.actions.client.map_event_type",
         return_value=mocker.MagicMock(skylight_event_type="fishing_activity_history"),
     )
-    return {"state_manager": state_manager, "build_client": build_client}
+    # No AOI list by default: an unusable list means the pull runs unfiltered, so
+    # tests here drive paging alone. The validation tests patch this explicitly.
+    search_aois_mock = mocker.patch("app.actions.client.search_aois", return_value=[])
+    return {
+        "state_manager": state_manager,
+        "build_client": build_client,
+        "search_aois": search_aois_mock,
+    }
 
 
 @pytest.mark.asyncio
@@ -393,29 +402,79 @@ async def test_get_skylight_events_stops_on_empty_page_before_total(mocker, inte
 
 
 @pytest.mark.asyncio
-async def test_get_skylight_events_skips_the_aoi_when_total_hits_skylight_cap(mocker, integration, auth, patch_skylight_clients):
-    # Hitting the cap means the result is truncated and probably unrepresentative
-    # (an unknown AOI id makes Skylight return worldwide events). Rather than
-    # pushing 10,000 arbitrary events downstream, the AOI is skipped entirely and
-    # flagged for an operator.
+async def test_get_skylight_events_drains_the_backlog_when_total_hits_skylight_cap(mocker, integration, auth, patch_skylight_clients):
+    # A backlog at or beyond the cap must NOT skip the AOI: skipping keeps the
+    # cursor where it is, so the identical query hits the cap again every run and
+    # the AOI never delivers anything. Results are oldest-update-first, so the run
+    # keeps this page and the cursor lets the next run continue.
     exec_mock = mocker.patch(
         "app.actions.client.execute_gql_query",
-        side_effect=[_page([{"event_id": "e1"}, {"event_id": "e2"}], total=10000), _page([], total=10000)],
+        side_effect=[
+            _page([{"event_id": "e1"}, {"event_id": "e2"}], total=10000, page_num=1),
+            _page([{"event_id": "e3"}], total=10000, page_num=2),
+            _page([], total=10000, page_num=3),
+        ],
     )
     log = mocker.patch("app.actions.client.logger")
 
     events, _ = await get_skylight_events(integration, _PullCfg(), auth)
 
-    # Stopped after the first page; nothing collected, so nothing is sent and
-    # (via latest_update_cursor) no cursor is advanced for this AOI.
-    assert exec_mock.call_count == 1
-    assert events["aoi1"] == []
+    assert exec_mock.call_count == 3
+    assert [e["event_id"] for e in events["aoi1"]] == ["e1", "e2", "e3"]
     cap_warnings = [
         call for call in log.warning.call_args_list
-        if "Skipping AOI" in str(call) and call.kwargs.get("extra", {}).get("attention_needed")
+        if "backlog" in str(call) and call.kwargs.get("extra", {}).get("attention_needed")
     ]
     assert len(cap_warnings) == 1
-    assert "needs review" in str(cap_warnings[0])
+    assert "Skipping AOI" not in str(cap_warnings[0])
+
+
+@pytest.mark.asyncio
+async def test_get_skylight_events_skips_aoi_ids_the_account_cannot_see(mocker, integration, auth, patch_skylight_clients):
+    # Skylight ignores an unknown aoiId and returns worldwide events, so an id the
+    # account can't see is dropped before any query is made.
+    patch_skylight_clients["search_aois"].return_value = [{"id": "aoi2"}]
+    exec_mock = mocker.patch("app.actions.client.execute_gql_query", side_effect=[_page([], total=0)])
+    log = mocker.patch("app.actions.client.logger")
+
+    events, _ = await get_skylight_events(integration, _PullCfg(), auth)
+
+    assert "aoi1" not in events
+    assert not exec_mock.called
+    errors = [
+        call for call in log.error.call_args_list
+        if "unknown AOI id" in str(call) and call.kwargs.get("extra", {}).get("attention_needed")
+    ]
+    assert len(errors) == 1
+
+
+@pytest.mark.asyncio
+async def test_get_skylight_events_queries_normally_when_the_aoi_is_known(mocker, integration, auth, patch_skylight_clients):
+    patch_skylight_clients["search_aois"].return_value = [{"id": "aoi1"}, {"id": "aoi2"}]
+    exec_mock = mocker.patch(
+        "app.actions.client.execute_gql_query",
+        side_effect=[_page([{"event_id": "e1"}], total=1)],
+    )
+
+    events, _ = await get_skylight_events(integration, _PullCfg(), auth)
+
+    assert exec_mock.call_count == 1
+    assert [e["event_id"] for e in events["aoi1"]] == ["e1"]
+
+
+@pytest.mark.asyncio
+async def test_get_skylight_events_continues_when_aoi_listing_fails(mocker, integration, auth, patch_skylight_clients):
+    # The validation call is a guard, not a gate: if it fails the pull still runs.
+    patch_skylight_clients["search_aois"].side_effect = Exception("boom")
+    exec_mock = mocker.patch(
+        "app.actions.client.execute_gql_query",
+        side_effect=[_page([{"event_id": "e1"}], total=1)],
+    )
+
+    events, _ = await get_skylight_events(integration, _PullCfg(), auth)
+
+    assert exec_mock.call_count == 1
+    assert [e["event_id"] for e in events["aoi1"]] == ["e1"]
 
 
 @pytest.mark.asyncio
@@ -542,6 +601,9 @@ def test_normalize_v2_event_detection_sets_v1_data_source_correlated_and_image_u
 
 
 def test_normalize_v2_event_rendezvous_keeps_second_vessel_as_vessel_1():
+    # The empty event_details below is correct, not a gap: StandardRendezvousEventDetails
+    # exposes no fields in v2, and v1 returned average_speed/distance/duration as null
+    # for this type anyway (verified live, 2026-09-10). See the query in client.py.
     result = normalize_v2_event({
         "eventId": "r1", "eventType": "standard_rendezvous",
         "vessels": {"vessel0": _v2_vessel(name="BIEN DONG"), "vessel1": _v2_vessel(name="LANH LX", mmsi=574345679)},
@@ -751,13 +813,15 @@ async def test_action_process_events_per_aoi_success(mocker, integration, proces
     mocker.patch("app.services.action_runner.publish_event", mock_publish_event)
     mocker.patch("app.services.action_scheduler.publish_event", mock_publish_event)
     mocker.patch("app.actions.handlers.transform", return_value={"event_id": "event1"})
-    mocker.patch("app.actions.handlers.generate_batches", return_value=[[{"event_id": "event1"}]])
-    mocker.patch("app.actions.handlers.gundi_tools.send_events_to_gundi", return_value=[{"object_id": "event1"}])
+    mocker.patch(
+        "app.actions.handlers.gundi_tools.send_events_to_gundi",
+        return_value=[{"object_id": "event1"}, {"object_id": "event2"}],
+    )
     mocker.patch("app.actions.handlers.process_attachments", return_value=None)
     mocker.patch("app.actions.handlers.save_events_state", return_value=None)
 
     result = await action_process_events_per_aoi(integration, process_events_config)
-    assert result["events_processed"] == 1
+    assert result["events_processed"] == 2
 
 
 @pytest.mark.asyncio
@@ -788,7 +852,6 @@ async def test_action_process_events_per_aoi_failure(mocker, integration, proces
     mocker.patch("app.services.action_runner.publish_event", mock_publish_event)
     mocker.patch("app.services.action_scheduler.publish_event", mock_publish_event)
     mocker.patch("app.actions.handlers.transform", return_value={"event_id": "event1"})
-    mocker.patch("app.actions.handlers.generate_batches", return_value=[[{"event_id": "event1"}]])
     mocker.patch("app.actions.handlers.gundi_tools.send_events_to_gundi", side_effect=httpx.HTTPError("Error"))
 
     with pytest.raises(httpx.HTTPError):
@@ -1323,3 +1386,159 @@ def test_pull_events_aoi_ids_carry_reference_annotation_for_registered_action():
     assert issubclass(config_model, ReferenceActionConfiguration)
     # aoi_ids itself is unchanged: a plain list of strings in the JSON schema.
     assert PullEventsConfig.schema()["properties"]["aoi_ids"]["items"] == {"type": "string"}
+
+
+@pytest.mark.asyncio
+async def test_process_events_per_aoi_pairs_state_with_the_event_actually_sent(
+    mocker, integration, process_events_config, mock_publish_event
+):
+    # Regression: responses follow the *sorted* transformed list, so pairing them
+    # back against action_config.events crossed the event -> Gundi object mapping
+    # and a later patch would overwrite the wrong EarthRanger event.
+    import datetime as _dt
+
+    mocker.patch("app.services.state.IntegrationStateManager.get_state", return_value=None)
+    mocker.patch("app.services.state.IntegrationStateManager.set_state", return_value=None)
+    mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
+    mocker.patch("app.services.action_runner.publish_event", mock_publish_event)
+    mocker.patch("app.services.action_scheduler.publish_event", mock_publish_event)
+    # event1 is older, so sorting by recorded_at descending reverses the input.
+    mocker.patch(
+        "app.actions.handlers.transform",
+        side_effect=[
+            {"event_id": "t1", "recorded_at": _dt.datetime(2024, 1, 1)},
+            {"event_id": "t2", "recorded_at": _dt.datetime(2024, 1, 2)},
+        ],
+    )
+    send_mock = mocker.patch(
+        "app.actions.handlers.gundi_tools.send_events_to_gundi",
+        return_value=[{"object_id": "obj2"}, {"object_id": "obj1"}],
+    )
+    mocker.patch("app.actions.handlers.process_attachments", return_value=None)
+    save_state = mocker.patch("app.actions.handlers.save_events_state", return_value=None)
+
+    await action_process_events_per_aoi(integration, process_events_config)
+
+    assert [e["event_id"] for e in send_mock.call_args.kwargs["events"]] == ["t2", "t1"]
+    responses, events, _ = save_state.call_args.args
+    assert responses == [{"object_id": "obj2"}, {"object_id": "obj1"}]
+    # event2 produced t2, which was sent first, so it must pair with obj2.
+    assert [e["event_id"] for e in events] == ["event2", "event1"]
+
+
+@pytest.mark.asyncio
+async def test_process_events_per_aoi_skips_state_when_response_count_differs(
+    mocker, integration, process_events_config, mock_publish_event
+):
+    # A guessed mapping is worse than none: it would make a later patch overwrite
+    # a different event. Two events sent, one response back -> nothing saved.
+    mocker.patch("app.services.state.IntegrationStateManager.get_state", return_value=None)
+    mocker.patch("app.services.state.IntegrationStateManager.set_state", return_value=None)
+    mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
+    mocker.patch("app.services.action_runner.publish_event", mock_publish_event)
+    mocker.patch("app.services.action_scheduler.publish_event", mock_publish_event)
+    mocker.patch("app.actions.handlers.transform", return_value={"event_id": "t"})
+    mocker.patch(
+        "app.actions.handlers.gundi_tools.send_events_to_gundi", return_value=[{"object_id": "obj1"}]
+    )
+    mocker.patch("app.actions.handlers.process_attachments", return_value=None)
+    save_state = mocker.patch("app.actions.handlers.save_events_state", return_value=None)
+    log = mocker.patch("app.actions.handlers.logger")
+
+    await action_process_events_per_aoi(integration, process_events_config)
+
+    save_state.assert_called_once_with([], [], integration)
+    assert any("Skipping the event-state mapping" in str(c) for c in log.warning.call_args_list)
+
+
+@pytest.mark.asyncio
+async def test_pull_events_checks_every_event_against_saved_state(
+    mocker, integration, pull_events_config, mock_publish_event
+):
+    # Regression: removing from the list being iterated shifted the index, so the
+    # event right after an already-known one was never checked and was re-sent to
+    # Gundi as new. Both events here are known, so neither may be re-sent.
+    mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
+    mocker.patch("app.services.action_runner.publish_event", mock_publish_event)
+    mocker.patch("app.services.action_scheduler.publish_event", mock_publish_event)
+    mocker.patch(
+        "app.actions.client.get_skylight_events",
+        return_value=({"aoi": [{"event_id": "event1"}, {"event_id": "event2"}]}, []),
+    )
+    mocker.patch("app.actions.client.get_auth_config", return_value=None)
+    mocker.patch(
+        "app.services.state.IntegrationStateManager.get_state",
+        side_effect=lambda *args, **kwargs: {"object_id": f"obj_{args[2]}"},
+    )
+    mocker.patch("app.services.state.IntegrationStateManager.set_state", return_value=None)
+    trigger = mocker.patch("app.actions.handlers.trigger_action", return_value=None)
+    patch_mock = mocker.patch("app.actions.handlers.patch_events", return_value=[{}, {}])
+
+    result = await action_pull_events(integration, pull_events_config)
+
+    assert not trigger.called
+    assert result["events_extracted"] == 0
+    patched_ids = [event["event_id"] for _, event in patch_mock.call_args.args[0]]
+    assert patched_ids == ["event1", "event2"]
+
+
+@pytest.mark.asyncio
+async def test_patch_events_refreshes_the_dedupe_ttl(mocker, integration):
+    # The cursor is inclusive, so the boundary event returns every run and lands
+    # on the patch path. Without refreshing the 72h key it would expire on a quiet
+    # AOI, look new again, and be duplicated in EarthRanger.
+    mocker.patch("app.actions.handlers.transform", return_value={"event_id": "t1"})
+    mocker.patch("app.actions.handlers.gundi_tools.update_gundi_event", return_value={"object_id": "obj1"})
+    set_state = mocker.patch("app.actions.handlers.state_manager.set_state", return_value=None)
+
+    await patch_events([("obj1", {"event_id": "event1"})], [], integration)
+
+    set_state.assert_called_once()
+    assert set_state.call_args.kwargs["source_id"] == "event1"
+    assert set_state.call_args.kwargs["state"] == {"object_id": "obj1"}
+    assert set_state.call_args.kwargs["expire"] == 259200
+
+
+def test_pull_events_config_rejects_a_zero_page_size():
+    # pageSize 0 made every AOI yield nothing and the run report success.
+    with pytest.raises(pydantic.ValidationError):
+        PullEventsConfig(aoi_ids=["aoi1"], event_types=["Fishing"], pageSize=0)
+
+
+@pytest.mark.asyncio
+async def test_get_skylight_events_warns_when_paging_is_not_pinned(mocker, integration, auth, patch_skylight_clients):
+    # No snapshotId means the pages aren't pinned to a snapshot; a concurrent
+    # update can shift the window and the event at that offset is never returned,
+    # with an updatedAt already below the saved cursor. Paging still continues.
+    exec_mock = mocker.patch(
+        "app.actions.client.execute_gql_query",
+        side_effect=[
+            _page([{"event_id": "e1"}, {"event_id": "e2"}], total=3, page_num=1, snapshot_id=None),
+            _page([{"event_id": "e3"}], total=3, page_num=2, snapshot_id=None),
+        ],
+    )
+    log = mocker.patch("app.actions.client.logger")
+
+    events, _ = await get_skylight_events(integration, _PullCfg(), auth)
+
+    assert exec_mock.call_count == 2
+    assert [e["event_id"] for e in events["aoi1"]] == ["e1", "e2", "e3"]
+    warnings = [
+        call for call in log.warning.call_args_list
+        if "no snapshotId" in str(call) and call.kwargs.get("extra", {}).get("attention_needed")
+    ]
+    assert len(warnings) == 1
+
+
+@pytest.mark.asyncio
+async def test_get_skylight_events_no_snapshot_warning_when_pinned(mocker, integration, auth, patch_skylight_clients):
+    mocker.patch(
+        "app.actions.client.execute_gql_query",
+        side_effect=[_page([{"event_id": "e1"}], total=1)],
+    )
+    log = mocker.patch("app.actions.client.logger")
+
+    await get_skylight_events(integration, _PullCfg(), auth)
+
+    assert not any("no snapshotId" in str(call) for call in log.warning.call_args_list)
+

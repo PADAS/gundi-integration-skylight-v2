@@ -86,6 +86,7 @@ class PullEventsConfig(PullActionConfiguration):
     )
     pageSize: int = Field(
         1000,
+        ge=1,
         title='Number of records per Skylight call',
         description='Number of records the integration will fetch per API call.',
     )
