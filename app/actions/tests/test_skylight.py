@@ -10,6 +10,7 @@ import pydantic
 from dateparser import parse as dp
 
 from gql.transport.exceptions import TransportQueryError, TransportServerError
+from gundi_core.schemas.v2 import LogLevel
 
 from app.actions.client import (
     execute_gql_query,
@@ -47,7 +48,11 @@ def _make_jwt(exp: int) -> str:
 
 @pytest.fixture
 def integration(mocker):
-    return mocker.AsyncMock(id="integration_id", base_url="https://gundi-test.com", additional=True)
+    # `name` can't be passed to the Mock constructor (it names the mock), so it is
+    # set afterwards — production code logs it, and a Mock there would be a bug.
+    mock = mocker.AsyncMock(id="integration_id", base_url="https://gundi-test.com", additional=True)
+    mock.configure_mock(name="Alerts via Skylight")
+    return mock
 
 @pytest.fixture
 def auth(mocker):
@@ -152,7 +157,17 @@ class _PullCfg:
 def _page(items, total, page_size=2, page_num=1, snapshot_id="snap-1"):
     # v2 records use camelCase; get_skylight_events reshapes them to the v1
     # layout (event_id, ...) so downstream assertions use v1 keys.
-    records = None if items is None else [{"eventId": i["event_id"]} for i in items]
+    #
+    # Every record carries an updatedAt, as the real API's do, and the stamps rise
+    # across pages: paging is by update cursor, so a page of records without one
+    # would stop the scan. An item may set its own via "updated_at".
+    records = None if items is None else [
+        {
+            "eventId": i["event_id"],
+            "updatedAt": i.get("updated_at", f"2026-09-{page_num:02d}T00:00:{index:02d}Z"),
+        }
+        for index, i in enumerate(items)
+    ]
     return {"searchEventsV2": {"records": records, "meta": {"total": total, "snapshotId": snapshot_id}}}
 
 
@@ -168,9 +183,15 @@ def patch_skylight_clients(mocker, state_manager):
         "app.actions.client.map_event_type",
         return_value=mocker.MagicMock(skylight_event_type="fishing_activity_history"),
     )
-    # No AOI list by default: an unusable list means the pull runs unfiltered, so
-    # tests here drive paging alone. The validation tests patch this explicitly.
-    search_aois_mock = mocker.patch("app.actions.client.search_aois", return_value=[])
+    # A healthy account that can see the configured AOIs by default, so the paging
+    # tests here drive paging alone. Validation is fail-closed (an unusable list
+    # queries nothing), so the validation tests patch this explicitly.
+    search_aois_mock = mocker.patch(
+        "app.actions.client.search_aois", return_value=[{"id": "aoi1"}, {"id": "aoi2"}]
+    )
+    # The activity logger publishes to PubSub and retries on failure; unpatched it
+    # stalls any test whose path logs activity. Tests that assert on it re-patch.
+    mocker.patch("app.actions.client.log_action_activity", return_value=None)
     return {
         "state_manager": state_manager,
         "build_client": build_client,
@@ -179,8 +200,10 @@ def patch_skylight_clients(mocker, state_manager):
 
 
 @pytest.mark.asyncio
-async def test_get_skylight_events_stops_at_last_page_via_meta(mocker, integration, auth, patch_skylight_clients):
-    # total=3, pageSize=2 -> 2 pages. Loop must stop after page 2 (no empty 3rd request).
+async def test_get_skylight_events_stops_when_a_page_is_short(mocker, integration, auth, patch_skylight_clients):
+    # total=3, pageSize=2. Page 2 comes back with one record, which is fewer than
+    # was asked for and therefore the end of the result set: stop without asking
+    # for an empty third page.
     exec_mock = mocker.patch(
         "app.actions.client.execute_gql_query",
         side_effect=[
@@ -265,13 +288,14 @@ async def test_get_skylight_events_resets_none_counter_after_success(mocker, int
             _page([{"event_id": "e3"}, {"event_id": "e4"}], total=6, page_num=2),  # page 2: ok
             _page(None, total=6, page_num=3),                                  # page 3: None -> retry (counter was reset)
             _page([{"event_id": "e5"}, {"event_id": "e6"}], total=6, page_num=3),  # page 3 retry: ok
+            _page([], total=6, page_num=4),                                    # page 4: end of the results
         ],
     )
 
     events, _ = await get_skylight_events(integration, _PullCfg(), auth)
 
     # If the counter weren't reset, the page-3 None would have aborted the AOI.
-    assert exec_mock.call_count == 5
+    assert exec_mock.call_count == 6
     assert [e["event_id"] for e in events["aoi1"]] == ["e1", "e2", "e3", "e4", "e5", "e6"]
 
 
@@ -326,14 +350,16 @@ async def test_get_skylight_events_handles_null_meta(mocker, integration, auth, 
 
 
 @pytest.mark.asyncio
-async def test_get_skylight_events_sends_v2_paging_params_and_snapshot(mocker, integration, auth, patch_skylight_clients):
-    # total=3, pageSize=2 -> 2 pages. Page 1 has no snapshotId yet; page 2 must
-    # echo the snapshotId from page 1 and advance the offset by pageSize.
+async def test_get_skylight_events_sends_v2_paging_params_and_cursor(mocker, integration, auth, patch_skylight_clients):
+    # Paging is by update cursor: the offset stays at 0 and page 2 asks for
+    # everything updated at or after the newest stamp page 1 returned. A
+    # snapshotId, if Skylight ever sends one, is echoed back.
     exec_mock = mocker.patch(
         "app.actions.client.execute_gql_query",
         side_effect=[
-            _page([{"event_id": "e1"}, {"event_id": "e2"}], total=3, snapshot_id="snap-abc"),
-            _page([{"event_id": "e3"}], total=3, snapshot_id="snap-abc"),
+            _page([{"event_id": "e1"}, {"event_id": "e2", "updated_at": "2026-09-01T00:00:09Z"}],
+                  total=3, snapshot_id="snap-abc"),
+            _page([{"event_id": "e3"}], total=3, page_num=2, snapshot_id="snap-abc"),
         ],
     )
 
@@ -343,51 +369,13 @@ async def test_get_skylight_events_sends_v2_paging_params_and_snapshot(mocker, i
     assert first["eventTypes"] == ["fishing_activity_history"]
     assert first["aoiId"] == "aoi1"
     assert first["limit"] == 2 and first["offset"] == 0 and first["snapshotId"] is None
-    assert second["limit"] == 2 and second["offset"] == 2 and second["snapshotId"] == "snap-abc"
+    assert first["updated"] is None   # first run: no cursor yet
+    # The second page resumes from the newest stamp on the first, and never by offset.
+    assert second["offset"] == 0
+    assert second["updated"] == {"gte": "2026-09-01T00:00:09Z"}
+    assert second["limit"] == 2 and second["snapshotId"] == "snap-abc"
     for params in (first, second):
         assert "pageSize" not in params and "pageNum" not in params
-        assert params["updated"] is None   # first run: no cursor yet
-
-
-@pytest.mark.asyncio
-async def test_get_skylight_events_uses_updated_since_cursor(mocker, integration, auth, patch_skylight_clients):
-    patch_skylight_clients["state_manager"].get_state.return_value = {"updated_since": "2026-09-08T10:00:00+00:00"}
-    exec_mock = mocker.patch("app.actions.client.execute_gql_query", side_effect=[_page([{"event_id": "e1"}], total=1)])
-
-    await get_skylight_events(integration, _PullCfg(), auth)
-
-    params = exec_mock.call_args.args[2]
-    assert params["updated"] == {"gte": "2026-09-08T10:00:00+00:00"}
-    # The start-time window is still applied as the outer bound (never the cursor).
-    assert params["startTime"] < "2026-09-08T10:00:00+00:00" or params["startTime"] > "2026-09-08"
-
-
-@pytest.mark.asyncio
-async def test_get_skylight_events_migrates_legacy_start_time_cursor(mocker, integration, auth, patch_skylight_clients):
-    # State written by the previous version only has start_time; use it as the
-    # initial `updated` cursor instead of re-pulling the whole window.
-    patch_skylight_clients["state_manager"].get_state.return_value = {"start_time": "2026-09-08 09:30:00+00:00"}
-    exec_mock = mocker.patch("app.actions.client.execute_gql_query", side_effect=[_page([{"event_id": "e1"}], total=1)])
-
-    await get_skylight_events(integration, _PullCfg(), auth)
-
-    assert exec_mock.call_args.args[2]["updated"] == {"gte": "2026-09-08T09:30:00+00:00"}
-
-
-def test_query_sorts_oldest_update_first_and_filters_on_updated():
-    import app.actions.client as skylight_client
-    import inspect
-    src = inspect.getsource(skylight_client.get_skylight_events)
-    assert "updated: $updated" in src and "sortBy: updated" in src and "sortDirection: asc" in src
-
-
-def test_latest_update_cursor_picks_newest_and_ignores_missing():
-    from app.actions.client import latest_update_cursor
-    assert latest_update_cursor([]) is None
-    assert latest_update_cursor([{"event_id": "x"}]) is None
-    assert latest_update_cursor([
-        {"updated_at": "2026-09-08T10:00:00Z"}, {"updated_at": "2026-09-08T12:00:00Z"}, {"event_id": "no-stamp"},
-    ]) == "2026-09-08T12:00:00Z"
 
 
 @pytest.mark.asyncio
@@ -409,6 +397,94 @@ async def test_get_skylight_events_stops_on_empty_page_before_total(mocker, inte
     assert [e["event_id"] for e in events["aoi1"]] == ["e1", "e2"]
 
 
+def _fake_skylight(store, page_size=2, snapshot_id=None, on_page=None):
+    """A stand-in Skylight that answers each request from `store`.
+
+    `store` maps event_id -> updatedAt. Every call re-sorts by the *current*
+    updatedAt, applies the request's `updated.gte`, and returns the next
+    `limit` records — so a record whose updatedAt changes mid-run moves in the
+    ordering exactly as the real API's would. `on_page(call_number, store)` runs
+    after each response and is how a test mutates the data between pages.
+    """
+    calls = {"n": 0}
+
+    async def _serve(client, query, params, integration, auth):
+        calls["n"] += 1
+        ordered = sorted(store.items(), key=lambda kv: kv[1])
+        gte = (params.get("updated") or {}).get("gte")
+        if gte:
+            ordered = [(eid, ts) for eid, ts in ordered if ts >= gte]
+        window = ordered[params["offset"]:params["offset"] + params["limit"]]
+        records = [{"eventId": eid, "updatedAt": ts} for eid, ts in window]
+        response = {"searchEventsV2": {
+            "records": records,
+            "meta": {"total": len(store), "snapshotId": snapshot_id},
+        }}
+        if on_page:
+            on_page(calls["n"], store)
+        return response
+
+    return _serve, calls
+
+
+@pytest.mark.asyncio
+async def test_get_skylight_events_loses_no_event_when_one_is_updated_mid_run(
+        mocker, integration, auth, patch_skylight_clients
+):
+    # Skylight returns no snapshotId, so paging is not pinned. With offset paging
+    # an event updated between pages shifts the window and whatever slid into the
+    # vacated offset is never returned — and because the cursor advances past it,
+    # it is lost for good rather than retried.
+    #
+    # Order by updatedAt is A, B, C, D with a page size of 2. Page 1 returns A, B;
+    # A is then updated to the newest stamp, making the order B, C, D, A. Offset 2
+    # would return D, A and drop C entirely.
+    store = {
+        "A": "2026-09-01T00:00:00Z",
+        "B": "2026-09-02T00:00:00Z",
+        "C": "2026-09-03T00:00:00Z",
+        "D": "2026-09-04T00:00:00Z",
+    }
+
+    def bump_a_after_first_page(call_number, data):
+        if call_number == 1:
+            data["A"] = "2026-09-05T00:00:00Z"
+
+    serve, calls = _fake_skylight(store, on_page=bump_a_after_first_page)
+    mocker.patch("app.actions.client.execute_gql_query", side_effect=serve)
+
+    events, _ = await get_skylight_events(integration, _PullCfg(), auth)
+
+    collected = [e["event_id"] for e in events["aoi1"]]
+    assert sorted(collected) == ["A", "B", "C", "D"], f"lost events: {collected}"
+    # Re-reading an event across a page boundary is fine; handing it downstream
+    # twice in one run is not.
+    assert len(collected) == len(set(collected))
+
+
+@pytest.mark.asyncio
+async def test_get_skylight_events_stops_when_a_page_is_all_events_it_has_seen(
+        mocker, integration, auth, patch_skylight_clients
+):
+    # Pathological case for cursor paging: more events share one updatedAt than
+    # fit in a page, so the cursor cannot advance. Stop and say so rather than
+    # request the same page forever.
+    store = {eid: "2026-09-01T00:00:00Z" for eid in ("A", "B", "C", "D")}
+    serve, calls = _fake_skylight(store)
+    mocker.patch("app.actions.client.execute_gql_query", side_effect=serve)
+    log = mocker.patch("app.actions.client.logger")
+
+    events, _ = await get_skylight_events(integration, _PullCfg(), auth)
+
+    assert calls["n"] <= 3, "paging did not terminate"
+    assert [e["event_id"] for e in events["aoi1"]] == ["A", "B"]
+    stalls = [
+        call for call in log.error.call_args_list
+        if "same update timestamp" in str(call) and call.kwargs.get("extra", {}).get("attention_needed")
+    ]
+    assert len(stalls) == 1
+
+
 @pytest.mark.asyncio
 async def test_get_skylight_events_drains_the_backlog_when_total_hits_skylight_cap(mocker, integration, auth, patch_skylight_clients):
     # A backlog at or beyond the cap must NOT skip the AOI: skipping keeps the
@@ -420,14 +496,13 @@ async def test_get_skylight_events_drains_the_backlog_when_total_hits_skylight_c
         side_effect=[
             _page([{"event_id": "e1"}, {"event_id": "e2"}], total=10000, page_num=1),
             _page([{"event_id": "e3"}], total=10000, page_num=2),
-            _page([], total=10000, page_num=3),
         ],
     )
     log = mocker.patch("app.actions.client.logger")
 
     events, _ = await get_skylight_events(integration, _PullCfg(), auth)
 
-    assert exec_mock.call_count == 3
+    assert exec_mock.call_count == 2
     assert [e["event_id"] for e in events["aoi1"]] == ["e1", "e2", "e3"]
     cap_warnings = [
         call for call in log.warning.call_args_list
@@ -435,6 +510,34 @@ async def test_get_skylight_events_drains_the_backlog_when_total_hits_skylight_c
     ]
     assert len(cap_warnings) == 1
     assert "Skipping AOI" not in str(cap_warnings[0])
+    # The GCP warning must name the integration, not only carry it in `extra`,
+    # so the log line is actionable on its own when it is read out of context.
+    assert str(integration.id) in str(cap_warnings[0])
+    assert integration.name in str(cap_warnings[0])
+
+
+@pytest.mark.asyncio
+async def test_get_skylight_events_reports_the_cap_to_the_activity_log(mocker, integration, auth, patch_skylight_clients):
+    # Hitting the cap means events are being left behind, which the person
+    # configuring the integration has to see in the portal — a GCP log line alone
+    # is not visible to them.
+    mocker.patch(
+        "app.actions.client.execute_gql_query",
+        side_effect=[
+            _page([{"event_id": "e1"}, {"event_id": "e2"}], total=10000, page_num=1),
+            _page([], total=10000, page_num=2),
+        ],
+    )
+    activity = mocker.patch("app.actions.client.log_action_activity", return_value=None)
+
+    await get_skylight_events(integration, _PullCfg(), auth)
+
+    activity.assert_called_once()
+    assert activity.call_args.kwargs["integration_id"] == integration.id
+    assert activity.call_args.kwargs["action_id"] == "pull_events"
+    assert activity.call_args.kwargs["level"] == LogLevel.WARNING
+    assert "10000" in str(activity.call_args.kwargs["data"])
+    assert activity.call_args.kwargs["data"]["aoi"] == "aoi1"
 
 
 @pytest.mark.asyncio
@@ -471,18 +574,36 @@ async def test_get_skylight_events_queries_normally_when_the_aoi_is_known(mocker
 
 
 @pytest.mark.asyncio
-async def test_get_skylight_events_continues_when_aoi_listing_fails(mocker, integration, auth, patch_skylight_clients):
-    # The validation call is a guard, not a gate: if it fails the pull still runs.
+async def test_get_skylight_events_defers_every_aoi_when_the_listing_fails(mocker, integration, auth, patch_skylight_clients):
+    # Validation is a gate, not a guard. Skylight ignores an unknown aoiId and
+    # answers with worldwide events, so an id that could not be checked must not
+    # be queried: a lookup failure defers the whole pull to the next run.
     patch_skylight_clients["search_aois"].side_effect = Exception("boom")
-    exec_mock = mocker.patch(
-        "app.actions.client.execute_gql_query",
-        side_effect=[_page([{"event_id": "e1"}], total=1)],
-    )
+    exec_mock = mocker.patch("app.actions.client.execute_gql_query")
+    log = mocker.patch("app.actions.client.logger")
 
     events, _ = await get_skylight_events(integration, _PullCfg(), auth)
 
-    assert exec_mock.call_count == 1
-    assert [e["event_id"] for e in events["aoi1"]] == ["e1"]
+    assert not exec_mock.called
+    assert events == {}
+    errors = [
+        call for call in log.error.call_args_list
+        if "could not be validated" in str(call) and call.kwargs.get("extra", {}).get("attention_needed")
+    ]
+    assert len(errors) == 1
+
+
+@pytest.mark.asyncio
+async def test_get_skylight_events_defers_every_aoi_when_the_listing_is_empty(mocker, integration, auth, patch_skylight_clients):
+    # An account that lists no AOIs does not authorize the configured ids either:
+    # an empty listing is an unusable answer, not permission to query anything.
+    patch_skylight_clients["search_aois"].return_value = []
+    exec_mock = mocker.patch("app.actions.client.execute_gql_query")
+
+    events, _ = await get_skylight_events(integration, _PullCfg(), auth)
+
+    assert not exec_mock.called
+    assert events == {}
 
 
 @pytest.mark.asyncio
@@ -499,22 +620,27 @@ async def test_get_skylight_events_no_cap_warning_below_cap(mocker, integration,
 
 
 @pytest.mark.asyncio
-async def test_get_skylight_events_clamps_last_page_to_result_cap(mocker, integration, auth, patch_skylight_clients):
-    # Skylight rejects offset + limit > 10000. A total just under the cap (so the
-    # skip-the-AOI guardrail does not fire) with page size 3000 still spans four
-    # pages, and the last must ask for limit 1000 at offset 9000, not 3000.
+async def test_get_skylight_events_asks_only_for_what_is_left_of_the_result_cap(mocker, integration, auth, patch_skylight_clients):
+    # Skylight returns at most 10,000 events for one query. With cursor paging the
+    # offset is always 0, so the cap is enforced on what the run already holds:
+    # three full 3,000-event pages leave room for 1,000, and the run stops there.
     class _BigPageCfg(_PullCfg):
         pageSize = 3000
 
-    def page(n):
-        return _page([{"event_id": f"e{n}"}], total=9999)
-    exec_mock = mocker.patch("app.actions.client.execute_gql_query", side_effect=[page(1), page(2), page(3), page(4)])
+    def full_page(page_num, size):
+        items = [{"event_id": f"p{page_num}e{n}"} for n in range(size)]
+        return _page(items, total=9999, page_num=page_num)
 
-    await get_skylight_events(integration, _BigPageCfg(), auth)
+    exec_mock = mocker.patch(
+        "app.actions.client.execute_gql_query",
+        side_effect=[full_page(1, 3000), full_page(2, 3000), full_page(3, 3000), full_page(4, 1000)],
+    )
+
+    events, _ = await get_skylight_events(integration, _BigPageCfg(), auth)
 
     requests = [(c.args[2]["offset"], c.args[2]["limit"]) for c in exec_mock.call_args_list]
-    assert requests == [(0, 3000), (3000, 3000), (6000, 3000), (9000, 1000)]
-    assert all(offset + limit <= 10000 for offset, limit in requests)
+    assert requests == [(0, 3000), (0, 3000), (0, 3000), (0, 1000)]
+    assert len(events["aoi1"]) == 10000
 
 
 # --- normalize_v2_event (v2 record -> v1 layout) ---
@@ -1556,10 +1682,10 @@ def test_pull_events_config_rejects_a_zero_page_size():
 
 
 @pytest.mark.asyncio
-async def test_get_skylight_events_warns_when_paging_is_not_pinned(mocker, integration, auth, patch_skylight_clients):
-    # No snapshotId means the pages aren't pinned to a snapshot; a concurrent
-    # update can shift the window and the event at that offset is never returned,
-    # with an updatedAt already below the saved cursor. Paging still continues.
+async def test_get_skylight_events_pages_normally_without_a_snapshot(mocker, integration, auth, patch_skylight_clients):
+    # Skylight returns no snapshotId in practice. That used to be a hazard because
+    # paging was by offset; paging by update cursor does not depend on a pinned
+    # snapshot, so it is no longer worth an operator's attention.
     exec_mock = mocker.patch(
         "app.actions.client.execute_gql_query",
         side_effect=[
@@ -1573,11 +1699,10 @@ async def test_get_skylight_events_warns_when_paging_is_not_pinned(mocker, integ
 
     assert exec_mock.call_count == 2
     assert [e["event_id"] for e in events["aoi1"]] == ["e1", "e2", "e3"]
-    warnings = [
+    assert not [
         call for call in log.warning.call_args_list
-        if "no snapshotId" in str(call) and call.kwargs.get("extra", {}).get("attention_needed")
+        if "snapshotId" in str(call)
     ]
-    assert len(warnings) == 1
 
 
 @pytest.mark.asyncio
@@ -1910,6 +2035,30 @@ async def test_action_process_events_per_aoi_leaves_the_chunk_unmarked_when_gund
     process_events_config.chunk_id = "run-0-0"
     mocker.patch("app.actions.handlers.transform", side_effect=lambda c, e: {"event_id": e["event_id"]})
     mocker.patch("app.actions.handlers.gundi_tools.send_events_to_gundi", return_value=[])
+    mocker.patch("app.actions.handlers.save_events_state", return_value=None)
+    set_state = mocker.patch("app.actions.handlers.state_manager.set_state", return_value=None)
+
+    result = await action_process_events_per_aoi(integration, process_events_config)
+
+    assert result["details"]["chunk_delivered"] is False
+    assert not set_state.called
+
+
+@pytest.mark.asyncio
+async def test_action_process_events_per_aoi_leaves_the_chunk_unmarked_on_a_partial_response(
+        mocker, integration, process_events_config, mock_publish_event
+):
+    # Gundi answered a two-event batch with one object. The other event's
+    # delivery is unconfirmed, so the chunk must not be marked: if it were, the
+    # next run's cursor would move past an event that may never have arrived.
+    mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
+    process_events_config.chunk_id = "run-0-0"
+    mocker.patch("app.actions.handlers.transform", side_effect=lambda c, e: {"event_id": e["event_id"]})
+    mocker.patch(
+        "app.actions.handlers.gundi_tools.send_events_to_gundi",
+        return_value=[{"object_id": "o1"}],
+    )
+    mocker.patch("app.actions.handlers.process_attachments", return_value=None)
     mocker.patch("app.actions.handlers.save_events_state", return_value=None)
     set_state = mocker.patch("app.actions.handlers.state_manager.set_state", return_value=None)
 

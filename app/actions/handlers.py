@@ -653,10 +653,14 @@ async def action_process_events_per_aoi(integration, action_config: ProcessEvent
                         # tell which event each object id belongs to. Saving a
                         # guessed mapping is worse than saving none: a wrong
                         # mapping makes a later patch overwrite another event.
+                        # The chunk is also not delivered: at least one event is
+                        # unaccounted for, so the cursor must not pass it.
+                        delivered = False
                         logger.warning(
                             f'Gundi returned {len(response)} response(s) for a batch of '
                             f'{len(batch_pairs)} event(s). Skipping the event-state mapping for '
-                            f'this batch; those events may be re-sent as new on a later run.',
+                            f'this batch and treating the chunk as undelivered; its events are '
+                            f'pulled again next run.',
                             extra={
                                 "integration_id": str(integration.id),
                                 "aoi": action_config.aoi,
