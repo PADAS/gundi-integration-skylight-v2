@@ -180,6 +180,31 @@ def normalize_v2_event(record: dict) -> dict:
     }
 
 
+def _updated_after(candidate, current) -> bool:
+    """True when `candidate` carries a strictly newer `updated_at` than `current`.
+
+    Parsed rather than compared as text: Skylight has returned both `...Z` and
+    `...+00:00`, which sort differently as strings.
+    """
+    raw_new, raw_old = candidate.get("updated_at"), current.get("updated_at")
+    if not raw_new:
+        return False
+    if not raw_old:
+        return True
+    # dateparser returns None rather than raising on an unparseable value.
+    parsed_new, parsed_old = dp(raw_new), dp(raw_old)
+    if parsed_new is None:
+        return False
+    if parsed_old is None:
+        return True
+    if (parsed_new.tzinfo is None) != (parsed_old.tzinfo is None):
+        # One side lacked an offset; treat a naive stamp as UTC so the two are
+        # comparable at all.
+        parsed_new = parsed_new.replace(tzinfo=parsed_new.tzinfo or timezone.utc)
+        parsed_old = parsed_old.replace(tzinfo=parsed_old.tzinfo or timezone.utc)
+    return parsed_new > parsed_old
+
+
 def latest_update_cursor(events) -> Optional[str]:
     """The newest `updated_at` among normalized events, or None.
 
@@ -769,7 +794,10 @@ async def get_skylight_events(integration, config_data, auth):
             # Events at the boundary stamp come back on the page after their own
             # (the filter is `>=`, inclusive), so pages overlap by design and
             # repeats are dropped here rather than handed downstream twice.
-            seen_event_ids = set()
+            # Position in response_list of each event id already collected, so a
+            # newer copy arriving on a later page replaces the older one in place
+            # rather than being dropped (see the replacement branch below).
+            seen_event_positions = {}
             page_cursor = updated_since
 
             while True:
@@ -957,12 +985,24 @@ async def get_skylight_events(integration, config_data, auth):
                     break
 
                 page_events = [normalize_v2_event(record) for record in events_response]
-                new_events = [
-                    event for event in page_events
-                    if event.get("event_id") not in seen_event_ids
-                ]
-                seen_event_ids.update(event.get("event_id") for event in page_events)
-                response_list.extend(new_events)
+                new_events = []
+                for event in page_events:
+                    event_id = event.get("event_id")
+                    position = seen_event_positions.get(event_id) if event_id else None
+                    if position is None:
+                        if event_id:
+                            seen_event_positions[event_id] = len(response_list)
+                        response_list.append(event)
+                        new_events.append(event)
+                    elif _updated_after(event, response_list[position]):
+                        # Same event, updated between the page that first returned
+                        # it and this one. Keep the newer copy: the page cursor
+                        # advances over repeats (below), so the saved cursor ends
+                        # up past this new stamp and the update would otherwise
+                        # never be fetched again. Not counted as new — the page
+                        # still yielded no unseen event, which is what the stall
+                        # guard below is measuring.
+                        response_list[position] = event
                 pages_fetched += 1
                 page_num += 1
 

@@ -598,6 +598,32 @@ async def action_process_events_per_aoi(integration, action_config: ProcessEvent
     state_responses = []
     state_events = []
 
+    # An event that already carries a saved Gundi mapping was delivered by an
+    # earlier sub-action. pull_events makes this same check when it splits the
+    # work, but a chunk can be re-issued while the original is still in flight —
+    # a missing completion marker does not prove the original died — and the
+    # original may well finish first. Re-checking here stops the replacement
+    # creating a second EarthRanger event. Skipping is the right outcome: the
+    # replacement carries the same Skylight event the original already created.
+    # This does not close a true dead heat (both chunks in flight, neither has
+    # written its mappings yet); that needs a create claim and is deliberately
+    # left out of this change.
+    events_to_send = []
+    already_delivered = 0
+    for event in action_config.events:
+        if await state_manager.get_state(
+            str(integration.id), "pull_events", get_clean_event_id(event)
+        ):
+            already_delivered += 1
+        else:
+            events_to_send.append(event)
+    if already_delivered:
+        logger.info(
+            f'Skipping {already_delivered} of {len(action_config.events)} event(s) already '
+            f'delivered by an earlier sub-action. AOI: {action_config.aoi}.',
+            extra={"integration_id": str(integration.id), "aoi": action_config.aoi}
+        )
+
     # Filter out falsy results: transform() returns {} for events it skips
     # (e.g. an entry alert with no start point). An empty dict is truthy inside
     # a list, so it must be filtered here or it would leak into the Gundi batch.
@@ -606,7 +632,7 @@ async def action_process_events_per_aoi(integration, action_config: ProcessEvent
     transformed_pairs = sorted(
         [
             (transformed, event)
-            for event in action_config.events
+            for event in events_to_send
             if (transformed := transform(action_config.updated_config_data, event))
         ],
         key=lambda pair: pair[0].get("recorded_at") or datetime.datetime.min, reverse=True
@@ -689,9 +715,10 @@ async def action_process_events_per_aoi(integration, action_config: ProcessEvent
         result["details"]["chunk_delivered"] = delivered
         return result
 
-    # Nothing survived transform() (unsupported types, entry alerts with no
-    # start point). There is nothing left to deliver, so the chunk is complete
-    # and must not hold the cursor back.
+    # Nothing left to send: either nothing survived transform() (unsupported
+    # types, entry alerts with no start point) or every event was already
+    # delivered by an earlier sub-action. Either way the chunk is complete and
+    # must not hold the cursor back.
     await mark_chunk_delivered(integration, action_config)
     result["details"]["chunk_delivered"] = True
     return result

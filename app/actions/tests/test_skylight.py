@@ -1012,6 +1012,7 @@ async def test_action_process_events_per_aoi_filters_empty_transforms(mocker, in
 
 @pytest.mark.asyncio
 async def test_action_process_events_per_aoi_failure(mocker, integration, process_events_config, mock_publish_event):
+    mocker.patch("app.actions.handlers.state_manager.get_state", return_value=None)
     mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
     mocker.patch("app.services.action_runner.publish_event", mock_publish_event)
     mocker.patch("app.services.action_scheduler.publish_event", mock_publish_event)
@@ -2016,6 +2017,7 @@ async def test_action_pull_events_settles_the_previous_run_before_fetching(
 async def test_action_process_events_per_aoi_marks_its_chunk_delivered(
         mocker, integration, process_events_config, mock_publish_event
 ):
+    mocker.patch("app.actions.handlers.state_manager.get_state", return_value=None)
     mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
     process_events_config.chunk_id = "run-0-0"
     mocker.patch("app.actions.handlers.transform", side_effect=lambda c, e: {"event_id": e["event_id"]})
@@ -2042,6 +2044,7 @@ async def test_action_process_events_per_aoi_marks_a_chunk_that_transformed_to_n
     # Every event was skipped by transform (unsupported type, entry alert with
     # no start point). There is nothing left to deliver, so the chunk must not
     # hold the AOI cursor back forever.
+    mocker.patch("app.actions.handlers.state_manager.get_state", return_value=None)
     mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
     process_events_config.chunk_id = "run-0-0"
     mocker.patch("app.actions.handlers.transform", return_value={})
@@ -2061,6 +2064,7 @@ async def test_action_process_events_per_aoi_leaves_the_chunk_unmarked_when_gund
 ):
     # An empty response means those events are not in EarthRanger. Without a
     # marker the cursor stops short of this chunk and the next run re-pulls it.
+    mocker.patch("app.actions.handlers.state_manager.get_state", return_value=None)
     mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
     process_events_config.chunk_id = "run-0-0"
     mocker.patch("app.actions.handlers.transform", side_effect=lambda c, e: {"event_id": e["event_id"]})
@@ -2081,6 +2085,7 @@ async def test_action_process_events_per_aoi_leaves_the_chunk_unmarked_on_a_part
     # Gundi answered a two-event batch with one object. The other event's
     # delivery is unconfirmed, so the chunk must not be marked: if it were, the
     # next run's cursor would move past an event that may never have arrived.
+    mocker.patch("app.actions.handlers.state_manager.get_state", return_value=None)
     mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
     process_events_config.chunk_id = "run-0-0"
     mocker.patch("app.actions.handlers.transform", side_effect=lambda c, e: {"event_id": e["event_id"]})
@@ -2102,6 +2107,7 @@ async def test_action_process_events_per_aoi_leaves_the_chunk_unmarked_on_a_part
 async def test_action_process_events_per_aoi_leaves_the_chunk_unmarked_when_it_raises(
         mocker, integration, process_events_config, mock_publish_event
 ):
+    mocker.patch("app.actions.handlers.state_manager.get_state", return_value=None)
     mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
     mocker.patch("app.services.action_runner.publish_event", mock_publish_event)
     mocker.patch("app.services.action_scheduler.publish_event", mock_publish_event)
@@ -2122,6 +2128,7 @@ async def test_process_events_per_aoi_without_a_chunk_id_writes_no_marker(
 ):
     # A command queued by an older revision carries no chunk_id. It must still
     # run; it simply has no plan entry to report against.
+    mocker.patch("app.actions.handlers.state_manager.get_state", return_value=None)
     mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
     assert process_events_config.chunk_id is None
     mocker.patch("app.actions.handlers.transform", side_effect=lambda c, e: {"event_id": e["event_id"]})
@@ -2395,3 +2402,92 @@ async def test_get_skylight_events_leaves_a_window_within_retention_alone(
     requested = dp(exec_mock.call_args.args[2]["startTime"])
     expected = datetime.datetime.now(tz=datetime.timezone.utc) - datetime.timedelta(days=30)
     assert abs((requested - expected).total_seconds()) < 86400
+
+
+class _PullCfgPage3(_PullCfg):
+    pageSize = 3
+
+
+@pytest.mark.asyncio
+async def test_get_skylight_events_keeps_the_newest_copy_of_a_repeated_event(
+        mocker, integration, auth, patch_skylight_clients
+):
+    # An event updated mid-pull comes back a second time with a newer stamp.
+    # Keeping only the first copy hands EarthRanger the stale version, and the
+    # saved cursor still advances past the newer stamp, so the update is never
+    # fetched again. The newer copy must win.
+    #
+    # Page size 3 over A@1, B@2, C@3, D@4, E@6: page 1 is A, B, C; A is then
+    # bumped to @5, so the order becomes B, C, D, A, E and page 2 returns A@5, E.
+    store = {
+        "A": "2026-09-01T00:00:00Z",
+        "B": "2026-09-02T00:00:00Z",
+        "C": "2026-09-03T00:00:00Z",
+        "D": "2026-09-04T00:00:00Z",
+        "E": "2026-09-06T00:00:00Z",
+    }
+
+    def bump_a_after_first_page(call_number, data):
+        if call_number == 1:
+            data["A"] = "2026-09-05T00:00:00Z"
+
+    serve, _ = _fake_skylight(store, page_size=3, on_page=bump_a_after_first_page)
+    mocker.patch("app.actions.client.execute_gql_query", side_effect=serve)
+
+    events, _ = await get_skylight_events(integration, _PullCfgPage3(), auth)
+
+    collected = {e["event_id"]: e["updated_at"] for e in events["aoi1"]}
+    assert len(events["aoi1"]) == len(collected), "an event was handed downstream twice"
+    assert sorted(collected) == ["A", "B", "C", "D", "E"]
+    assert collected["A"] == "2026-09-05T00:00:00Z", "kept the stale copy of A"
+
+
+@pytest.mark.asyncio
+async def test_process_events_per_aoi_skips_events_an_earlier_chunk_already_delivered(
+        mocker, integration, process_events_config, mock_publish_event
+):
+    # A chunk can be re-issued while the original is still in flight, and the
+    # original may finish first. Without this check the replacement would create
+    # a second EarthRanger event for the same Skylight event.
+    mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
+    process_events_config.chunk_id = "run-1-0"
+    mocker.patch(
+        "app.actions.handlers.state_manager.get_state",
+        side_effect=lambda *args, **kwargs: (
+            {"object_id": "already-there"} if args[2] == "event1" else None
+        ),
+    )
+    mocker.patch("app.actions.handlers.state_manager.set_state", return_value=None)
+    mocker.patch("app.actions.handlers.transform", side_effect=lambda c, e: {"event_id": e["event_id"]})
+    send_mock = mocker.patch(
+        "app.actions.handlers.gundi_tools.send_events_to_gundi", return_value=[{"object_id": "o2"}]
+    )
+    mocker.patch("app.actions.handlers.process_attachments", return_value=None)
+    mocker.patch("app.actions.handlers.save_events_state", return_value=None)
+
+    result = await action_process_events_per_aoi(integration, process_events_config)
+
+    assert [e["event_id"] for e in send_mock.call_args.kwargs["events"]] == ["event2"]
+    assert result["details"]["chunk_delivered"] is True
+
+
+@pytest.mark.asyncio
+async def test_process_events_per_aoi_sends_nothing_when_every_event_was_delivered(
+        mocker, integration, process_events_config, mock_publish_event
+):
+    # The whole chunk is a replacement for work already done: send nothing, and
+    # still mark it delivered so it cannot hold the cursor back forever.
+    mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
+    process_events_config.chunk_id = "run-1-0"
+    mocker.patch(
+        "app.actions.handlers.state_manager.get_state", return_value={"object_id": "already-there"}
+    )
+    set_state = mocker.patch("app.actions.handlers.state_manager.set_state", return_value=None)
+    mocker.patch("app.actions.handlers.transform", side_effect=lambda c, e: {"event_id": e["event_id"]})
+    send_mock = mocker.patch("app.actions.handlers.gundi_tools.send_events_to_gundi", return_value=[])
+
+    result = await action_process_events_per_aoi(integration, process_events_config)
+
+    assert not send_mock.called
+    assert result["details"]["chunk_delivered"] is True
+    assert set_state.call_args.args[3] == "_chunk.run-1-0"
