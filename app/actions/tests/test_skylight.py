@@ -486,11 +486,12 @@ async def test_get_skylight_events_stops_when_a_page_is_all_events_it_has_seen(
 
 
 @pytest.mark.asyncio
-async def test_get_skylight_events_drains_the_backlog_when_total_hits_skylight_cap(mocker, integration, auth, patch_skylight_clients):
-    # A backlog at or beyond the cap must NOT skip the AOI: skipping keeps the
-    # cursor where it is, so the identical query hits the cap again every run and
-    # the AOI never delivers anything. Results are oldest-update-first, so the run
-    # keeps this page and the cursor lets the next run continue.
+async def test_get_skylight_events_drops_the_aoi_whole_when_total_hits_skylight_cap(mocker, integration, auth, patch_skylight_clients):
+    # An AOI matching the whole result cap is a misconfiguration, not a backlog:
+    # sending 10,000 events would flood EarthRanger's map. The AOI is dropped
+    # entirely — no events, no further pages — and because it never reaches
+    # `events` no chunk plan is written for it, so its cursor stays put and the
+    # same error repeats every run until a person narrows the configuration.
     exec_mock = mocker.patch(
         "app.actions.client.execute_gql_query",
         side_effect=[
@@ -502,25 +503,47 @@ async def test_get_skylight_events_drains_the_backlog_when_total_hits_skylight_c
 
     events, _ = await get_skylight_events(integration, _PullCfg(), auth)
 
-    assert exec_mock.call_count == 2
-    assert [e["event_id"] for e in events["aoi1"]] == ["e1", "e2", "e3"]
-    cap_warnings = [
-        call for call in log.warning.call_args_list
-        if "backlog" in str(call) and call.kwargs.get("extra", {}).get("attention_needed")
+    # Stopped on the first page: no second query, and nothing kept from the first.
+    assert exec_mock.call_count == 1
+    assert "aoi1" not in events
+    cap_errors = [
+        call for call in log.error.call_args_list
+        if "skipped to avoid sending" in str(call) and call.kwargs.get("extra", {}).get("attention_needed")
     ]
-    assert len(cap_warnings) == 1
-    assert "Skipping AOI" not in str(cap_warnings[0])
-    # The GCP warning must name the integration, not only carry it in `extra`,
-    # so the log line is actionable on its own when it is read out of context.
-    assert str(integration.id) in str(cap_warnings[0])
-    assert integration.name in str(cap_warnings[0])
+    assert len(cap_errors) == 1
+    assert "AOI aoi1 skipped to avoid sending 10000 events to EarthRanger" in str(cap_errors[0])
+    assert "Check the configuration in Gundi" in str(cap_errors[0])
+    # The GCP line must name the integration, not only carry it in `extra`, so it
+    # is actionable on its own when it is read out of context.
+    assert str(integration.id) in str(cap_errors[0])
+    assert integration.name in str(cap_errors[0])
+
+
+@pytest.mark.asyncio
+async def test_get_skylight_events_drops_the_aoi_when_the_cap_is_reached_without_a_total(mocker, integration, auth, patch_skylight_clients):
+    # Same rule when Skylight reports no usable total: once the run holds the
+    # full result cap the AOI is dropped rather than sent.
+    mocker.patch("app.actions.client.SKYLIGHT_RESULT_CAP", 4)
+    mocker.patch(
+        "app.actions.client.execute_gql_query",
+        side_effect=[
+            _page([{"event_id": "e1"}, {"event_id": "e2"}], total=0, page_num=1),
+            _page([{"event_id": "e3"}, {"event_id": "e4"}], total=0, page_num=2),
+            _page([{"event_id": "e5"}], total=0, page_num=3),
+        ],
+    )
+    log = mocker.patch("app.actions.client.logger")
+
+    events, _ = await get_skylight_events(integration, _PullCfg(), auth)
+
+    assert "aoi1" not in events
+    assert any("skipped to avoid sending 4 events to EarthRanger" in str(call) for call in log.error.call_args_list)
 
 
 @pytest.mark.asyncio
 async def test_get_skylight_events_reports_the_cap_to_the_activity_log(mocker, integration, auth, patch_skylight_clients):
-    # Hitting the cap means events are being left behind, which the person
-    # configuring the integration has to see in the portal — a GCP log line alone
-    # is not visible to them.
+    # The AOI is delivering nothing until it is reconfigured, and the person who
+    # can reconfigure it reads the portal, not GCP.
     mocker.patch(
         "app.actions.client.execute_gql_query",
         side_effect=[
@@ -535,8 +558,12 @@ async def test_get_skylight_events_reports_the_cap_to_the_activity_log(mocker, i
     activity.assert_called_once()
     assert activity.call_args.kwargs["integration_id"] == integration.id
     assert activity.call_args.kwargs["action_id"] == "pull_events"
-    assert activity.call_args.kwargs["level"] == LogLevel.WARNING
-    assert "10000" in str(activity.call_args.kwargs["data"])
+    assert activity.call_args.kwargs["level"] == LogLevel.ERROR
+    assert activity.call_args.kwargs["title"] == (
+        "AOI aoi1 skipped to avoid sending 10000 events to EarthRanger. "
+        "Check the configuration in Gundi."
+    )
+    assert activity.call_args.kwargs["data"]["events_matched"] == 10000
     assert activity.call_args.kwargs["data"]["aoi"] == "aoi1"
 
 
@@ -640,7 +667,10 @@ async def test_get_skylight_events_asks_only_for_what_is_left_of_the_result_cap(
 
     requests = [(c.args[2]["offset"], c.args[2]["limit"]) for c in exec_mock.call_args_list]
     assert requests == [(0, 3000), (0, 3000), (0, 3000), (0, 1000)]
-    assert len(events["aoi1"]) == 10000
+    # Asking for the last 1,000 is the point of the clamp — Skylight rejects
+    # `offset + limit > 10,000`. What the run then does with a full cap's worth
+    # of events is the rule in the cap tests above: the AOI is dropped, not sent.
+    assert "aoi1" not in events
 
 
 # --- normalize_v2_event (v2 record -> v1 layout) ---

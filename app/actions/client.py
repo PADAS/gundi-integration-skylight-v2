@@ -676,10 +676,12 @@ async def get_skylight_events(integration, config_data, auth):
     #
     # This is a gate, not a guard: an id that could not be validated is deferred,
     # not queried. A failed or empty listing is an unusable answer rather than
-    # permission, and the result cap is no backstop — worldwide results are
-    # accepted as a backlog to drain. Deferring costs one run, which the next run
-    # recovers; querying an unvalidated id can flood the destination with
-    # worldwide events and cannot be undone.
+    # permission. Deferring costs one run, which the next run recovers; querying
+    # an unvalidated id can flood the destination with worldwide events and
+    # cannot be undone. The result-cap rule below is a second line of defence
+    # rather than the first — it drops an AOI that answers with 10,000 events —
+    # but it only catches a bad id that happens to be that busy, so the gate
+    # still has to hold on its own.
     try:
         known_aoi_ids = {record.get("id") for record in await search_aois(integration, auth)}
     except Exception as e:
@@ -748,6 +750,9 @@ async def get_skylight_events(integration, config_data, auth):
             pages_fetched = 0
             reported_total = None
             page_num = 1
+            # Set when the AOI matches Skylight's whole result cap, which drops
+            # the AOI for this run (see the cap branch below).
+            aoi_capped = False
             # v2 *should* pin paging to a snapshot so results don't shift between
             # pages, but Skylight returns no snapshotId in practice. Paging is
             # therefore by cursor, not by offset: each page asks for events
@@ -772,6 +777,43 @@ async def get_skylight_events(integration, config_data, auth):
                 # return for one query.
                 limit = min(page_size, SKYLIGHT_RESULT_CAP - len(response_list))
                 if limit <= 0:
+                    # Same rule as the meta.total branch below, for the case
+                    # where Skylight gives no usable total: this AOI has handed
+                    # back the entire result cap, which is a configuration
+                    # problem rather than a backlog. Drop it whole rather than
+                    # sending 10,000 events into EarthRanger.
+                    cap_message = (
+                        f'AOI {aoi} skipped to avoid sending {len(response_list)} events to '
+                        f'EarthRanger. Check the configuration in Gundi.'
+                    )
+                    # The integration is named in the message itself, not only in
+                    # `extra`: this line gets read in GCP on its own, away from
+                    # its structured fields, and "some AOI was skipped" is not
+                    # actionable without knowing whose.
+                    logger.error(
+                        f'Integration "{integration.name}" ({str(integration.id)}): {cap_message}',
+                        extra={
+                            "integration_id": str(integration.id),
+                            "aoi": aoi,
+                            "attention_needed": True,
+                        }
+                    )
+                    await log_action_activity(
+                        integration_id=integration.id,
+                        action_id="pull_events",
+                        level=LogLevel.ERROR,
+                        title=cap_message,
+                        data={
+                            "message": cap_message,
+                            "aoi": aoi,
+                            "integration_name": integration.name,
+                            "events_matched": len(response_list),
+                            "result_cap": SKYLIGHT_RESULT_CAP,
+                            "start_time": start_time,
+                            "updated_since": updated_since,
+                        }
+                    )
+                    aoi_capped = True
                     break
                 params = {
                     "eventTypes": event_types,
@@ -858,29 +900,29 @@ async def get_skylight_events(integration, config_data, auth):
                     total = meta.get('total') or 0
                     reported_total = total
                     if total >= SKYLIGHT_RESULT_CAP:
-                        # The backlog is larger than Skylight will return in one
-                        # query. Results are sorted oldest-update-first, so this
-                        # run keeps the oldest SKYLIGHT_RESULT_CAP events and the
-                        # cursor saved from them lets the next run continue from
-                        # where this one stopped, draining the backlog run by run.
-                        # (Skipping the AOI instead would never advance the cursor,
-                        # so the identical query would hit the cap forever and the
-                        # AOI would never deliver anything. The unknown-AOI case
-                        # that concern was really about is caught up front by
-                        # validating the ids against searchAOIs.)
+                        # An AOI matching Skylight's entire result cap is a
+                        # configuration problem, not a backlog to work through.
+                        # Ten thousand events is far more than one AOI is meant
+                        # to deliver, and sending them would hit EarthRanger hard
+                        # and flood the map with data nobody asked for. So the
+                        # AOI is dropped whole: nothing is pulled, nothing is
+                        # sent, and the cursor is left exactly where it was.
+                        #
+                        # The same error then repeats on every run, which is the
+                        # intent — only a person can fix this (a wrong AOI id, a
+                        # window that is too wide, too many event types), and the
+                        # integration should keep saying so until they do. Once
+                        # the configuration is narrowed the events are picked up
+                        # from the unchanged cursor, so nothing is skipped.
                         cap_message = (
-                            f'AOI "{aoi}" has a backlog at or beyond Skylight\'s maximum of '
-                            f'{SKYLIGHT_RESULT_CAP} events (started since {start_time}, updated '
-                            f'since {updated_since}). Taking the oldest {SKYLIGHT_RESULT_CAP} this '
-                            f'run and continuing from the cursor on the next one. If this repeats '
-                            f'every run the configuration may be too loose (time window or event '
-                            f'types too broad).'
+                            f'AOI {aoi} skipped to avoid sending {total} events to EarthRanger. '
+                            f'Check the configuration in Gundi.'
                         )
                         # The integration is named in the message itself, not only
                         # in `extra`: this line gets read in GCP on its own, away
-                        # from its structured fields, and "some AOI is capped" is
-                        # not actionable without knowing whose.
-                        logger.warning(
+                        # from its structured fields, and "some AOI was skipped"
+                        # is not actionable without knowing whose.
+                        logger.error(
                             f'Integration "{integration.name}" ({str(integration.id)}): {cap_message}',
                             extra={
                                 "integration_id": str(integration.id),
@@ -888,27 +930,26 @@ async def get_skylight_events(integration, config_data, auth):
                                 "attention_needed": True,
                             }
                         )
-                        # Also surfaced in the portal: events are being left
-                        # behind, and the person who can fix the configuration
-                        # does not read GCP logs.
+                        # Also surfaced in the portal: this AOI is delivering
+                        # nothing at all until it is reconfigured, and the person
+                        # who can reconfigure it does not read GCP logs.
                         await log_action_activity(
                             integration_id=integration.id,
                             action_id="pull_events",
-                            level=LogLevel.WARNING,
-                            title=(
-                                f'AOI "{aoi}" hit Skylight\'s {SKYLIGHT_RESULT_CAP}-event maximum; '
-                                f'the backlog is being drained one run at a time.'
-                            ),
+                            level=LogLevel.ERROR,
+                            title=cap_message,
                             data={
                                 "message": cap_message,
                                 "aoi": aoi,
                                 "integration_name": integration.name,
-                                "reported_total": total,
+                                "events_matched": total,
                                 "result_cap": SKYLIGHT_RESULT_CAP,
                                 "start_time": start_time,
                                 "updated_since": updated_since,
                             }
                         )
+                        aoi_capped = True
+                        break
 
                 if not events_response:
                     # Nothing left (Skylight caps meta.total, so an empty page can
@@ -966,6 +1007,13 @@ async def get_skylight_events(integration, config_data, auth):
                     )
                     break
                 page_cursor = next_cursor
+
+            if aoi_capped:
+                # Dropped whole: no events for this AOI, and no entry in
+                # `events`, so no chunk plan is written for it and the next run
+                # leaves its cursor untouched.
+                continue
+
             logger.info(
                 f'Fetched {len(response_list)} events for AOI "{aoi}" in {pages_fetched} page(s). '
                 f'Skylight reported total: {reported_total}. Window start: {start_time}. '
