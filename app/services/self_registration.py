@@ -12,8 +12,13 @@ from app.actions import (
     PushActionConfiguration,
     ExecutableActionMixin,
     InternalActionConfiguration,
+    ReferenceActionConfiguration,
 )
-from app.settings import INTEGRATION_TYPE_SLUG, INTEGRATION_TYPE_NAME, INTEGRATION_SERVICE_URL
+from app.settings import (
+    INTEGRATION_TYPE_SLUG,
+    INTEGRATION_TYPE_NAME,
+    INTEGRATION_SERVICE_URL,
+)
 from .core import ActionTypeEnum
 from app.webhooks.core import get_webhook_handler, GenericJsonTransformConfig
 
@@ -51,7 +56,12 @@ async def register_integration_in_gundi(gundi_client, type_slug=None, type_name=
         action_name = getattr(func, "action_title", None) or action_id.replace("_", " ").title()
         action_schema = json.loads(config_model.schema_json())
         action_ui_schema = config_model.ui_schema()
-        if issubclass(config_model, AuthActionConfiguration):
+        if issubclass(config_model, ReferenceActionConfiguration):
+            # Registered with their own type so the platform can tell the
+            # read-only lookups apart from generic actions (and enforce the
+            # ephemeral whitelist on its side too).
+            action_type = ActionTypeEnum.REFERENCE.value
+        elif issubclass(config_model, AuthActionConfiguration):
             action_type = ActionTypeEnum.AUTHENTICATION.value
         elif issubclass(config_model, PullActionConfiguration):
             action_type = ActionTypeEnum.PULL_DATA.value

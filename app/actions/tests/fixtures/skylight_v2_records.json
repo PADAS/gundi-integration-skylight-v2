@@ -1,0 +1,395 @@
+{
+  "fishing_activity_history": {
+    "eventId": "fishing_activity_history-fixture-00",
+    "eventType": "fishing_activity_history",
+    "createdAt": "2026-05-13T17:03:27.690000Z",
+    "updatedAt": "2026-05-13T17:03:27.690000Z",
+    "start": {
+      "point": {
+        "lat": 34.8,
+        "lon": 125.4
+      },
+      "time": "2026-05-13T16:53:34Z"
+    },
+    "end": {
+      "point": {
+        "lat": 34.8,
+        "lon": 125.4
+      },
+      "time": "2026-05-13T17:03:04Z"
+    },
+    "vessels": {
+      "vessel0": {
+        "vesselId": "999000000",
+        "name": "VESSEL 0",
+        "mmsi": 999000000,
+        "imo": null,
+        "countryCode": [
+          "KOR"
+        ],
+        "trackId": "B:999000000:1700000000",
+        "category": "other",
+        "subcategory": null,
+        "vesselType": "OTHER",
+        "gfwVesselId": null,
+        "displayCountry": "South Korea",
+        "length": null,
+        "class": "vessel"
+      },
+      "vessel1": null
+    },
+    "eventDetails": {
+      "fishingScore": 0.8061990737915039
+    }
+  },
+  "dark_rendezvous": {
+    "eventId": "dark_rendezvous-fixture-01",
+    "eventType": "dark_rendezvous",
+    "createdAt": "2026-05-13T19:52:01.681000Z",
+    "updatedAt": "2026-05-13T19:52:01.681000Z",
+    "start": {
+      "point": {
+        "lat": 11.6,
+        "lon": 110.3
+      },
+      "time": "2026-05-13T17:36:27Z"
+    },
+    "end": {
+      "point": {
+        "lat": 11.6,
+        "lon": 110.3
+      },
+      "time": "2026-05-13T19:15:51Z"
+    },
+    "vessels": {
+      "vessel0": {
+        "vesselId": "999000010",
+        "name": "VESSEL 10",
+        "mmsi": 999000010,
+        "imo": null,
+        "countryCode": [
+          "VNM"
+        ],
+        "trackId": "B:999000010:1700000000",
+        "category": "other",
+        "subcategory": null,
+        "vesselType": "OTHER",
+        "gfwVesselId": null,
+        "displayCountry": "Viet Nam",
+        "length": null,
+        "class": "vessel"
+      },
+      "vessel1": null
+    },
+    "eventDetails": {
+      "osrScore": 1
+    }
+  },
+  "standard_rendezvous": {
+    "eventId": "standard_rendezvous-fixture-02",
+    "eventType": "standard_rendezvous",
+    "createdAt": "2026-05-13T17:30:54.786000Z",
+    "updatedAt": "2026-05-13T17:30:54.786000Z",
+    "start": {
+      "point": {
+        "lat": 7.0,
+        "lon": 108.7
+      },
+      "time": "2026-05-13T16:54:46Z"
+    },
+    "end": {
+      "point": {
+        "lat": 7.0,
+        "lon": 108.7
+      },
+      "time": "2026-05-13T17:27:47Z"
+    },
+    "vessels": {
+      "vessel0": {
+        "vesselId": "999000020",
+        "name": "VESSEL 20",
+        "mmsi": 999000020,
+        "imo": null,
+        "countryCode": [
+          "VNM"
+        ],
+        "trackId": "B:999000020:1700000000",
+        "category": "fishing",
+        "subcategory": null,
+        "vesselType": "FISHING",
+        "gfwVesselId": null,
+        "displayCountry": "Viet Nam",
+        "length": 26,
+        "class": "vessel"
+      },
+      "vessel1": {
+        "vesselId": "999000021",
+        "name": "VESSEL 21",
+        "mmsi": 999000021,
+        "imo": null,
+        "countryCode": [
+          "VNM"
+        ],
+        "trackId": "B:999000021:1700000000",
+        "category": "fishing",
+        "subcategory": null,
+        "vesselType": "FISHING",
+        "gfwVesselId": "gfw000021",
+        "displayCountry": "Viet Nam",
+        "length": null,
+        "class": "vessel"
+      }
+    },
+    "eventDetails": {}
+  },
+  "aoi_visit": {
+    "eventId": "aoi_visit-fixture-03",
+    "eventType": "aoi_visit",
+    "createdAt": "2026-05-13T21:59:20.155000Z",
+    "updatedAt": "2026-05-13T21:59:20.155000Z",
+    "start": {
+      "point": {
+        "lat": -26.6,
+        "lon": 33.2
+      },
+      "time": "2026-05-13T19:05:24Z"
+    },
+    "end": {
+      "point": {
+        "lat": -26.9,
+        "lon": 33.1
+      },
+      "time": "2026-05-13T21:49:41Z"
+    },
+    "vessels": {
+      "vessel0": {
+        "vesselId": "999000030",
+        "name": "VESSEL 30",
+        "mmsi": 999000030,
+        "imo": 9000030,
+        "countryCode": [
+          "LBR"
+        ],
+        "trackId": "B:999000030:1700000000",
+        "category": "other",
+        "subcategory": null,
+        "vesselType": "RESERVED",
+        "gfwVesselId": null,
+        "displayCountry": "Liberia",
+        "length": 234,
+        "class": "vessel"
+      },
+      "vessel1": null
+    },
+    "eventDetails": {
+      "entrySpeed": 6.099999904632568,
+      "entryHeading": 199,
+      "endHeading": null
+    }
+  },
+  "viirs": {
+    "eventId": "viirs-fixture-04",
+    "eventType": "viirs",
+    "createdAt": "2026-05-13T19:23:53.383000Z",
+    "updatedAt": "2026-05-13T19:23:53.383000Z",
+    "start": {
+      "point": {
+        "lat": -20.1,
+        "lon": 118.6
+      },
+      "time": "2026-05-13T16:48:00Z"
+    },
+    "end": {
+      "point": {
+        "lat": -20.1,
+        "lon": 118.6
+      },
+      "time": "2026-05-13T16:48:00Z"
+    },
+    "vessels": {
+      "vessel0": {
+        "vesselId": "999000040",
+        "name": "VESSEL 40",
+        "mmsi": 999000040,
+        "imo": 9000040,
+        "countryCode": [
+          "KOR"
+        ],
+        "trackId": "B:999000040:1700000000",
+        "category": "cargo",
+        "subcategory": null,
+        "vesselType": "CARGO",
+        "gfwVesselId": "gfw000040",
+        "displayCountry": "South Korea",
+        "length": 300,
+        "class": "vessel"
+      },
+      "vessel1": null
+    },
+    "eventDetails": {
+      "imageUrl": "https://cdn.example.invalid/viirs/chip.png",
+      "dataSource": "nasa",
+      "detectionType": "ais_correlated",
+      "estimatedLength": null,
+      "estimatedSpeedKts": null,
+      "estimatedVesselCategory": null,
+      "frameIds": [
+        "frame04"
+      ],
+      "heading": null,
+      "radianceNw": 16.225
+    }
+  },
+  "sar_sentinel1": {
+    "eventId": "sar_sentinel1-fixture-05",
+    "eventType": "sar_sentinel1",
+    "createdAt": "2026-05-13T19:30:37.244000Z",
+    "updatedAt": "2026-05-13T19:30:37.244000Z",
+    "start": {
+      "point": {
+        "lat": 32.7,
+        "lon": 14.3
+      },
+      "time": "2026-05-13T17:02:11.079597Z"
+    },
+    "end": {
+      "point": {
+        "lat": 32.7,
+        "lon": 14.3
+      },
+      "time": "2026-05-13T17:02:11.079597Z"
+    },
+    "vessels": {
+      "vessel0": {
+        "vesselId": null,
+        "name": null,
+        "mmsi": 999000050,
+        "imo": null,
+        "countryCode": [
+          "COM"
+        ],
+        "trackId": "B:999000050:1700000000",
+        "category": null,
+        "subcategory": null,
+        "vesselType": null,
+        "gfwVesselId": null,
+        "displayCountry": "Comoros",
+        "length": null,
+        "class": "unknown"
+      },
+      "vessel1": null
+    },
+    "eventDetails": {
+      "imageUrl": "https://cdn.example.invalid/sar_sentinel1/chip.png",
+      "dataSource": "sentinel1",
+      "detectionType": "ais_correlated",
+      "score": 0.9140275120735168,
+      "estimatedLength": null,
+      "estimatedSpeedKts": null,
+      "estimatedVesselCategory": null,
+      "frameIds": [
+        "frame05"
+      ],
+      "heading": null,
+      "distanceToCoastM": 185,
+      "orientation": 0,
+      "metersPerPixel": 8
+    }
+  },
+  "eo_sentinel2": {
+    "eventId": "eo_sentinel2-fixture-06",
+    "eventType": "eo_sentinel2",
+    "createdAt": "2026-05-13T22:36:57.563000Z",
+    "updatedAt": "2026-05-13T22:36:57.563000Z",
+    "start": {
+      "point": {
+        "lat": 18.5,
+        "lon": -114.3
+      },
+      "time": "2026-05-13T18:19:08.262536Z"
+    },
+    "end": {
+      "point": {
+        "lat": 18.5,
+        "lon": -114.3
+      },
+      "time": "2026-05-13T18:19:08.262536Z"
+    },
+    "vessels": {
+      "vessel0": {
+        "vesselId": "999000060",
+        "name": "VESSEL 60",
+        "mmsi": 999000060,
+        "imo": 9000060,
+        "countryCode": [
+          "PAN"
+        ],
+        "trackId": "B:999000060:1700000000",
+        "category": "cargo",
+        "subcategory": null,
+        "vesselType": "CARGO",
+        "gfwVesselId": null,
+        "displayCountry": "Panama",
+        "length": 225,
+        "class": "vessel"
+      },
+      "vessel1": null
+    },
+    "eventDetails": {
+      "imageUrl": "https://cdn.example.invalid/eo_sentinel2/chip.png",
+      "dataSource": "sentinel2",
+      "detectionType": "ais_correlated",
+      "score": 0.998505711555481,
+      "estimatedLength": 221,
+      "estimatedSpeedKts": 10,
+      "estimatedVesselCategory": "cargo",
+      "frameIds": [
+        "frame06"
+      ],
+      "heading": 95,
+      "distanceToCoastM": 44567,
+      "orientation": 0,
+      "metersPerPixel": 10
+    }
+  },
+  "eo_landsat_8_9": {
+    "eventId": "eo_landsat_8_9-fixture-07",
+    "eventType": "eo_landsat_8_9",
+    "createdAt": "2026-05-13T21:00:34.829000Z",
+    "updatedAt": "2026-05-13T21:00:34.829000Z",
+    "start": {
+      "point": {
+        "lat": 18.6,
+        "lon": -104.6
+      },
+      "time": "2026-05-13T17:17:40.656948Z"
+    },
+    "end": {
+      "point": {
+        "lat": 18.6,
+        "lon": -104.6
+      },
+      "time": "2026-05-13T17:17:40.656948Z"
+    },
+    "vessels": {
+      "vessel0": null,
+      "vessel1": null
+    },
+    "eventDetails": {
+      "imageUrl": "https://cdn.example.invalid/eo_landsat_8_9/chip.png",
+      "dataSource": "landsat_8_9",
+      "detectionType": "dark",
+      "score": 0.9614085555076599,
+      "estimatedLength": null,
+      "estimatedSpeedKts": null,
+      "estimatedVesselCategory": null,
+      "frameIds": [
+        "frame07"
+      ],
+      "heading": null,
+      "distanceToCoastM": 53633,
+      "orientation": 0,
+      "metersPerPixel": 15
+    }
+  }
+}
