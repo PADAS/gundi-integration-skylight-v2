@@ -60,23 +60,16 @@ AOI_SEARCH_PAGE_SIZE = 100
 # Refresh tokens this many seconds before their actual expiry to avoid races.
 _TOKEN_EXPIRY_SKEW_SECONDS = 60
 
-# For use in case an event doesn't have a vessel dict (uncorrelated "dark"
-# satellite detections). Holds every text vessel field the connector sends, so a
-# dark detection shows the same rows as a correlated one. The number fields
-# (length, imo) are left out on purpose: the published ER schemas declare them as
-# numbers, and "N/A" there would put text in a number field.
+# For use in case an event doesn't have a vessel dict
 EMPTY_VESSEL_DICT = {
     "category": "N/A",
     "class": "N/A",
     "country_filter": "N/A",
     "display_country": "N/A",
-    "gfw_vessel_id": "N/A",
     "mmsi": "N/A",
     "name": "N/A",
     "subcategory": "N/A",
-    "track_id": "N/A",
     "type": "N/A",
-    "vessel_id": "N/A",
 }
 
 # --- searchEventsV2 -> v1 record shape -------------------------------------

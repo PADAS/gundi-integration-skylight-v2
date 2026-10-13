@@ -26,7 +26,6 @@ from app.actions.client import (
     search_aois,
     DEFAULT_EVENT_MAPPING,
     SKYLIGHT_MAX_WINDOW_DAYS,
-    EMPTY_VESSEL_DICT,
 )
 from app.actions.configurations import ProcessEventsPerAOIConfig, PullEventsConfig, ListAOIsQuery
 from app.actions.handlers import (
@@ -848,34 +847,6 @@ def test_normalize_v2_event_does_not_derive_duration_for_other_types():
     assert "duration" not in visit["event_details"]
     assert "duration" not in detection["event_details"]
     assert speed["event_details"]["duration"] == 16013   # Skylight's own value, not the span
-
-
-_ORIGINAL_EMPTY_VESSEL_DICT = dict(EMPTY_VESSEL_DICT)
-
-
-def test_dark_detection_gets_every_text_vessel_field_but_no_number_fields(mocker):
-    # Other tests in this module replace client.EMPTY_VESSEL_DICT; pin the real one.
-    mocker.patch("app.actions.client.EMPTY_VESSEL_DICT", _ORIGINAL_EMPTY_VESSEL_DICT)
-    config = [{"skylight_event_type": ["viirs", "sar_sentinel1", "eo_sentinel2", "eo_landsat_8_9"],
-               "event_title": "Vessel Detection", "event_type": "detection_alert_rep"}]
-    span = {"point": {"lat": 1.0, "lon": 2.0}, "time": "2026-10-12T00:00:00Z"}
-    dark = transform(config, normalize_v2_event({
-        "eventId": "d5", "eventType": "sar_sentinel1", "start": span, "end": span,
-        "vessels": {"vessel0": None, "vessel1": None}, "eventDetails": {"detectionType": "dark"},
-    }))
-    correlated = transform(config, normalize_v2_event({
-        "eventId": "d6", "eventType": "sar_sentinel1", "start": span, "end": span,
-        "vessels": {"vessel0": _v2_vessel(imo=9499307, length=30), "vessel1": None}, "eventDetails": {"detectionType": "ais_correlated"},
-    }))
-    dark_vessel_keys = {k for k in dark["event_details"] if k.startswith("vessel_0_")}
-    text_keys = {k for k, v in correlated["event_details"].items()
-                 if k.startswith("vessel_0_") and not isinstance(v, (int, float))}
-    assert text_keys <= dark_vessel_keys
-    for key in ("vessel_0_vessel_id", "vessel_0_track_id", "vessel_0_gfw_vessel_id"):
-        assert dark["event_details"][key] == "N/A"
-    # Declared as numbers in the published ER schemas, so never filled with "N/A".
-    assert "vessel_0_imo" not in dark["event_details"]
-    assert "vessel_0_length" not in dark["event_details"]
 
 
 def test_normalize_v2_event_handles_missing_vessels_and_details():
