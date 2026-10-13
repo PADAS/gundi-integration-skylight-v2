@@ -849,6 +849,43 @@ def test_normalize_v2_event_does_not_derive_duration_for_other_types():
     assert speed["event_details"]["duration"] == 16013   # Skylight's own value, not the span
 
 
+def test_normalize_v2_event_adds_aoi_name_from_the_aoi_feature_configuration():
+    visit = normalize_v2_event({
+        "eventId": "a5", "eventType": "aoi_visit", "vessels": {"vessel0": None, "vessel1": None},
+        "aoiFeatureConfiguration": {"aoiName": "Maputo"},
+        "eventDetails": {"entrySpeed": 5.5, "entryHeading": 10, "endHeading": None},
+    })
+    assert visit["event_details"]["aoi_name"] == "Maputo"
+    fishing = normalize_v2_event({
+        "eventId": "f4", "eventType": "fishing_activity_history", "vessels": {"vessel0": None, "vessel1": None},
+        "aoiFeatureConfiguration": None, "eventDetails": {"fishingScore": 0.5},
+    })
+    assert "aoi_name" not in fishing["event_details"]
+
+
+def test_normalize_v2_event_passes_owner_and_joins_unique_authorizations():
+    result = normalize_v2_event({
+        "eventId": "r4", "eventType": "standard_rendezvous",
+        "vessels": {
+            "vessel0": _v2_vessel(ownerName="TRITON NAUTILUS ASSET LEASING", authorizations=["SPRFMO", "SPRFMO", "SPRFMO"]),
+            "vessel1": _v2_vessel(ownerName=None, authorizations=["GFCM", "ICCAT"]),
+        },
+        "eventDetails": {},
+    })
+    assert result["vessels"]["vessel_0"]["owner_name"] == "TRITON NAUTILUS ASSET LEASING"
+    assert result["vessels"]["vessel_0"]["authorizations"] == "SPRFMO"
+    assert result["vessels"]["vessel_1"]["authorizations"] == "GFCM, ICCAT"
+    assert result["vessels"]["vessel_1"]["owner_name"] is None   # transform drops None
+
+
+def test_normalize_v2_event_empty_authorizations_become_none():
+    result = normalize_v2_event({
+        "eventId": "f5", "eventType": "fishing_activity_history",
+        "vessels": {"vessel0": _v2_vessel(authorizations=[]), "vessel1": None}, "eventDetails": {},
+    })
+    assert result["vessels"]["vessel_0"]["authorizations"] is None
+
+
 def test_normalize_v2_event_handles_missing_vessels_and_details():
     result = normalize_v2_event({"eventId": "x", "eventType": "fishing_activity_history"})
     assert result["vessels"] == {"vessel_0": None}
@@ -1346,6 +1383,7 @@ def test_transform_entry_alert_start_and_end():
     assert result["location"] == {"lat": 1.0, "lon": 104.0}
     assert result["event_details"]["exit_date"] == "2026-06-01T02:30:00Z"
     assert result["event_details"]["duration_in_area"] == 2.5
+    assert result["event_details"]["duration_in_area_seconds"] == 9000
 
 
 def test_transform_entry_alert_start_only_pending():
@@ -1363,6 +1401,7 @@ def test_transform_entry_alert_start_only_pending():
     assert result["location"] == {"lat": 2.0, "lon": 105.0}
     assert result["event_details"]["exit_date"] == "Pending"
     assert result["event_details"]["duration_in_area"] == "Pending"
+    assert "duration_in_area_seconds" not in result["event_details"]
 
 
 def test_transform_entry_alert_no_start_returns_empty():

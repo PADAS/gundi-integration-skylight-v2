@@ -325,6 +325,12 @@ def transform(config, data: dict) -> dict:
                     full_event_details["duration_in_area"] = round(
                         (end_dt - start_dt).total_seconds() / 3600, 2
                     )
+                    # The same time in whole seconds, the unit Speed Range and
+                    # rendezvous `duration` use. Left out while the vessel is
+                    # still inside, rather than sending "Pending" as a number.
+                    full_event_details["duration_in_area_seconds"] = int(
+                        (end_dt - start_dt).total_seconds()
+                    )
                 else:
                     full_event_details["duration_in_area"] = "Pending"
             else:

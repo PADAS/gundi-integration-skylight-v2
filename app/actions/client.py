@@ -166,6 +166,19 @@ def _span_seconds(start, end) -> Optional[int]:
     return int((end_dt - start_dt).total_seconds())
 
 
+def _reshape_v2_vessel(vessel: dict) -> dict:
+    """v2 vessel -> v1 vessel keys. `authorizations` (RFMO lists the vessel is
+    authorised on) comes back as a list with repeats, e.g. ["SPRFMO", "SPRFMO"];
+    it is sent as one readable string, "SPRFMO" / "GFCM, ICCAT", which a text
+    field in an ER schema can show as is."""
+    out = _reshape_v2_fields(vessel, _V2_VESSEL_FIELD_MAP)
+    authorizations = out.get("authorizations")
+    if isinstance(authorizations, list):
+        unique = list(dict.fromkeys(a for a in authorizations if a))
+        out["authorizations"] = ", ".join(unique) if unique else None
+    return out
+
+
 def normalize_v2_event(record: dict) -> dict:
     """Reshape one `searchEventsV2` record into the v1 `events` item layout."""
     event_type = record.get("eventType")
@@ -188,16 +201,21 @@ def normalize_v2_event(record: dict) -> dict:
     for key in ("createdAt", "updatedAt"):
         if record.get(key) is not None:
             details[_camel_to_snake(key)] = record[key]
+    # The AOI an entry or speed-range alert fired on, so a site watching
+    # several AOIs can tell which one the vessel entered.
+    aoi_name = (record.get("aoiFeatureConfiguration") or {}).get("aoiName")
+    if aoi_name:
+        details["aoi_name"] = aoi_name
 
     v2_vessels = record.get("vessels") or {}
     vessel0 = v2_vessels.get("vessel0")
     # vessel_0 is always present (None -> EMPTY_VESSEL_DICT in transform, as in
     # v1). vessel_1 is only emitted when v2 actually returned a second vessel,
     # so single-vessel events don't gain a set of "N/A" vessel_1 fields.
-    vessels = {"vessel_0": _reshape_v2_fields(vessel0, _V2_VESSEL_FIELD_MAP) if vessel0 else None}
+    vessels = {"vessel_0": _reshape_v2_vessel(vessel0) if vessel0 else None}
     vessel1 = v2_vessels.get("vessel1")
     if vessel1:
-        vessels["vessel_1"] = _reshape_v2_fields(vessel1, _V2_VESSEL_FIELD_MAP)
+        vessels["vessel_1"] = _reshape_v2_vessel(vessel1)
 
     return {
         "event_id": record.get("eventId"),
@@ -585,6 +603,10 @@ async def get_skylight_events(integration, config_data, auth):
                     eventType
                     createdAt
                     updatedAt
+                    # Set only on AOI-generated events (aoi_visit, speed_range).
+                    aoiFeatureConfiguration {
+                        aoiName
+                    }
                     start {
                         point {
                             lat
@@ -614,6 +636,8 @@ async def get_skylight_events(integration, config_data, auth):
                             displayCountry
                             length
                             class
+                            ownerName
+                            authorizations
                         }
                         vessel1 {
                             vesselId
@@ -629,6 +653,8 @@ async def get_skylight_events(integration, config_data, auth):
                             displayCountry
                             length
                             class
+                            ownerName
+                            authorizations
                         }
                     }
                     eventDetails {
