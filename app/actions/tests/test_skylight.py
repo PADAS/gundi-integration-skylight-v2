@@ -26,6 +26,7 @@ from app.actions.client import (
     search_aois,
     DEFAULT_EVENT_MAPPING,
     SKYLIGHT_MAX_WINDOW_DAYS,
+    EMPTY_VESSEL_DICT,
 )
 from app.actions.configurations import ProcessEventsPerAOIConfig, PullEventsConfig, ListAOIsQuery
 from app.actions.handlers import (
@@ -779,6 +780,104 @@ def test_normalize_v2_event_rendezvous_keeps_second_vessel_as_vessel_1():
     assert result["event_details"] == {}
 
 
+def test_normalize_v2_event_rounds_noisy_details_in_place_keeping_their_types():
+    visit = normalize_v2_event({
+        "eventId": "a2", "eventType": "aoi_visit", "vessels": {"vessel0": None, "vessel1": None},
+        "eventDetails": {"entrySpeed": 19.600000381469727, "entryHeading": 288, "endHeading": None},
+    })
+    assert visit["event_details"]["entry_speed"] == "19.6"   # still a string, as v1 sent it
+    assert visit["event_details"]["entry_heading"] == "288"
+
+    fishing = normalize_v2_event({
+        "eventId": "f2", "eventType": "fishing_activity_history", "vessels": {"vessel0": None, "vessel1": None},
+        "eventDetails": {"fishingScore": 0.3291875720024109},
+    })
+    assert fishing["event_details"]["fishing_score"] == 0.33
+
+    detection = normalize_v2_event({
+        "eventId": "d3", "eventType": "sar_sentinel1", "vessels": {"vessel0": None, "vessel1": None},
+        "eventDetails": {"detectionType": "dark", "score": 0.9112884402275085, "radianceNw": None},
+    })
+    assert detection["event_details"]["score"] == 0.91
+
+
+def test_normalize_v2_event_leaves_whole_and_missing_values_unrounded():
+    visit = normalize_v2_event({
+        "eventId": "a3", "eventType": "aoi_visit", "vessels": {"vessel0": None, "vessel1": None},
+        "eventDetails": {"entrySpeed": 5, "entryHeading": 1, "endHeading": None},
+    })
+    assert visit["event_details"]["entry_speed"] == "5"
+    fishing = normalize_v2_event({
+        "eventId": "f3", "eventType": "fishing_activity_history", "vessels": {"vessel0": None, "vessel1": None},
+        "eventDetails": {"fishingScore": None},
+    })
+    assert fishing["event_details"]["fishing_score"] is None
+
+
+@pytest.mark.parametrize("event_type", ["standard_rendezvous", "dark_rendezvous", "fishing_activity_history"])
+def test_normalize_v2_event_derives_duration_in_seconds_from_start_and_end(event_type):
+    result = normalize_v2_event({
+        "eventId": "r2", "eventType": event_type, "vessels": {"vessel0": _v2_vessel(), "vessel1": None},
+        "start": {"point": {"lat": 1.0, "lon": 2.0}, "time": "2026-10-12T00:17:39Z"},
+        "end": {"point": {"lat": 1.1, "lon": 2.1}, "time": "2026-10-12T09:42:40Z"},
+        "eventDetails": {},
+    })
+    assert result["event_details"]["duration"] == 33901
+
+
+@pytest.mark.parametrize("end", [None, {"point": {"lat": 1.0, "lon": 2.0}, "time": None}])
+def test_normalize_v2_event_omits_duration_without_an_end_time(end):
+    result = normalize_v2_event({
+        "eventId": "r3", "eventType": "standard_rendezvous", "vessels": {"vessel0": None, "vessel1": None},
+        "start": {"point": {"lat": 1.0, "lon": 2.0}, "time": "2026-10-12T00:17:39Z"}, "end": end,
+        "eventDetails": {},
+    })
+    assert "duration" not in result["event_details"]
+
+
+def test_normalize_v2_event_does_not_derive_duration_for_other_types():
+    span = {
+        "start": {"point": {"lat": 1.0, "lon": 2.0}, "time": "2026-10-12T00:00:00Z"},
+        "end": {"point": {"lat": 1.0, "lon": 2.0}, "time": "2026-10-12T05:00:00Z"},
+    }
+    visit = normalize_v2_event({"eventId": "a4", "eventType": "aoi_visit", **span,
+                                "eventDetails": {"entrySpeed": 1.0, "entryHeading": 1, "endHeading": None}})
+    detection = normalize_v2_event({"eventId": "d4", "eventType": "viirs", **span, "eventDetails": {"detectionType": "dark"}})
+    speed = normalize_v2_event({"eventId": "s2", "eventType": "speed_range", **span,
+                                "eventDetails": {"averageSpeed": 3.22, "distance": 25.5, "durationSec": 16013}})
+    assert "duration" not in visit["event_details"]
+    assert "duration" not in detection["event_details"]
+    assert speed["event_details"]["duration"] == 16013   # Skylight's own value, not the span
+
+
+_ORIGINAL_EMPTY_VESSEL_DICT = dict(EMPTY_VESSEL_DICT)
+
+
+def test_dark_detection_gets_every_text_vessel_field_but_no_number_fields(mocker):
+    # Other tests in this module replace client.EMPTY_VESSEL_DICT; pin the real one.
+    mocker.patch("app.actions.client.EMPTY_VESSEL_DICT", _ORIGINAL_EMPTY_VESSEL_DICT)
+    config = [{"skylight_event_type": ["viirs", "sar_sentinel1", "eo_sentinel2", "eo_landsat_8_9"],
+               "event_title": "Vessel Detection", "event_type": "detection_alert_rep"}]
+    span = {"point": {"lat": 1.0, "lon": 2.0}, "time": "2026-10-12T00:00:00Z"}
+    dark = transform(config, normalize_v2_event({
+        "eventId": "d5", "eventType": "sar_sentinel1", "start": span, "end": span,
+        "vessels": {"vessel0": None, "vessel1": None}, "eventDetails": {"detectionType": "dark"},
+    }))
+    correlated = transform(config, normalize_v2_event({
+        "eventId": "d6", "eventType": "sar_sentinel1", "start": span, "end": span,
+        "vessels": {"vessel0": _v2_vessel(imo=9499307, length=30), "vessel1": None}, "eventDetails": {"detectionType": "ais_correlated"},
+    }))
+    dark_vessel_keys = {k for k in dark["event_details"] if k.startswith("vessel_0_")}
+    text_keys = {k for k, v in correlated["event_details"].items()
+                 if k.startswith("vessel_0_") and not isinstance(v, (int, float))}
+    assert text_keys <= dark_vessel_keys
+    for key in ("vessel_0_vessel_id", "vessel_0_track_id", "vessel_0_gfw_vessel_id"):
+        assert dark["event_details"][key] == "N/A"
+    # Declared as numbers in the published ER schemas, so never filled with "N/A".
+    assert "vessel_0_imo" not in dark["event_details"]
+    assert "vessel_0_length" not in dark["event_details"]
+
+
 def test_normalize_v2_event_handles_missing_vessels_and_details():
     result = normalize_v2_event({"eventId": "x", "eventType": "fishing_activity_history"})
     assert result["vessels"] == {"vessel_0": None}
@@ -1393,6 +1492,9 @@ def test_v2_record_transforms_to_the_same_er_event_as_v1(v1_item, v2_record):
         if key == "visit_type":
             continue  # v1 constant "end" on every event; deliberately dropped (no v2 source, no information)
         assert key in from_v2["event_details"], f"missing v1 key {key}"
+        if key == "entry_speed":
+            # Rounded to 2 decimals in place (GUNDI-5609); same key, still a string.
+            value = str(round(float(value), 2))
         assert from_v2["event_details"][key] == value, key
         assert type(from_v2["event_details"][key]) is type(value), key
 

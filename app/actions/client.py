@@ -60,16 +60,23 @@ AOI_SEARCH_PAGE_SIZE = 100
 # Refresh tokens this many seconds before their actual expiry to avoid races.
 _TOKEN_EXPIRY_SKEW_SECONDS = 60
 
-# For use in case an event doesn't have a vessel dict
+# For use in case an event doesn't have a vessel dict (uncorrelated "dark"
+# satellite detections). Holds every text vessel field the connector sends, so a
+# dark detection shows the same rows as a correlated one. The number fields
+# (length, imo) are left out on purpose: the published ER schemas declare them as
+# numbers, and "N/A" there would put text in a number field.
 EMPTY_VESSEL_DICT = {
     "category": "N/A",
     "class": "N/A",
     "country_filter": "N/A",
     "display_country": "N/A",
+    "gfw_vessel_id": "N/A",
     "mmsi": "N/A",
     "name": "N/A",
     "subcategory": "N/A",
+    "track_id": "N/A",
     "type": "N/A",
+    "vessel_id": "N/A",
 }
 
 # --- searchEventsV2 -> v1 record shape -------------------------------------
@@ -116,6 +123,17 @@ _V2_DETAILS_FIELD_MAP = {
 # numbers. Stringified so EarthRanger keeps receiving the same value types.
 _V1_STRING_DETAILS = ("entry_speed", "entry_heading", "end_heading")
 
+# Skylight sends these with float noise ("19.600000381469727", 0.3291875720024109);
+# its own UI shows 2 decimals. Rounded in place, so each keeps its key and type.
+_ROUNDED_DETAILS = ("entry_speed", "fishing_score", "score")
+_DETAIL_DECIMALS = 2
+
+# Event types with a start and end but no duration field in v2. The duration is
+# derived from the two times and sent as `duration` in seconds, the same key and
+# unit Speed Range uses. Satellite detections are left out (start == end) and so
+# are entries, which already get `duration_in_area` in transform().
+_DURATION_FROM_SPAN_EVENT_TYPES = {"standard_rendezvous", "dark_rendezvous", "fishing_activity_history"}
+
 # v1 also returned `visit_type: "end"` on every event of every type; it carried
 # no information and v2 has no such field, so it is intentionally not emitted.
 
@@ -142,11 +160,27 @@ def _reshape_v2_fields(source, field_map: dict) -> dict:
     return out
 
 
+def _span_seconds(start, end) -> Optional[int]:
+    """Whole seconds between two v2 StartEnd times, or None if either is missing
+    or unparseable (dateparser returns None rather than raising)."""
+    start_time = (start or {}).get("time")
+    end_time = (end or {}).get("time")
+    if not start_time or not end_time:
+        return None
+    start_dt, end_dt = dp(start_time), dp(end_time)
+    if start_dt is None or end_dt is None:
+        return None
+    return int((end_dt - start_dt).total_seconds())
+
+
 def normalize_v2_event(record: dict) -> dict:
     """Reshape one `searchEventsV2` record into the v1 `events` item layout."""
     event_type = record.get("eventType")
     v2_details = record.get("eventDetails") or {}
     details = _reshape_v2_fields(v2_details, _V2_DETAILS_FIELD_MAP)
+    for key in _ROUNDED_DETAILS:
+        if isinstance(details.get(key), float):
+            details[key] = round(details[key], _DETAIL_DECIMALS)
     for key in _V1_STRING_DETAILS:
         if details.get(key) is not None:
             details[key] = str(details[key])
@@ -154,6 +188,10 @@ def normalize_v2_event(record: dict) -> dict:
         detection_type = v2_details.get("detectionType")
         if detection_type is not None:
             details["correlated"] = detection_type == "ais_correlated"
+    if event_type in _DURATION_FROM_SPAN_EVENT_TYPES:
+        duration = _span_seconds(record.get("start"), record.get("end"))
+        if duration is not None:
+            details["duration"] = duration
     for key in ("createdAt", "updatedAt"):
         if record.get(key) is not None:
             details[_camel_to_snake(key)] = record[key]
