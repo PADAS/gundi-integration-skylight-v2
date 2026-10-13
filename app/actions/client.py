@@ -153,14 +153,32 @@ def _reshape_v2_fields(source, field_map: dict) -> dict:
     return out
 
 
-def _span_seconds(start, end) -> Optional[int]:
-    """Whole seconds between two v2 StartEnd times, or None if either is missing
-    or unparseable (dateparser returns None rather than raising)."""
-    start_time = (start or {}).get("time")
-    end_time = (end or {}).get("time")
-    if not start_time or not end_time:
+def parse_skylight_time(value) -> Optional[datetime]:
+    """A Skylight ISO 8601 time as an aware datetime, or None if it is missing
+    or unreadable. A time without an offset is taken as UTC, so any two results
+    can be subtracted.
+
+    The trailing "Z" and the fraction of a second are normalised by hand: the
+    production image runs Python 3.10, whose fromisoformat accepts neither "Z"
+    nor a fraction other than 3 or 6 digits.
+    """
+    if not isinstance(value, str) or not value:
         return None
-    start_dt, end_dt = dp(start_time), dp(end_time)
+    if value[-1] in "Zz":
+        value = value[:-1] + "+00:00"
+    value = re.sub(r"\.(\d+)", lambda m: "." + m.group(1)[:6].ljust(6, "0"), value, count=1)
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def span_seconds(start, end) -> Optional[int]:
+    """Whole seconds between two v2 StartEnd times, or None if either is missing
+    or unreadable."""
+    start_dt = parse_skylight_time((start or {}).get("time"))
+    end_dt = parse_skylight_time((end or {}).get("time"))
     if start_dt is None or end_dt is None:
         return None
     return int((end_dt - start_dt).total_seconds())
@@ -194,8 +212,9 @@ def normalize_v2_event(record: dict) -> dict:
         detection_type = v2_details.get("detectionType")
         if detection_type is not None:
             details["correlated"] = detection_type == "ais_correlated"
-    if event_type in _DURATION_FROM_SPAN_EVENT_TYPES:
-        duration = _span_seconds(record.get("start"), record.get("end"))
+    # Skylight's own durationSec wins if it ever sends one for these types.
+    if event_type in _DURATION_FROM_SPAN_EVENT_TYPES and details.get("duration") is None:
+        duration = span_seconds(record.get("start"), record.get("end"))
         if duration is not None:
             details["duration"] = duration
     for key in ("createdAt", "updatedAt"):

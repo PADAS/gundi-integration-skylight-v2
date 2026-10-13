@@ -2,12 +2,14 @@ import base64
 import datetime
 import json
 import os
+import re
 import time
 import pytest
 import httpx
 import pydantic
 
 from dateparser import parse as dp
+from graphql import print_ast
 
 from gql.transport.exceptions import TransportQueryError, TransportServerError
 from gundi_core.schemas.v2 import LogLevel
@@ -23,7 +25,9 @@ from app.actions.client import (
     PullEventsBadConfigException,
     _TOKEN_EXPIRY_SKEW_SECONDS,
     normalize_v2_event,
+    parse_skylight_time,
     search_aois,
+    span_seconds,
     DEFAULT_EVENT_MAPPING,
     SKYLIGHT_MAX_WINDOW_DAYS,
 )
@@ -347,6 +351,22 @@ async def test_get_skylight_events_handles_null_meta(mocker, integration, auth, 
 
     assert exec_mock.call_count == 1
     assert [e["event_id"] for e in events["aoi1"]] == ["e1"]
+
+
+@pytest.mark.asyncio
+async def test_get_skylight_events_query_requests_aoi_name_owner_and_authorizations(
+        mocker, integration, auth, patch_skylight_clients
+):
+    exec_mock = mocker.patch("app.actions.client.execute_gql_query", side_effect=[_page([], total=0)])
+
+    await get_skylight_events(integration, _PullCfg(), auth)
+
+    query = " ".join(print_ast(exec_mock.call_args.args[1]).split())
+    assert "aoiFeatureConfiguration { aoiName }" in query
+    for vessel in ("vessel0", "vessel1"):
+        fields = re.search(vessel + r" \{([^}]*)\}", query).group(1).split()
+        assert "ownerName" in fields
+        assert "authorizations" in fields
 
 
 @pytest.mark.asyncio
@@ -832,6 +852,47 @@ def test_normalize_v2_event_omits_duration_without_an_end_time(end):
         "eventDetails": {},
     })
     assert "duration" not in result["event_details"]
+
+
+def test_normalize_v2_event_derives_duration_across_mixed_time_zones():
+    # One time with an offset and one without used to raise TypeError and drop
+    # the whole AOI; the one without is taken as UTC.
+    result = normalize_v2_event({
+        "eventId": "r5", "eventType": "dark_rendezvous", "vessels": {"vessel0": None, "vessel1": None},
+        "start": {"point": {"lat": 1.0, "lon": 2.0}, "time": "2026-10-12T00:00:00Z"},
+        "end": {"point": {"lat": 1.0, "lon": 2.0}, "time": "2026-10-12T01:00:00"},
+        "eventDetails": {},
+    })
+    assert result["event_details"]["duration"] == 3600
+
+
+@pytest.mark.parametrize("duration_sec, expected", [(120, 120), (None, 18000)])
+def test_normalize_v2_event_keeps_skylights_own_duration(duration_sec, expected):
+    result = normalize_v2_event({
+        "eventId": "f6", "eventType": "fishing_activity_history", "vessels": {"vessel0": None, "vessel1": None},
+        "start": {"point": {"lat": 1.0, "lon": 2.0}, "time": "2026-10-12T00:00:00Z"},
+        "end": {"point": {"lat": 1.0, "lon": 2.0}, "time": "2026-10-12T05:00:00Z"},
+        "eventDetails": {"durationSec": duration_sec},
+    })
+    assert result["event_details"]["duration"] == expected
+
+
+@pytest.mark.parametrize("start, end, expected", [
+    ("2026-10-12T00:00:00Z", "2026-10-12T01:00:00", 3600),
+    ("2026-10-12T00:00:00", "2026-10-12T03:00:00+02:00", 3600),
+    ("2026-10-12T00:00:00.123456Z", "2026-10-12T00:00:10.123456Z", 10),
+    ("2026-10-12T00:00:00.1Z", "2026-10-12T00:00:10.1234567Z", 10),
+    ("2026-10-12T00:00:00Z", "not a time", None),
+    ("2026-10-12T00:00:00Z", None, None),
+])
+def test_span_seconds(start, end, expected):
+    assert span_seconds({"time": start}, {"time": end}) == expected
+
+
+def test_parse_skylight_time_returns_aware_utc_for_naive_and_z_times():
+    for value in ("2026-10-12T00:00:00Z", "2026-10-12T00:00:00"):
+        parsed = parse_skylight_time(value)
+        assert parsed == datetime.datetime(2026, 10, 12, tzinfo=datetime.timezone.utc)
 
 
 def test_normalize_v2_event_does_not_derive_duration_for_other_types():
@@ -1384,6 +1445,21 @@ def test_transform_entry_alert_start_and_end():
     assert result["event_details"]["exit_date"] == "2026-06-01T02:30:00Z"
     assert result["event_details"]["duration_in_area"] == 2.5
     assert result["event_details"]["duration_in_area_seconds"] == 9000
+
+
+def test_transform_entry_alert_duration_across_mixed_time_zones():
+    data = {
+        "event_id": "evt1b",
+        "event_type": "aoi_visit",
+        "event_details": {},
+        "vessels": {},
+        "start": {"point": {"lat": 1.0, "lon": 104.0}, "time": "2026-06-01T00:00:00Z"},
+        "end": {"point": {"lat": 1.1, "lon": 104.1}, "time": "2026-06-01T01:30:00"},
+    }
+    result = transform(_ENTRY_ALERT_CONFIG, data)
+
+    assert result["event_details"]["duration_in_area"] == 1.5
+    assert result["event_details"]["duration_in_area_seconds"] == 5400
 
 
 def test_transform_entry_alert_start_only_pending():

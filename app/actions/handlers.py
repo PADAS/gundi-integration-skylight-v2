@@ -319,18 +319,13 @@ def transform(config, data: dict) -> dict:
             end = data.get('end')
             if end:
                 full_event_details["exit_date"] = end.get('time')
-                start_dt = dp(event_time_and_location.get('time'))
-                end_dt = dp(end.get('time'))
-                if start_dt and end_dt:
-                    full_event_details["duration_in_area"] = round(
-                        (end_dt - start_dt).total_seconds() / 3600, 2
-                    )
+                seconds = client.span_seconds(event_time_and_location, end)
+                if seconds is not None:
+                    full_event_details["duration_in_area"] = round(seconds / 3600, 2)
                     # The same time in whole seconds, the unit Speed Range and
                     # rendezvous `duration` use. Left out while the vessel is
                     # still inside, rather than sending "Pending" as a number.
-                    full_event_details["duration_in_area_seconds"] = int(
-                        (end_dt - start_dt).total_seconds()
-                    )
+                    full_event_details["duration_in_area_seconds"] = seconds
                 else:
                     full_event_details["duration_in_area"] = "Pending"
             else:
