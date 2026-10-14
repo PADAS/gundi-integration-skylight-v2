@@ -117,9 +117,10 @@ _V2_DETAILS_FIELD_MAP = {
 _V1_STRING_DETAILS = ("entry_speed", "entry_heading", "end_heading")
 
 # Skylight sends these with float noise ("19.600000381469727", 0.3291875720024109).
-# Entry speed is rounded in place; the 0-1 scores are sent as a percentage
-# (0.9112884402275085 -> 91.13), as Skylight recommends. Each keeps its key and
-# stays a number.
+# Entry speed is rounded in place and then stays a string, like v1 (see
+# _V1_STRING_DETAILS); the 0-1 scores are sent as a percentage
+# (0.9112884402275085 -> 91.13), as Skylight recommends, and stay numbers.
+# Each keeps its key.
 _ROUNDED_DETAILS = ("entry_speed",)
 _PERCENT_DETAILS = ("fishing_score", "score", "osr_score")
 _DETAIL_DECIMALS = 2
