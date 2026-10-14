@@ -121,7 +121,7 @@ _V1_STRING_DETAILS = ("entry_speed", "entry_heading", "end_heading")
 # (0.9112884402275085 -> 91.13), as Skylight recommends. Each keeps its key and
 # stays a number.
 _ROUNDED_DETAILS = ("entry_speed",)
-_PERCENT_DETAILS = ("fishing_score", "score")
+_PERCENT_DETAILS = ("fishing_score", "score", "osr_score")
 _DETAIL_DECIMALS = 2
 
 # Event types with a start and end but no duration field in v2. The duration is

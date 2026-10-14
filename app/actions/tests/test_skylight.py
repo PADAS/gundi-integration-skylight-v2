@@ -843,6 +843,15 @@ def test_normalize_v2_event_sends_scores_as_a_percentage(score, expected):
     assert isinstance(detection["event_details"]["score"], float)
 
 
+@pytest.mark.parametrize("score, expected", [(0.681, 68.1), (1, 100.0)])
+def test_normalize_v2_event_sends_osr_score_as_a_percentage(score, expected):
+    dark = normalize_v2_event({
+        "eventId": "r6", "eventType": "dark_rendezvous", "vessels": {"vessel0": None, "vessel1": None},
+        "eventDetails": {"osrScore": score},
+    })
+    assert dark["event_details"]["osr_score"] == expected
+
+
 @pytest.mark.parametrize("event_type", ["standard_rendezvous", "dark_rendezvous", "fishing_activity_history"])
 def test_normalize_v2_event_derives_duration_in_seconds_from_start_and_end(event_type):
     result = normalize_v2_event({
