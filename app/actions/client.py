@@ -116,6 +116,21 @@ _V2_DETAILS_FIELD_MAP = {
 # numbers. Stringified so EarthRanger keeps receiving the same value types.
 _V1_STRING_DETAILS = ("entry_speed", "entry_heading", "end_heading")
 
+# Skylight sends these with float noise ("19.600000381469727", 0.3291875720024109).
+# Entry speed is rounded in place and then stays a string, like v1 (see
+# _V1_STRING_DETAILS); the 0-1 scores are sent as a percentage
+# (0.9112884402275085 -> 91.13), as Skylight recommends, and stay numbers.
+# Each keeps its key.
+_ROUNDED_DETAILS = ("entry_speed",)
+_PERCENT_DETAILS = ("fishing_score", "score", "osr_score")
+_DETAIL_DECIMALS = 2
+
+# Event types with a start and end but no duration field in v2. The duration is
+# derived from the two times and sent as `duration` in seconds, the same key and
+# unit Speed Range uses. Satellite detections are left out (start == end) and so
+# are entries, which already get `duration_in_area` in transform().
+_DURATION_FROM_SPAN_EVENT_TYPES = {"standard_rendezvous", "dark_rendezvous", "fishing_activity_history"}
+
 # v1 also returned `visit_type: "end"` on every event of every type; it carried
 # no information and v2 has no such field, so it is intentionally not emitted.
 
@@ -142,11 +157,62 @@ def _reshape_v2_fields(source, field_map: dict) -> dict:
     return out
 
 
+def parse_skylight_time(value) -> Optional[datetime]:
+    """A Skylight ISO 8601 time as an aware datetime, or None if it is missing
+    or unreadable. A time without an offset is taken as UTC, so any two results
+    can be subtracted.
+
+    The trailing "Z" and the fraction of a second are normalised by hand: the
+    production image runs Python 3.10, whose fromisoformat accepts neither "Z"
+    nor a fraction other than 3 or 6 digits.
+    """
+    if not isinstance(value, str) or not value:
+        return None
+    if value[-1] in "Zz":
+        value = value[:-1] + "+00:00"
+    value = re.sub(r"\.(\d+)", lambda m: "." + m.group(1)[:6].ljust(6, "0"), value, count=1)
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def span_seconds(start, end) -> Optional[int]:
+    """Whole seconds between two v2 StartEnd times, or None if either is missing
+    or unreadable."""
+    start_dt = parse_skylight_time((start or {}).get("time"))
+    end_dt = parse_skylight_time((end or {}).get("time"))
+    if start_dt is None or end_dt is None:
+        return None
+    return int((end_dt - start_dt).total_seconds())
+
+
+def _reshape_v2_vessel(vessel: dict) -> dict:
+    """v2 vessel -> v1 vessel keys. `authorizations` (RFMO lists the vessel is
+    authorised on) comes back as a list with repeats, e.g. ["SPRFMO", "SPRFMO"];
+    it is sent as one readable string, "SPRFMO" / "GFCM, ICCAT", which a text
+    field in an ER schema can show as is."""
+    out = _reshape_v2_fields(vessel, _V2_VESSEL_FIELD_MAP)
+    authorizations = out.get("authorizations")
+    if isinstance(authorizations, list):
+        unique = list(dict.fromkeys(a for a in authorizations if a))
+        out["authorizations"] = ", ".join(unique) if unique else None
+    return out
+
+
 def normalize_v2_event(record: dict) -> dict:
     """Reshape one `searchEventsV2` record into the v1 `events` item layout."""
     event_type = record.get("eventType")
     v2_details = record.get("eventDetails") or {}
     details = _reshape_v2_fields(v2_details, _V2_DETAILS_FIELD_MAP)
+    for key in _ROUNDED_DETAILS:
+        if isinstance(details.get(key), float):
+            details[key] = round(details[key], _DETAIL_DECIMALS)
+    for key in _PERCENT_DETAILS:
+        value = details.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            details[key] = round(float(value) * 100, _DETAIL_DECIMALS)
     for key in _V1_STRING_DETAILS:
         if details.get(key) is not None:
             details[key] = str(details[key])
@@ -154,19 +220,29 @@ def normalize_v2_event(record: dict) -> dict:
         detection_type = v2_details.get("detectionType")
         if detection_type is not None:
             details["correlated"] = detection_type == "ais_correlated"
+    # Skylight's own durationSec wins if it ever sends one for these types.
+    if event_type in _DURATION_FROM_SPAN_EVENT_TYPES and details.get("duration") is None:
+        duration = span_seconds(record.get("start"), record.get("end"))
+        if duration is not None:
+            details["duration"] = duration
     for key in ("createdAt", "updatedAt"):
         if record.get(key) is not None:
             details[_camel_to_snake(key)] = record[key]
+    # The AOI an entry or speed-range alert fired on, so a site watching
+    # several AOIs can tell which one the vessel entered.
+    aoi_name = (record.get("aoiFeatureConfiguration") or {}).get("aoiName")
+    if aoi_name:
+        details["aoi_name"] = aoi_name
 
     v2_vessels = record.get("vessels") or {}
     vessel0 = v2_vessels.get("vessel0")
     # vessel_0 is always present (None -> EMPTY_VESSEL_DICT in transform, as in
     # v1). vessel_1 is only emitted when v2 actually returned a second vessel,
     # so single-vessel events don't gain a set of "N/A" vessel_1 fields.
-    vessels = {"vessel_0": _reshape_v2_fields(vessel0, _V2_VESSEL_FIELD_MAP) if vessel0 else None}
+    vessels = {"vessel_0": _reshape_v2_vessel(vessel0) if vessel0 else None}
     vessel1 = v2_vessels.get("vessel1")
     if vessel1:
-        vessels["vessel_1"] = _reshape_v2_fields(vessel1, _V2_VESSEL_FIELD_MAP)
+        vessels["vessel_1"] = _reshape_v2_vessel(vessel1)
 
     return {
         "event_id": record.get("eventId"),
@@ -554,6 +630,10 @@ async def get_skylight_events(integration, config_data, auth):
                     eventType
                     createdAt
                     updatedAt
+                    # Set only on AOI-generated events (aoi_visit, speed_range).
+                    aoiFeatureConfiguration {
+                        aoiName
+                    }
                     start {
                         point {
                             lat
@@ -583,6 +663,8 @@ async def get_skylight_events(integration, config_data, auth):
                             displayCountry
                             length
                             class
+                            ownerName
+                            authorizations
                         }
                         vessel1 {
                             vesselId
@@ -598,6 +680,8 @@ async def get_skylight_events(integration, config_data, auth):
                             displayCountry
                             length
                             class
+                            ownerName
+                            authorizations
                         }
                     }
                     eventDetails {
