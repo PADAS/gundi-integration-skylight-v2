@@ -738,7 +738,7 @@ def test_normalize_v2_event_maps_record_and_vessel_to_v1_keys():
     assert vessel["gfw_vessel_id"] == "78450769f"
     assert "vessel_type" not in vessel and "vesselId" not in vessel
     # v2-only detail fields pass through; GraphQL meta is dropped.
-    assert result["event_details"]["fishing_score"] == 0.87
+    assert result["event_details"]["fishing_score"] == 87.0   # sent as a percentage
     assert "visit_type" not in result["event_details"]   # v1 constant carried no info; not emitted
     assert result["event_details"]["created_at"] == "2026-09-08T22:37:36Z"
     assert result["event_details"]["updated_at"] == "2026-09-08T22:37:37Z"
@@ -770,7 +770,7 @@ def test_normalize_v2_event_detection_sets_v1_data_source_correlated_and_image_u
     assert details["data_source"] == "sentinel2"
     assert details["correlated"] is False
     assert details["detection_type"] == "dark"
-    assert details["score"] == 0.99
+    assert details["score"] == 99.0
     # No vessel -> vessel_0 is None so transform fills EMPTY_VESSEL_DICT, as in v1.
     assert dark["vessels"] == {"vessel_0": None}
 
@@ -811,13 +811,13 @@ def test_normalize_v2_event_rounds_noisy_details_in_place_keeping_their_types():
         "eventId": "f2", "eventType": "fishing_activity_history", "vessels": {"vessel0": None, "vessel1": None},
         "eventDetails": {"fishingScore": 0.3291875720024109},
     })
-    assert fishing["event_details"]["fishing_score"] == 0.33
+    assert fishing["event_details"]["fishing_score"] == 32.92   # 0-1 score as a percentage
 
     detection = normalize_v2_event({
         "eventId": "d3", "eventType": "sar_sentinel1", "vessels": {"vessel0": None, "vessel1": None},
         "eventDetails": {"detectionType": "dark", "score": 0.9112884402275085, "radianceNw": None},
     })
-    assert detection["event_details"]["score"] == 0.91
+    assert detection["event_details"]["score"] == 91.13
 
 
 def test_normalize_v2_event_leaves_whole_and_missing_values_unrounded():
@@ -831,6 +831,16 @@ def test_normalize_v2_event_leaves_whole_and_missing_values_unrounded():
         "eventDetails": {"fishingScore": None},
     })
     assert fishing["event_details"]["fishing_score"] is None
+
+
+@pytest.mark.parametrize("score, expected", [(1, 100.0), (0, 0.0), (0.996, 99.6), (0.29, 29.0)])
+def test_normalize_v2_event_sends_scores_as_a_percentage(score, expected):
+    detection = normalize_v2_event({
+        "eventId": "d5", "eventType": "viirs", "vessels": {"vessel0": None, "vessel1": None},
+        "eventDetails": {"detectionType": "dark", "score": score},
+    })
+    assert detection["event_details"]["score"] == expected
+    assert isinstance(detection["event_details"]["score"], float)
 
 
 @pytest.mark.parametrize("event_type", ["standard_rendezvous", "dark_rendezvous", "fishing_activity_history"])

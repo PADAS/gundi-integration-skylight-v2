@@ -116,9 +116,12 @@ _V2_DETAILS_FIELD_MAP = {
 # numbers. Stringified so EarthRanger keeps receiving the same value types.
 _V1_STRING_DETAILS = ("entry_speed", "entry_heading", "end_heading")
 
-# Skylight sends these with float noise ("19.600000381469727", 0.3291875720024109);
-# its own UI shows 2 decimals. Rounded in place, so each keeps its key and type.
-_ROUNDED_DETAILS = ("entry_speed", "fishing_score", "score")
+# Skylight sends these with float noise ("19.600000381469727", 0.3291875720024109).
+# Entry speed is rounded in place; the 0-1 scores are sent as a percentage
+# (0.9112884402275085 -> 91.13), as Skylight recommends. Each keeps its key and
+# stays a number.
+_ROUNDED_DETAILS = ("entry_speed",)
+_PERCENT_DETAILS = ("fishing_score", "score")
 _DETAIL_DECIMALS = 2
 
 # Event types with a start and end but no duration field in v2. The duration is
@@ -205,6 +208,10 @@ def normalize_v2_event(record: dict) -> dict:
     for key in _ROUNDED_DETAILS:
         if isinstance(details.get(key), float):
             details[key] = round(details[key], _DETAIL_DECIMALS)
+    for key in _PERCENT_DETAILS:
+        value = details.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            details[key] = round(float(value) * 100, _DETAIL_DECIMALS)
     for key in _V1_STRING_DETAILS:
         if details.get(key) is not None:
             details[key] = str(details[key])
