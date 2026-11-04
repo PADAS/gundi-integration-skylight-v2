@@ -1544,6 +1544,33 @@ async def test_process_attachments_gundi_upload_error_is_skipped(mocker, integra
     assert mock_log_action_activity.call_args.kwargs["data"]["server_response_body"] == "boom"
 
 
+@pytest.mark.asyncio
+async def test_process_attachments_upload_error_is_logged_masked(mocker, integration):
+    # The skipped exception never reaches the runner's own redaction, so a
+    # secret Gundi echoes back must be masked here, in the event and the log.
+    from gundi_client_v2.errors import GundiAPIError
+
+    transformed_data = [{"event_details": {"image_url": "https://example.com/a.png"}}]
+    response = [{"object_id": "event1"}]
+    mocker.patch(
+        "httpx.AsyncClient.get",
+        return_value=mocker.AsyncMock(status_code=200, aread=mocker.AsyncMock(return_value=b"img")),
+    )
+    mocker.patch(
+        "app.actions.handlers.gundi_tools.send_event_attachments_to_gundi",
+        side_effect=GundiAPIError(status_code=400, detail='{"api_key": "k-secret-1"}'),
+    )
+    mock_log_action_activity = mocker.patch("app.actions.handlers.log_action_activity", return_value=None)
+    log = mocker.patch("app.actions.handlers.logger")
+
+    await process_attachments(transformed_data, response, integration)
+
+    published = str(mock_log_action_activity.call_args)
+    assert "k-secret-1" not in published
+    assert "k-secret-1" not in str(log.mock_calls)
+    log.exception.assert_not_called()
+
+
 def test_transform_with_vessel_info():
     data = {
         "event_type": "some_event_type",

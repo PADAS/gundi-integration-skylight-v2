@@ -267,16 +267,24 @@ def redact_body(body: Any) -> str:
     if body is None:
         return ""
     if isinstance(body, (dict, list)):
-        return json.dumps(redact_secrets(body))
+        try:
+            return json.dumps(redact_secrets(body))
+        except RecursionError:
+            return REDACTED
     if isinstance(body, (bytes, bytearray)):
         text = bytes(body).decode("utf-8", errors="replace")
     else:
         text = str(body)
     if not text.strip():
         return text
-    parsed, has_duplicate_keys = _parse_json(text)
+    try:
+        parsed, has_duplicate_keys = _parse_json(text)
+        redacted = redact_secrets(parsed) if isinstance(parsed, (dict, list)) else None
+    except RecursionError:
+        # Nested too deeply to parse or walk. This runs inside error handling,
+        # where raising would replace the original failure: mask it whole.
+        return REDACTED
     if isinstance(parsed, (dict, list)):
-        redacted = redact_secrets(parsed)
         # Re-serialized only when something was masked, so an innocent body
         # is attached exactly as it went over the wire. Unless an object
         # repeated a key: parsing kept the last value only, so the text may
@@ -418,7 +426,31 @@ def redact_text(text: Optional[str]) -> str:
     URL's query is parsed exactly as ``redact_url`` parses the structured
     ``request_url``, so the two can never disagree on what is secret.
     """
-    return _redact_text(text, depth=0) if text else (text or "")
+    if not text:
+        return text or ""
+    return _KEY_COLON_VALUE.sub(_mask_key_colon_value, _redact_text(text, depth=0))
+
+
+# A secret written as a JSON or Python dict entry ({"access_token": "t"},
+# {'password': 'p'}) or as "token: t" in prose: a key, quoted or bare, then a
+# colon and a value (quoted with escapes, or a bare run up to a separator).
+_KEY_COLON_VALUE = re.compile(
+    # A key starts only where a run of key characters starts, as in
+    # _URL_OR_PAIR: retrying inside a long run (a JWT) would be quadratic.
+    r"""(?<![A-Za-z0-9_.\-])(?P<quote>["']?)(?P<key>[A-Za-z0-9_.\-]+)(?P=quote)(?P<sep>\s*:\s*)"""
+    r"""(?P<value>"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|[^\s,;:{}\[\]()"']+)"""
+)
+
+
+def _mask_key_colon_value(match) -> str:
+    if not _is_sensitive_key(match.group("key")):
+        return match.group(0)
+    value = match.group("value")
+    value_quote = value[0] if value[:1] in ("'", '"') else ""
+    return (
+        f"{match.group('quote')}{match.group('key')}{match.group('quote')}"
+        f"{match.group('sep')}{value_quote}{REDACTED}{value_quote}"
+    )
 
 
 # How deep an innocent value is rescanned ("x=y=z=..."): past this the value

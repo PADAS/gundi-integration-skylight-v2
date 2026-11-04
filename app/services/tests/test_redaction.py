@@ -677,3 +677,33 @@ def test_redact_text_is_linear_on_long_runs_without_equals():
     for text in ("a" * 50_000, "h" * 50_000, "x" + "http" * 12_500):
         assert redact_text(text) == text
     assert time.perf_counter() - start < 1
+
+
+@pytest.mark.parametrize("text, secret", [
+    ('GundiAPIError: HTTP 500: {"access_token": "tok-123", "ok": 1}', "tok-123"),
+    ("ValueError: {'password': 'hunter2', 'user': 'u'}", "hunter2"),
+    ('{"password": "a\\"b"}', 'a\\"b'),
+    ("login failed, token: abc123, retry", "abc123"),
+])
+def test_redact_text_masks_secrets_written_with_a_colon(text, secret):
+    redacted = redact_text(text)
+    assert secret not in redacted
+    assert REDACTED in redacted
+
+
+def test_redact_text_leaves_innocent_colon_pairs_alone():
+    text = 'Traceback (most recent call last): {"detail": "not found", "status": 404}'
+    assert redact_text(text) == text
+
+
+def test_redact_text_colon_scan_stays_linear_on_long_runs():
+    import time
+    start = time.monotonic()
+    redact_text("a" * 200_000 + ": x")
+    assert time.monotonic() - start < 1
+
+
+@pytest.mark.parametrize("body", ["[" * 5000 + "]" * 5000, '{"a":' * 3000 + "1" + "}" * 3000])
+def test_redact_body_masks_a_body_too_deep_to_walk(body):
+    # Must not raise inside error handling: the original failure would be lost.
+    assert redact_body(body) == REDACTED
