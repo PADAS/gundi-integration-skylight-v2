@@ -155,10 +155,17 @@ def _publish_batches(messages):
 )
 async def _publish_batch(client, topic: str, messages: list, topic_name: str):
     # Retried per batch, so a failure late in a large list does not republish
-    # the batches that already succeeded.
+    # the batches that already succeeded. A 4xx other than 429 fails fast,
+    # as in publish_event: PubSub will reject the same batch every time.
     try:
         return await client.publish(topic, messages)
     except Exception as e:
+        if _is_non_retryable(e):
+            logger.exception(
+                f"Error publishing {len(messages)} system events to topic {topic_name}: {e}. "
+                "Client errors are not retried."
+            )
+            raise _NonRetryablePublishError(e) from e
         logger.exception(
             f"Error publishing {len(messages)} system events to topic {topic_name}: {e}. This will be retried."
         )
@@ -193,7 +200,10 @@ async def publish_events(events: List[SystemEventBaseModel], topic_name: str):
         ]
         for messages in _publish_batches(all_messages):
             logger.debug(f"Sending {len(messages)} events to PubSub topic {topic_name}..")
-            response = await _publish_batch(client, topic, messages, topic_name)
+            try:
+                response = await _publish_batch(client, topic, messages, topic_name)
+            except _NonRetryablePublishError as e:
+                raise e.original
             message_ids.extend((response or {}).get("messageIds", []))
         return {"messageIds": message_ids}
 

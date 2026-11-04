@@ -694,3 +694,39 @@ async def test_activity_logger_decorator_redacts_model_declared_secrets_below_th
     for call in mock_publish_event.call_args_list:
         event = call.kwargs["event"]
         assert event.payload.config_data == {"details": {"code": REDACTED, "realm": "r"}, "site": "s"}
+
+
+@pytest.mark.asyncio
+async def test_publish_events_does_not_retry_client_errors(
+        mocker, mock_pubsub_client, action_started_event, fast_retries
+):
+    # Same rule as publish_event: a 4xx batch will be rejected every time.
+    mocker.patch("app.services.activity_logger.pubsub", mock_pubsub_client)
+    publish_mock = mock_pubsub_client.PublisherClient.return_value.publish
+    publish_mock.side_effect = _client_response_error(400, "Bad Request")
+
+    with pytest.raises(aiohttp.ClientResponseError):
+        await publish_events([action_started_event], settings.INTEGRATION_EVENTS_TOPIC)
+
+    assert publish_mock.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_publish_events_retries_transient_errors(
+        mocker, mock_pubsub_client, gcp_pubsub_publish_response, action_started_event, fast_retries
+):
+    mocker.patch("app.services.activity_logger.pubsub", mock_pubsub_client)
+    publish_mock = mock_pubsub_client.PublisherClient.return_value.publish
+    calls = {"n": 0}
+
+    async def _fail_then_ok(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise _client_response_error(503, "Unavailable")
+        return gcp_pubsub_publish_response
+
+    publish_mock.side_effect = _fail_then_ok
+
+    await publish_events([action_started_event], settings.INTEGRATION_EVENTS_TOPIC)
+
+    assert publish_mock.call_count == 2

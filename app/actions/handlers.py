@@ -15,7 +15,8 @@ from dateparser import parse as dp
 from gql.transport.exceptions import TransportQueryError
 
 from app.actions.core import action_title
-from app.actions.configurations import AuthenticateConfig, PullEventsConfig, ProcessEventsPerAOIConfig, ListAOIsQuery, ReferenceDataResponse, ReferenceOption
+from app.actions.configurations import AuthenticateConfig, PullEventsConfig, ProcessEventsPerAOIConfig, ListAOIsQuery
+from app.actions.core import ReferenceDataResponse, ReferenceOption
 from app.services.action_scheduler import trigger_action
 from app.services.activity_logger import activity_logger, log_action_activity
 from app.services.errors import classify_error, format_classified_error

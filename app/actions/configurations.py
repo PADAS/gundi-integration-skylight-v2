@@ -39,21 +39,8 @@ class AuthenticateConfig(AuthActionConfiguration, ExecutableActionMixin):
 
 
 # --- Reference data (portal live dropdowns) ---------------------------------
-# Response contract for reference actions, as consumed by the Gundi portal:
-# {options: [{value, label?, description?, group?}], cache_ttl_seconds, truncated}.
-
-class ReferenceOption(BaseModel):
-    value: str
-    label: Optional[str] = None        # portal defaults label to value
-    description: Optional[str] = None  # tooltip / help text
-    group: Optional[str] = None        # optional grouping for long lists
-
-
-class ReferenceDataResponse(BaseModel):
-    options: List[ReferenceOption]
-    cache_ttl_seconds: int = 300       # portal-side cache hint
-    truncated: bool = False            # true if the list was capped
-
+# The response contract (ReferenceOption, ReferenceDataResponse) lives in
+# app.actions.core, shared with the template.
 
 class ListAOIsQuery(ReferenceActionConfiguration):
     """Reference action: the AOIs visible to the integration's Skylight account.
