@@ -564,6 +564,15 @@ def test_redact_url_masks_a_url_nested_in_an_innocent_query_value():
     assert redact_url(plain) == plain
 
 
+def test_redact_url_and_text_bound_deeply_nested_query_urls():
+    # Redaction runs inside the runner's error handling: a pathological URL
+    # must be masked, never raise RecursionError.
+    url = "https://h/?next=" * 400 + "https://x/?token=t123"
+
+    assert "t123" not in redact_url(url)
+    assert "t123" not in redact_text(f"Client error for url '{url}'")
+
+
 def test_redact_text_masks_the_userinfo_of_a_url_nested_in_a_query_value():
     text = "Client error for url 'https://host/cb?next=https://u:pw@x.test/'"
 
