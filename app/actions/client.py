@@ -24,6 +24,7 @@ from gql.transport.httpx import HTTPXAsyncTransport
 
 from app.services.activity_logger import log_action_activity
 from app.services.errors import ConfigurationNotFound
+from app.services.redaction import redact_body
 from app.services.utils import find_config_for_action
 from app.services.state import IntegrationStateManager
 
@@ -418,21 +419,6 @@ def _redact_headers(headers):
     return redacted
 
 
-def _redact_body(content: bytes) -> str:
-    """Decode a GraphQL request body with any `password` variable masked, so
-    the getToken mutation can be logged without leaking the Skylight password."""
-    text = content.decode("utf-8", "replace")
-    try:
-        body = json.loads(text)
-    except ValueError:
-        return text
-    variables = body.get("variables") if isinstance(body, dict) else None
-    if isinstance(variables, dict) and "password" in variables:
-        body["variables"] = {**variables, "password": "***redacted***"}
-        return json.dumps(body)
-    return text
-
-
 async def _log_skylight_error_response(response):
     """httpx response hook: whenever Skylight returns an error (4xx/5xx), log
     the full request and response (URL, headers, bodies) so the failure is
@@ -458,10 +444,11 @@ async def _log_skylight_error_response(response):
         request.method,
         request.url,
         _redact_headers(request.headers),
-        _redact_body(request.content),
+        # Masks the getToken password variable (and any other secret-looking key).
+        redact_body(request.content),
         response.status_code,
         dict(response.headers),
-        response.text,
+        redact_body(response.text),
         extra={"attention_needed": True},
     )
 

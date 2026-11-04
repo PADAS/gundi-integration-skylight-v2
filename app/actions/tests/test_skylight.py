@@ -23,7 +23,6 @@ from app.actions.client import (
     _is_token_expired,
     _redact_headers,
     _log_skylight_error_response,
-    _redact_body,
     build_auth_client,
     get_authentication_token,
     PullEventsBadConfigException,
@@ -1147,18 +1146,6 @@ async def test_log_skylight_error_response_unreadable_body_does_not_raise(mocker
     log.error.assert_not_called()
 
 
-def test_redact_body_masks_password_variable():
-    body = json.dumps({"query": "q", "variables": {"username": "u", "password": "hunter2"}}).encode()
-    redacted = _redact_body(body)
-    assert "hunter2" not in redacted
-    assert json.loads(redacted)["variables"] == {"username": "u", "password": "***redacted***"}
-
-
-def test_redact_body_leaves_other_bodies_untouched():
-    assert _redact_body(b'{"query": "q", "variables": {"limit": 1}}') == '{"query": "q", "variables": {"limit": 1}}'
-    assert _redact_body(b"not json") == "not json"
-
-
 @pytest.mark.asyncio
 async def test_refused_login_is_logged_without_the_password(mocker, integration):
     # A 429 on getToken is logged in full (status, headers, body) so it can be
@@ -1527,6 +1514,62 @@ async def test_process_attachments_403_error(mocker, integration):
 
     mock_read_img.assert_called_once_with("https://example.com/image.png")
     mock_log_action_activity.assert_called_once()
+
+@pytest.mark.asyncio
+async def test_process_attachments_gundi_upload_error_is_skipped(mocker, integration):
+    # gundi-client-v2 3.x raises GundiAPIError for a refused upload. The event
+    # is already in EarthRanger, so the attachment is skipped and logged rather
+    # than failing the run (which would leave the batch's dedupe state unsaved).
+    from gundi_client_v2.errors import GundiAPIError
+
+    transformed_data = [
+        {"event_details": {"image_url": "https://example.com/a.png"}},
+        {"event_details": {"image_url": "https://example.com/b.png"}},
+    ]
+    response = [{"object_id": "event1"}, {"object_id": "event2"}]
+    mocker.patch(
+        "httpx.AsyncClient.get",
+        return_value=mocker.AsyncMock(status_code=200, aread=mocker.AsyncMock(return_value=b"img")),
+    )
+    send = mocker.patch(
+        "app.actions.handlers.gundi_tools.send_event_attachments_to_gundi",
+        side_effect=[GundiAPIError(status_code=500, detail="boom"), None],
+    )
+    mock_log_action_activity = mocker.patch("app.actions.handlers.log_action_activity", return_value=None)
+
+    await process_attachments(transformed_data, response, integration)
+
+    assert send.call_count == 2
+    mock_log_action_activity.assert_called_once()
+    assert mock_log_action_activity.call_args.kwargs["data"]["server_response_body"] == "boom"
+
+
+@pytest.mark.asyncio
+async def test_process_attachments_upload_error_is_logged_masked(mocker, integration):
+    # The skipped exception never reaches the runner's own redaction, so a
+    # secret Gundi echoes back must be masked here, in the event and the log.
+    from gundi_client_v2.errors import GundiAPIError
+
+    transformed_data = [{"event_details": {"image_url": "https://example.com/a.png"}}]
+    response = [{"object_id": "event1"}]
+    mocker.patch(
+        "httpx.AsyncClient.get",
+        return_value=mocker.AsyncMock(status_code=200, aread=mocker.AsyncMock(return_value=b"img")),
+    )
+    mocker.patch(
+        "app.actions.handlers.gundi_tools.send_event_attachments_to_gundi",
+        side_effect=GundiAPIError(status_code=400, detail='{"api_key": "k-secret-1"}'),
+    )
+    mock_log_action_activity = mocker.patch("app.actions.handlers.log_action_activity", return_value=None)
+    log = mocker.patch("app.actions.handlers.logger")
+
+    await process_attachments(transformed_data, response, integration)
+
+    published = str(mock_log_action_activity.call_args)
+    assert "k-secret-1" not in published
+    assert "k-secret-1" not in str(log.mock_calls)
+    log.exception.assert_not_called()
+
 
 def test_transform_with_vessel_info():
     data = {

@@ -1,5 +1,7 @@
 import datetime
 import httpx
+from gundi_client_v2.errors import GundiAPIError
+from app.services.redaction import redact_body, redact_text
 import json
 import logging
 import stamina
@@ -15,7 +17,8 @@ from dateparser import parse as dp
 from gql.transport.exceptions import TransportQueryError
 
 from app.actions.core import action_title
-from app.actions.configurations import AuthenticateConfig, PullEventsConfig, ProcessEventsPerAOIConfig, ListAOIsQuery, ReferenceDataResponse, ReferenceOption
+from app.actions.configurations import AuthenticateConfig, PullEventsConfig, ProcessEventsPerAOIConfig, ListAOIsQuery
+from app.actions.core import ReferenceDataResponse, ReferenceOption
 from app.services.action_scheduler import trigger_action
 from app.services.activity_logger import activity_logger, log_action_activity
 from app.services.errors import classify_error, format_classified_error
@@ -752,24 +755,38 @@ async def process_attachments(transformed_data, response, integration):
                     attachments=[(filename, img)],
                     integration_id=integration.id
                 )
-        except httpx.HTTPStatusError as e:
-            if e.response.status_code == 403:
-                message = f"HTTP 403 Forbidden response while reading event attachment for event ID '{event_id['object_id']}'. Exception: {e}"
+        except (httpx.HTTPStatusError, GundiAPIError) as e:
+            # httpx.HTTPStatusError: Skylight's image server refused the
+            # download. GundiAPIError: Gundi refused the upload (gundi-client-v2
+            # 3.x wraps its 4xx/5xx this way instead of re-raising httpx's
+            # error). Either way the event is already in EarthRanger, so skip
+            # this attachment and keep going: failing the run here would leave
+            # the batch's dedupe state unsaved and duplicate its events.
+            # The error text and response body may echo a secret, and this
+            # path swallows the exception, so the runner's own redaction never
+            # sees it: masked here before the log and the activity event.
+            status_code = e.status_code if isinstance(e, GundiAPIError) else e.response.status_code
+            error_text = redact_text(f"{type(e).__name__}: {e}")
+            if status_code == 403:
+                message = f"HTTP 403 Forbidden response while reading event attachment for event ID '{event_id['object_id']}'. Exception: {error_text}"
             else:
-                message = f"Error while processing event attachment for event ID '{event_id['object_id']}'. Exception: {e}"
+                message = f"Error while processing event attachment for event ID '{event_id['object_id']}'. Exception: {error_text}"
 
             request = {
                 "event_id": event_id["object_id"],
                 "filename": filename,
                 "integration_id": integration.id
             }
-            logger.exception(message, extra={
+            # No traceback: it would repeat the unmasked exception text.
+            logger.error(message, extra={
                 "integration_id": str(integration.id),
                 "attention_needed": True
             })
             log_data = {"message": message, "request": request}
-            if server_response := getattr(e, "response", None):
-                log_data["server_response_body"] = server_response.text
+            if isinstance(e, GundiAPIError):
+                log_data["server_response_body"] = redact_body(e.detail)
+            elif server_response := getattr(e, "response", None):
+                log_data["server_response_body"] = redact_body(server_response.text)
             await log_action_activity(
                 integration_id=integration.id,
                 action_id="pull_events",
