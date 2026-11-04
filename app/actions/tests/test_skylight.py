@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import datetime
 import json
@@ -22,6 +23,9 @@ from app.actions.client import (
     _is_token_expired,
     _redact_headers,
     _log_skylight_error_response,
+    _redact_body,
+    build_auth_client,
+    get_authentication_token,
     PullEventsBadConfigException,
     _TOKEN_EXPIRY_SKEW_SECONDS,
     normalize_v2_event,
@@ -79,7 +83,7 @@ def skylight_client():
 
 @pytest.mark.asyncio
 async def test_execute_gql_query_success(mocker, gql_client, integration, auth):
-    gql_client.execute.return_value = {"data": "response"}
+    gql_client.execute_async = mocker.AsyncMock(return_value={"data": "response"})
     query = "query"
     params = {}
 
@@ -91,7 +95,7 @@ async def test_execute_gql_query_clears_token_on_unauthorized(mocker, gql_client
     # On UNAUTHORIZED: state is deleted once (so next run re-auths) and the
     # error is re-raised. No retry — the stale token is still in gql_client's
     # transport headers, so retrying with the same client would fail identically.
-    gql_client.execute = mocker.MagicMock(
+    gql_client.execute_async = mocker.AsyncMock(
         side_effect=TransportQueryError(
             "Error",
             errors=[{"extensions": {"message": "UNAUTHORIZED", "code": "UNAUTHORIZED"}}]
@@ -108,7 +112,7 @@ async def test_execute_gql_query_clears_token_on_unauthorized(mocker, gql_client
 
 @pytest.mark.asyncio
 async def test_execute_gql_query_clears_token_on_unauthenticated(mocker, gql_client, integration, auth, state_manager):
-    gql_client.execute = mocker.MagicMock(
+    gql_client.execute_async = mocker.AsyncMock(
         side_effect=TransportQueryError(
             "Error",
             errors=[{"extensions": {"code": "UNAUTHENTICATED"}}]
@@ -123,6 +127,41 @@ async def test_execute_gql_query_clears_token_on_unauthenticated(mocker, gql_cli
     assert state_manager.delete_state.call_count == 1
 
 
+def _client_with_token(authorization):
+    from app.actions.client import build_events_client, SkylightRequestHeader
+    return build_events_client({"url": "https://example.invalid/graphql"}, SkylightRequestHeader(Authorization=authorization))
+
+
+@pytest.mark.asyncio
+async def test_execute_gql_query_keeps_token_refreshed_by_another_run(mocker, integration, auth, state_manager):
+    # The failed request used an old token, but an overlapping run has already
+    # cached a fresh one: that fresh token must not be deleted.
+    gql_client = _client_with_token("Bearer old-token")
+    gql_client.execute_async = mocker.AsyncMock(
+        side_effect=TransportQueryError("Error", errors=[{"extensions": {"code": "UNAUTHENTICATED"}}])
+    )
+    state_manager.get_state.return_value = {"token_type": "Bearer", "access_token": "fresh-token"}
+    mocker.patch("app.actions.client.state_manager", state_manager)
+
+    with pytest.raises(TransportQueryError):
+        await execute_gql_query(gql_client, "query", {}, integration, auth)
+    state_manager.delete_state.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_execute_gql_query_clears_the_token_that_failed(mocker, integration, auth, state_manager):
+    gql_client = _client_with_token("Bearer old-token")
+    gql_client.execute_async = mocker.AsyncMock(
+        side_effect=TransportQueryError("Error", errors=[{"extensions": {"code": "UNAUTHORIZED"}}])
+    )
+    state_manager.get_state.return_value = {"token_type": "Bearer", "access_token": "old-token"}
+    mocker.patch("app.actions.client.state_manager", state_manager)
+
+    with pytest.raises(TransportQueryError):
+        await execute_gql_query(gql_client, "query", {}, integration, auth)
+    state_manager.delete_state.assert_called_once()
+
+
 @pytest.mark.asyncio
 async def test_execute_gql_query_does_not_retry_if_not_unauthorized_code(
         mocker,
@@ -131,7 +170,7 @@ async def test_execute_gql_query_does_not_retry_if_not_unauthorized_code(
         auth,
         state_manager
 ):
-    gql_client.execute = mocker.MagicMock(
+    gql_client.execute_async = mocker.AsyncMock(
         side_effect=TransportQueryError(
             "Error",
             errors=[{"extensions": {"message": "Error", "code": "Error"}}]
@@ -278,6 +317,29 @@ async def test_get_skylight_events_logs_and_skips_server_error(mocker, integrati
         "failed for AOI" in str(call) and call.kwargs.get("extra", {}).get("attention_needed")
         for call in log.error.call_args_list
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("timeout_error", [TimeoutError, asyncio.TimeoutError])
+async def test_get_skylight_events_keeps_prefix_on_timeout(
+        mocker, integration, auth, patch_skylight_clients, timeout_error
+):
+    # gql's execute_timeout raises a timeout, not a TransportError: the AOI
+    # still stops at the failed page and keeps the pages collected before it.
+    # Both classes are covered because they are distinct on Python 3.10.
+    exec_mock = mocker.patch(
+        "app.actions.client.execute_gql_query",
+        side_effect=[
+            _page([{"event_id": "e1"}, {"event_id": "e2"}], total=4, page_num=1),
+            timeout_error(),
+        ],
+    )
+    mocker.patch("app.actions.client.logger")
+
+    events, _ = await get_skylight_events(integration, _PullCfg(), auth)
+
+    assert exec_mock.call_count == 2
+    assert [e["event_id"] for e in events["aoi1"]] == ["e1", "e2"]
 
 
 @pytest.mark.asyncio
@@ -1032,6 +1094,7 @@ def _make_response(mocker, status_code):
         headers={"content-type": "application/json"},
         text="Internal Server Error",
         request=request,
+        aread=mocker.AsyncMock(),
     )
 
 
@@ -1045,13 +1108,14 @@ def test_redact_headers_is_case_insensitive():
     assert _redact_headers({"authorization": "Bearer x"})["authorization"] == "Bearer ***redacted***"
 
 
-def test_log_skylight_error_response_logs_full_detail_on_error(mocker):
+@pytest.mark.asyncio
+async def test_log_skylight_error_response_logs_full_detail_on_error(mocker):
     response = _make_response(mocker, 500)
     log = mocker.patch("app.actions.client.logger")
 
-    _log_skylight_error_response(response)
+    await _log_skylight_error_response(response)
 
-    response.read.assert_called_once()
+    response.aread.assert_awaited_once()
     log.error.assert_called_once()
     # The bearer token must be redacted, never logged in the clear.
     logged = str(log.error.call_args)
@@ -1059,14 +1123,61 @@ def test_log_skylight_error_response_logs_full_detail_on_error(mocker):
     assert "***redacted***" in logged
 
 
-def test_log_skylight_error_response_silent_on_success(mocker):
+@pytest.mark.asyncio
+async def test_log_skylight_error_response_silent_on_success(mocker):
     response = _make_response(mocker, 200)
     log = mocker.patch("app.actions.client.logger")
 
-    _log_skylight_error_response(response)
+    await _log_skylight_error_response(response)
 
     log.error.assert_not_called()
-    response.read.assert_not_called()
+    response.aread.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_log_skylight_error_response_unreadable_body_does_not_raise(mocker):
+    # The hook must never replace the Skylight error with its own read failure.
+    response = _make_response(mocker, 429)
+    response.aread = mocker.AsyncMock(side_effect=httpx.ReadError("connection reset"))
+    log = mocker.patch("app.actions.client.logger")
+
+    await _log_skylight_error_response(response)
+
+    log.warning.assert_called_once()
+    log.error.assert_not_called()
+
+
+def test_redact_body_masks_password_variable():
+    body = json.dumps({"query": "q", "variables": {"username": "u", "password": "hunter2"}}).encode()
+    redacted = _redact_body(body)
+    assert "hunter2" not in redacted
+    assert json.loads(redacted)["variables"] == {"username": "u", "password": "***redacted***"}
+
+
+def test_redact_body_leaves_other_bodies_untouched():
+    assert _redact_body(b'{"query": "q", "variables": {"limit": 1}}') == '{"query": "q", "variables": {"limit": 1}}'
+    assert _redact_body(b"not json") == "not json"
+
+
+@pytest.mark.asyncio
+async def test_refused_login_is_logged_without_the_password(mocker, integration):
+    # A 429 on getToken is logged in full (status, headers, body) so it can be
+    # shared with Skylight, but the password never reaches the log.
+    def too_many(request):
+        return httpx.Response(429, headers={"retry-after": "60"}, text="Too Many Requests")
+
+    client = build_auth_client({"url": "https://example.invalid/graphql", "transport": httpx.MockTransport(too_many)})
+    auth = mocker.MagicMock(username="someone@example.com")
+    auth.password.get_secret_value.return_value = "SuperSecret123"
+    log = mocker.patch("app.actions.client.logger")
+
+    with pytest.raises(TransportServerError):
+        await get_authentication_token(integration, auth, client)
+
+    log.error.assert_called_once()
+    logged = str(log.error.call_args)
+    assert "429" in logged and "Too Many Requests" in logged and "retry-after" in logged
+    assert "SuperSecret123" not in logged
 
 
 # --- _is_token_expired ---
@@ -1134,6 +1245,47 @@ async def test_build_request_header_refreshes_expired_token(mocker, integration,
     get_auth.assert_called_once()
     state_manager.set_state.assert_called_once()
     assert "Bearer" in header.Authorization
+
+
+@pytest.mark.asyncio
+async def test_build_request_header_refreshes_once_for_overlapping_runs(
+        mocker, integration, auth, gql_client, state_manager
+):
+    # Two overlapping runs with no cached token: the second waits for the
+    # first refresh and reuses its token instead of calling getToken again.
+    import weakref
+    mocker.patch("app.actions.client._token_locks", weakref.WeakValueDictionary())
+    stored = {}
+
+    async def get_state(*args):
+        return stored.get("token")
+
+    async def set_state(integration_id, action_id, value, source_id):
+        stored["token"] = value
+
+    state_manager.get_state.side_effect = get_state
+    state_manager.set_state.side_effect = set_state
+    mocker.patch("app.actions.client.state_manager", state_manager)
+
+    from app.actions.client import SkylightGetTokenResponse
+
+    async def slow_login(*args):
+        await asyncio.sleep(0.01)
+        return SkylightGetTokenResponse(
+            access_token=_make_jwt(int(time.time()) + 3600),
+            expires_in=3600,
+            token_type="Bearer",
+        )
+
+    get_auth = mocker.patch("app.actions.client.get_authentication_token", side_effect=slow_login)
+
+    first, second = await asyncio.gather(
+        build_request_header(integration, auth, gql_client),
+        build_request_header(integration, auth, gql_client),
+    )
+
+    assert get_auth.await_count == 1
+    assert first.Authorization == second.Authorization
 
 
 @pytest.mark.asyncio

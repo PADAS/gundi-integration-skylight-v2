@@ -362,7 +362,7 @@ async def action_auth(integration, action_config: AuthenticateConfig):
             url=client.DEFAULT_SKYLIGHT_API_URL,
             verify=True,
         )
-        gql_client = client.build_graphql_client(default_transport_dict)
+        gql_client = client.build_auth_client(default_transport_dict)
         token = await client.get_authentication_token(integration, action_config, gql_client)
         if not token:
             logger.error(f"Auth unsuccessful for integration '{integration.id}'.")
