@@ -1,5 +1,6 @@
 import datetime
 import httpx
+from gundi_client_v2.errors import GundiAPIError
 import json
 import logging
 import stamina
@@ -753,8 +754,15 @@ async def process_attachments(transformed_data, response, integration):
                     attachments=[(filename, img)],
                     integration_id=integration.id
                 )
-        except httpx.HTTPStatusError as e:
-            if e.response.status_code == 403:
+        except (httpx.HTTPStatusError, GundiAPIError) as e:
+            # httpx.HTTPStatusError: Skylight's image server refused the
+            # download. GundiAPIError: Gundi refused the upload (gundi-client-v2
+            # 3.x wraps its 4xx/5xx this way instead of re-raising httpx's
+            # error). Either way the event is already in EarthRanger, so skip
+            # this attachment and keep going: failing the run here would leave
+            # the batch's dedupe state unsaved and duplicate its events.
+            status_code = e.status_code if isinstance(e, GundiAPIError) else e.response.status_code
+            if status_code == 403:
                 message = f"HTTP 403 Forbidden response while reading event attachment for event ID '{event_id['object_id']}'. Exception: {e}"
             else:
                 message = f"Error while processing event attachment for event ID '{event_id['object_id']}'. Exception: {e}"
@@ -769,7 +777,9 @@ async def process_attachments(transformed_data, response, integration):
                 "attention_needed": True
             })
             log_data = {"message": message, "request": request}
-            if server_response := getattr(e, "response", None):
+            if isinstance(e, GundiAPIError):
+                log_data["server_response_body"] = e.detail
+            elif server_response := getattr(e, "response", None):
                 log_data["server_response_body"] = server_response.text
             await log_action_activity(
                 integration_id=integration.id,
