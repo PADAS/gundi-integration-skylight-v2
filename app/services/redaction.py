@@ -409,7 +409,9 @@ def _redact_query_value(key: str, value: str, depth: int) -> str:
 # greedy), and retrying from every position of a long run with no "=" (a JWT,
 # a hex blob) took quadratic time inside the async error handling.
 _URL_OR_PAIR = re.compile(
-    r"""(?P<quote>['"])?(?P<url>https?://[^\s<>"]+)"""
+    # A scheme-relative URL (//user:pw@host/) counts too, when the "//" does
+    # not continue a word, a scheme or a path.
+    r"""(?P<quote>['"])?(?P<url>https?://[^\s<>"]+|(?<![\w:/])//[^\s<>"/][^\s<>"]*)"""
     r"""|(?<![A-Za-z0-9_.\-\[\]%])(?P<key>[A-Za-z0-9_.\-\[\]%]+)=(?P<value>(?:"[^"]*"|'[^']*'|[^\s])+)"""
 )
 
@@ -428,29 +430,91 @@ def redact_text(text: Optional[str]) -> str:
     """
     if not text:
         return text or ""
-    return _KEY_COLON_VALUE.sub(_mask_key_colon_value, _redact_text(text, depth=0))
+    return _redact_colon_pairs(_redact_text(text, depth=0))
 
 
 # A secret written as a JSON or Python dict entry ({"access_token": "t"},
-# {'password': 'p'}) or as "token: t" in prose: a key, quoted or bare, then a
-# colon and a value (quoted with escapes, or a bare run up to a separator).
-_KEY_COLON_VALUE = re.compile(
-    # A key starts only where a run of key characters starts, as in
-    # _URL_OR_PAIR: retrying inside a long run (a JWT) would be quadratic.
-    r"""(?<![A-Za-z0-9_.\-])(?P<quote>["']?)(?P<key>[A-Za-z0-9_.\-]+)(?P=quote)(?P<sep>\s*:\s*)"""
-    r"""(?P<value>"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|[^\s,;:{}\[\]()"']+)"""
+# {'password': 'p'}, a JSON-escaped {"pass\u0077ord": "p"}) or as
+# "token: t" / "Authorization: Bearer t" in prose: a key, quoted or bare,
+# then a colon. A key starts only where a run of key characters starts, as
+# in _URL_OR_PAIR: retrying inside a long run (a JWT) would be quadratic.
+_KEY_COLON = re.compile(
+    r"""(?<![A-Za-z0-9_.\-%\\])(?P<quote>["']?)"""
+    r"""(?P<key>(?:[A-Za-z0-9_.\-%]|\\u[0-9a-fA-F]{4})+)(?P=quote)(?P<sep>\s*:\s*)"""
 )
+# A bare value runs to the end of the line or the next separator, spaces
+# included, so "Bearer abc123" is masked whole. Over-masking the rest of a
+# clause is the safe side.
+_BARE_VALUE_END = re.compile(r"""[\r\n,;{}\[\]()"']""")
+# How far a nested value ({...} or [...]) is followed looking for its end.
+# Past that, or with no end, the rest of the text is masked.
+_MAX_CONTAINER_CHARS = 100_000
 
 
-def _mask_key_colon_value(match) -> str:
-    if not _is_sensitive_key(match.group("key")):
-        return match.group(0)
-    value = match.group("value")
-    value_quote = value[0] if value[:1] in ("'", '"') else ""
-    return (
-        f"{match.group('quote')}{match.group('key')}{match.group('quote')}"
-        f"{match.group('sep')}{value_quote}{REDACTED}{value_quote}"
-    )
+def _decoded_key(key: str) -> str:
+    return unquote(_JSON_UNICODE_ESCAPE.sub(lambda m: chr(int(m.group(1), 16)), key))
+
+
+def _quoted_end(text: str, start: int) -> int:
+    """Index just past the quoted string opening at ``start`` (escapes
+    honoured), or len(text) when it never closes."""
+    quote, i = text[start], start + 1
+    while i < len(text):
+        if text[i] == "\\":
+            i += 2
+            continue
+        if text[i] == quote:
+            return i + 1
+        i += 1
+    return len(text)
+
+
+def _container_end(text: str, start: int) -> int:
+    """Index just past the {...} or [...] opening at ``start``, skipping
+    brackets inside quoted strings; len(text) when it does not close within
+    _MAX_CONTAINER_CHARS."""
+    depth, i, limit = 0, start, min(len(text), start + _MAX_CONTAINER_CHARS)
+    while i < limit:
+        ch = text[i]
+        if ch in "\"'":
+            i = _quoted_end(text, i)
+            continue
+        if ch in "{[":
+            depth += 1
+        elif ch in "}]":
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        i += 1
+    return len(text)
+
+
+def _redact_colon_pairs(text: str) -> str:
+    out, pos = [], 0
+    for match in _KEY_COLON.finditer(text):
+        value_start = match.end()
+        if match.start() < pos or value_start >= len(text):
+            continue  # inside a value already masked, or nothing after the colon
+        if not _is_sensitive_key(_decoded_key(match.group("key"))):
+            continue
+        first = text[value_start]
+        if first in "\"'":
+            value_end = _quoted_end(text, value_start)
+            masked = f"{first}{REDACTED}{first}"
+        elif first in "{[":
+            value_end = _container_end(text, value_start)
+            masked = REDACTED
+        else:
+            end = _BARE_VALUE_END.search(text, value_start)
+            value_end = end.start() if end else len(text)
+            masked = REDACTED
+            if not text[value_start:value_end].strip():
+                continue
+        out.append(text[pos:value_start])
+        out.append(masked)
+        pos = value_end
+    out.append(text[pos:])
+    return "".join(out)
 
 
 # How deep an innocent value is rescanned ("x=y=z=..."): past this the value

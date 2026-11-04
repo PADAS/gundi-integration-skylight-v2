@@ -707,3 +707,23 @@ def test_redact_text_colon_scan_stays_linear_on_long_runs():
 def test_redact_body_masks_a_body_too_deep_to_walk(body):
     # Must not raise inside error handling: the original failure would be lost.
     assert redact_body(body) == REDACTED
+
+
+@pytest.mark.parametrize("text, secret", [
+    ("Failed URL '//user:pw-123@host/path'", "pw-123"),
+    ('GundiAPIError: {"pass\\u0077ord": "abc123"}', "abc123"),
+    ('{"credentials": {"access": "abc123"}, "ok": 1}', "abc123"),
+    ("Authorization: Bearer abc123\nnext line", "abc123"),
+    ('{"token": [1, "a]", {"b": "deep-1"}], "z": 3}', "deep-1"),
+])
+def test_redact_text_masks_scheme_relative_urls_escaped_keys_and_whole_values(text, secret):
+    assert secret not in redact_text(text)
+
+
+def test_redact_text_keeps_text_after_a_masked_nested_value():
+    assert redact_text('{"credentials": {"access": "x"}, "ok": 1}') == '{"credentials": **********, "ok": 1}'
+
+
+def test_redact_text_leaves_double_slashes_inside_paths_alone():
+    text = "see https://a.b/c//d and x//y"
+    assert redact_text(text) == text

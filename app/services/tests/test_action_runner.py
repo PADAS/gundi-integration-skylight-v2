@@ -2825,3 +2825,34 @@ async def test_handler_failure_redacts_the_request_and_response_it_attaches(
     assert events[0].payload.request_data == details["request_data"]
     assert events[0].payload.request_url == details["request_url"]
     assert events[0].payload.server_response_body == details["server_response_body"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("detail, secret", [
+    ('{"pass\\u0077ord": "abc123"}', "abc123"),
+    ('{"credentials": {"access": "nested-456"}}', "nested-456"),
+])
+async def test_execute_action_masks_secrets_in_a_gundi_error_text(
+        mocker, mock_gundi_client_v2, integration_v2, mock_config_manager,
+        mock_publish_event, mock_action_handlers, detail, secret,
+):
+    # A GundiAPIError's text quotes the response body. The structured
+    # server_response_body is masked by redact_body; the error text and
+    # traceback must not leak the same secret through redact_text.
+    from gundi_client_v2.errors import GundiAPIError
+
+    mock_handler, _, _ = mock_action_handlers["pull_observations"]
+    mock_handler.side_effect = GundiAPIError(status_code=400, detail=detail)
+    mocker.patch("app.services.action_runner.action_handlers", mock_action_handlers)
+    mocker.patch("app.services.action_runner._portal", mock_gundi_client_v2)
+    mocker.patch("app.services.action_runner.config_manager", mock_config_manager)
+    mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
+    mocker.patch("app.services.action_runner.publish_event", mock_publish_event)
+
+    response = await execute_action(
+        integration_id=str(integration_v2.id),
+        action_id="pull_observations",
+    )
+
+    assert secret not in response.body.decode()
+    assert secret not in str(mock_publish_event.call_args_list)
