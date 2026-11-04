@@ -349,10 +349,20 @@ def redact_url(url: str) -> str:
 def _redact_query(query: str) -> str:
     """``query`` with secret-looking parameters masked, by the decoded
     parameter name (``api%5Fkey`` is ``api_key``), and re-encoded; returned
-    as given when nothing in it is secret."""
+    as given when nothing in it is secret. An innocent parameter whose value
+    is itself a URL (``?next=https://user:pw@host/``, encoded or not) has
+    that URL redacted too, userinfo and query alike."""
     pairs = parse_qsl(query, keep_blank_values=True)
-    redacted = [(key, REDACTED if _is_sensitive_key(key) and value else value) for key, value in pairs]
+    redacted = [(key, _redact_query_value(key, value)) for key, value in pairs]
     return query if redacted == pairs else urlencode(redacted, safe="*")
+
+
+def _redact_query_value(key: str, value: str) -> str:
+    if not value:
+        return value
+    if _is_sensitive_key(key):
+        return REDACTED
+    return redact_url(value) if "://" in value else value
 
 
 # Free text is scanned for two shapes, in one pass so that a pair inside a

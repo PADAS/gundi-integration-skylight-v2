@@ -549,6 +549,27 @@ def test_redact_text_masks_the_userinfo_of_a_url_quoted_in_free_text():
     )
 
 
+def test_redact_url_masks_a_url_nested_in_an_innocent_query_value():
+    # parse_qsl decodes the value first, so the encoded form is caught too.
+    for url in (
+        "https://host/cb?next=https://u:pw@x.test/&page=2",
+        "https://host/cb?next=https%3A%2F%2Fu%3Apw%40x.test%2F&page=2",
+    ):
+        redacted = redact_url(url)
+        assert "pw" not in redacted
+        assert "page=2" in redacted
+    assert "t123" not in redact_url("https://host/cb?next=https%3A%2F%2Fx.test%2F%3Ftoken%3Dt123")
+    # A nested URL with nothing secret in it is left exactly as given.
+    plain = "https://host/cb?next=https%3A%2F%2Fx.test%2Fhome"
+    assert redact_url(plain) == plain
+
+
+def test_redact_text_masks_the_userinfo_of_a_url_nested_in_a_query_value():
+    text = "Client error for url 'https://host/cb?next=https://u:pw@x.test/'"
+
+    assert "u:pw" not in redact_text(text)
+
+
 def test_redact_url_masks_a_url_it_cannot_parse_instead_of_raising():
     # An unbalanced bracket is rejected by urlsplit on every supported
     # Python. A balanced one around a non-address host ("[broken]") is
