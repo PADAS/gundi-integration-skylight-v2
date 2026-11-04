@@ -3,6 +3,7 @@ import base64
 import json
 import logging
 import re
+import weakref
 import pydantic
 
 import app.settings.integration as settings
@@ -511,8 +512,10 @@ def _is_token_expired(access_token: str) -> bool:
 
 
 # One lock per (integration, username), so overlapping runs on this instance
-# wait for a single token refresh instead of each calling getToken.
-_token_locks: dict = {}
+# wait for a single token refresh instead of each calling getToken. Weak values:
+# a lock lives only while a run holds or waits on it, so one-off integration ids
+# (draft AOI lookups get a fresh id per run) don't pile up in memory.
+_token_locks: "weakref.WeakValueDictionary" = weakref.WeakValueDictionary()
 
 
 async def build_request_header(integration, auth, gql_client):
@@ -986,11 +989,12 @@ async def get_skylight_events(integration, config_data, auth):
 
                 try:
                     response = await execute_gql_query(gql_client, query, params, integration, auth)
-                except (TransportError, TimeoutError) as te:
+                except (TransportError, TimeoutError, asyncio.TimeoutError) as te:
                     # Catch the TransportError base so every Skylight transport
                     # failure is logged — query errors, 500s (TransportServerError),
-                    # protocol errors, etc. TimeoutError is gql's execute_timeout
-                    # cap on execute_async.
+                    # protocol errors, etc. The timeouts are gql's execute_timeout
+                    # cap on execute_async; on Python 3.10 (the deployed runtime)
+                    # the built-in and asyncio TimeoutError are distinct classes.
                     logger.error(
                         f'"searchEventsV2" page {page_num} failed for AOI "{aoi}": '
                         f'{type(te).__name__}: {te}. '

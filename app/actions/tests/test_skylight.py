@@ -285,14 +285,18 @@ async def test_get_skylight_events_logs_and_skips_server_error(mocker, integrati
 
 
 @pytest.mark.asyncio
-async def test_get_skylight_events_keeps_prefix_on_timeout(mocker, integration, auth, patch_skylight_clients):
-    # gql's execute_timeout raises TimeoutError, not a TransportError: the AOI
+@pytest.mark.parametrize("timeout_error", [TimeoutError, asyncio.TimeoutError])
+async def test_get_skylight_events_keeps_prefix_on_timeout(
+        mocker, integration, auth, patch_skylight_clients, timeout_error
+):
+    # gql's execute_timeout raises a timeout, not a TransportError: the AOI
     # still stops at the failed page and keeps the pages collected before it.
+    # Both classes are covered because they are distinct on Python 3.10.
     exec_mock = mocker.patch(
         "app.actions.client.execute_gql_query",
         side_effect=[
             _page([{"event_id": "e1"}, {"event_id": "e2"}], total=4, page_num=1),
-            TimeoutError(),
+            timeout_error(),
         ],
     )
     mocker.patch("app.actions.client.logger")
@@ -1214,7 +1218,8 @@ async def test_build_request_header_refreshes_once_for_overlapping_runs(
 ):
     # Two overlapping runs with no cached token: the second waits for the
     # first refresh and reuses its token instead of calling getToken again.
-    mocker.patch("app.actions.client._token_locks", {})
+    import weakref
+    mocker.patch("app.actions.client._token_locks", weakref.WeakValueDictionary())
     stored = {}
 
     async def get_state(*args):
