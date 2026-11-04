@@ -367,9 +367,18 @@ def _redact_query_value(key: str, value: str, depth: int) -> str:
         return value
     if _is_sensitive_key(key):
         return REDACTED
-    if "://" not in value:
+    if "://" in value or value.startswith("//"):
+        # A URL, absolute or scheme-relative ("//user:pw@host/").
+        return REDACTED if depth >= _RESCAN_DEPTH else _redact_url(value, depth + 1)
+    decoded = unquote(value)
+    if decoded == value:
         return value
-    return REDACTED if depth >= _RESCAN_DEPTH else _redact_url(value, depth + 1)
+    # Still percent-encoded after parse_qsl's own decoding (a URL encoded
+    # twice): look again at the decoded form, within the same depth budget.
+    if depth >= _RESCAN_DEPTH:
+        return REDACTED
+    redacted = _redact_query_value(key, decoded, depth + 1)
+    return value if redacted == decoded else redacted
 
 
 # Free text is scanned for two shapes, in one pass so that a pair inside a
