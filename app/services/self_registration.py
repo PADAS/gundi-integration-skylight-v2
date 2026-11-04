@@ -3,7 +3,6 @@ import datetime
 import logging
 
 import stamina
-import httpx
 
 from app.actions import (
     action_handlers,
@@ -17,15 +16,19 @@ from app.actions import (
 from app.settings import (
     INTEGRATION_TYPE_SLUG,
     INTEGRATION_TYPE_NAME,
+    INTEGRATION_TYPE_DESCRIPTION,
     INTEGRATION_SERVICE_URL,
 )
 from .core import ActionTypeEnum
 from app.webhooks.core import get_webhook_handler, GenericJsonTransformConfig
+from .retry_policies import is_transient_gundi_error
 
 logger = logging.getLogger(__name__)
 
 
-async def register_integration_in_gundi(gundi_client, type_slug=None, type_name=None, service_url=None, action_schedules=None):
+async def register_integration_in_gundi(
+    gundi_client, type_slug=None, type_name=None, service_url=None, action_schedules=None, type_description=None
+):
     # Prepare the integration name and value
     integration_type_slug = type_slug or INTEGRATION_TYPE_SLUG
     if not integration_type_slug:
@@ -38,7 +41,11 @@ async def register_integration_in_gundi(gundi_client, type_slug=None, type_name=
     data = {
         "name": integration_type_name,
         "value": integration_type_slug,
-        "description": f"Default type for integrations with {integration_type_name}",
+        "description": (
+            type_description
+            or INTEGRATION_TYPE_DESCRIPTION
+            or f"Default type for integrations with {integration_type_name}"
+        ),
     }
     if integration_service_url := service_url or INTEGRATION_SERVICE_URL:
         logger.info(
@@ -117,7 +124,7 @@ async def register_integration_in_gundi(gundi_client, type_slug=None, type_name=
     logger.info(f"Registering '{integration_type_slug}' with actions: '{actions}'")
     # Register the integration type and actions in Gundi
     async for attempt in stamina.retry_context(
-        on=httpx.HTTPError, wait_initial=datetime.timedelta(seconds=1), attempts=3
+        on=is_transient_gundi_error, wait_initial=datetime.timedelta(seconds=1), attempts=3
     ):
         with attempt:
             response = await gundi_client.register_integration_type(data)

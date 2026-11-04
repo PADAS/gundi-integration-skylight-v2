@@ -8,23 +8,34 @@ from typing import Optional
 
 import pydantic
 import stamina
-from gundi_client_v2 import GundiClient
 from gundi_core.schemas.v2 import Integration
 
-from app.actions import action_handlers, get_action_handler_by_data_type
+# app.settings before gundi_client_v2: both load a .env, and the first loader
+# wins per key (see app/settings/base.py).
 from app import settings
+from gundi_client_v2 import GundiClient
+from gundi_client_v2.errors import AuthenticationError, GundiAPIError
+
+from app.actions import action_handlers, get_action_handler_by_data_type
 from fastapi import status
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
 from gundi_core.events import IntegrationActionFailed, ActionExecutionFailed, LogLevel
 
-from app.actions.core import AuthActionConfiguration, PullActionConfiguration, ReferenceActionConfiguration
+from app.actions.core import (
+    AuthActionConfiguration, InternalActionConfiguration, PullActionConfiguration, ReferenceActionConfiguration,
+)
 from app.api_schemas import IntegrationState
 from .config_manager import IntegrationConfigurationManager
 from .state import IntegrationStateManager
 from .utils import find_config_for_action
 from .activity_logger import publish_event, log_action_activity, ephemeral_run
-from .errors import classify_error, format_classified_error, source_status_code, IntegrationError, IntegrationConfigurationError
+from .redaction import redact_body, redact_config_data, redact_text, redact_url
+from .retry_policies import is_retryable_failure
+from .errors import (
+    ActionTimeoutError, classify_error, format_classified_error, is_http_failure_status,
+    source_status_code, IntegrationError, IntegrationConfigurationError,
+)
 from .url_policy import validate_outbound_url
 from .gundi import EphemeralWriteBlocked
 
@@ -179,23 +190,29 @@ def _ephemeral_status_for(exc: Exception, fallback: int) -> int:
     Forward the source system's verdict so cdip's upstream_status matches it
     and the portal can tell bad credentials from a broken source. The status
     is read by errors.source_status_code, the same reader the classifier
-    uses, so the body text and the response status always agree; an
-    IntegrationAuthError with no explicit code is still a 401. Only 4xx/5xx
+    uses, so wherever a status is forwarded it is the one the text names; an
+    IntegrationAuthError with no explicit code is still a 401. A Gundi-side
+    failure is the one case where the two differ on purpose: see below. Only 4xx/5xx
     are forwarded: statuses below 400 are not failures the portal can
     classify (a redirect surfaced by raise_for_status with redirects off is
     the common one), and anything outside the HTTP range is a connector bug,
     not a status the runner should answer with. A connector's
     IntegrationConfigurationError is not a source verdict either: it is a
-    422, the request was understood but its content cannot be acted on.
-    Everything else keeps the caller's `fallback` (500 for a handler
-    exception, 504 for a timeout).
+    422, the request was understood but its content cannot be acted on. Nor
+    is a Gundi-side failure (the runner's own OAuth client rejected, a portal
+    outage): forwarded, a Gundi 401 would read in the portal as the provider
+    rejecting the draft's credentials, so it keeps the fallback and the body
+    names Gundi. Everything else keeps the caller's `fallback` (500 for a
+    handler exception, 504 for a timeout).
     """
+    if isinstance(exc, (GundiAPIError, AuthenticationError)):
+        return fallback
     source_status = source_status_code(exc)
     if source_status is None and isinstance(exc, IntegrationError) and exc.error_type == "auth":
         return status.HTTP_401_UNAUTHORIZED
     if isinstance(exc, IntegrationConfigurationError):
         return status.HTTP_422_UNPROCESSABLE_ENTITY
-    if source_status is not None and 400 <= source_status <= 599:
+    if source_status is not None and is_http_failure_status(source_status):
         return source_status
     return fallback
 
@@ -247,44 +264,76 @@ async def _handle_error(
         logger.error(f"Error in ephemeral action '{action_id}': {logged}\n{frames}".rstrip())
         return _request_error_response(action_id, safe_text, status_code)
 
-    log_message = f"Error in action '{action_id}' for integration '{integration_id}': {type(exc).__name__}: {exc}"
-    logger.exception(log_message)
+    # str(exc) and the traceback may quote the failed request's URL, query
+    # string included: httpx's raise_for_status() message names it, and a
+    # chained cause repeats it. Masked like request_url below, before the
+    # text reaches the application log, the event or the response.
+    error_text = redact_text(f"{type(exc).__name__}: {exc}")
+    error_traceback = redact_text(traceback.format_exc())
+    log_message = f"Error in action '{action_id}' for integration '{integration_id}': {error_text}"
+    logger.error(f"{log_message}\n{error_traceback}")
 
     # Classified errors (auth, connectivity, rate limit, bad response) get
     # short human-first text — the portal prepends "Error running action
     # '<id>': " and truncates, so the useful part must come first. Anything
     # unclassified keeps the verbose format. Full details always remain in
     # error_traceback and the request/response fields below.
-    message = format_classified_error(classified) if classified else log_message
+    message = redact_text(format_classified_error(classified)) if classified else log_message
 
     error_details = {
         "integration_id": integration_id,
         "action_id": action_id,
-        "config_data": config_data or {},
+        # The saved configurations (auth row included) or the action's own
+        # config, as the portal stores them: raw dicts, secrets in clear.
+        # Masked here, the one place both the published event and the JSON
+        # response are built from.
+        "config_data": redact_config_data(
+            config_data, action_id=action_id,
+            config_models={aid: model for aid, (_, model, _) in action_handlers.items()},
+        ),
         "error": message,
         # Machine-readable category. Only reaches the JSON response below;
         # ActionExecutionFailed is a gundi-core model that drops unknown fields.
         "error_type": classified.error_type if classified else None,
-        "error_traceback": traceback.format_exc()
+        # Whether redelivering the triggering message could help (main.execute
+        # reads it). From the exception itself, so it holds on the paths above
+        # that leave error_type unset on purpose.
+        "retryable": is_retryable_failure(exc),
+        "error_traceback": error_traceback,
     }
 
     # Extract additional request/response details if available.
     # httpx exceptions expose .request as a property that raises RuntimeError
     # when the error was constructed without one — treat that as "no request".
-    try:
-        request = getattr(exc, "request", None)
-    except RuntimeError:
-        request = None
+    def _request_of(e):
+        try:
+            return getattr(e, "request", None)
+        except RuntimeError:
+            return None
+
+    # gundi-client-v2 3.x wraps a non-2xx Gundi response as GundiAPIError,
+    # which carries neither, and chains httpx's error as the cause: read them
+    # from there. Only for that type: an AuthenticationError's cause is the
+    # token POST, whose body holds the client secret or password, and a
+    # connector's `raise IntegrationAuthError(...) from e` may chain a provider
+    # login; neither request may reach the activity log.
+    carrier = exc.__cause__ if isinstance(exc, GundiAPIError) else exc
+    request = _request_of(carrier)
+    response = getattr(carrier, "response", None)  # bool(response) on status errors returns False
+    # The request may be the connector's own login (a password-grant token
+    # POST carries the password in its body, a key may sit in the URL query)
+    # and the response may echo a token: masked by the same key rules as
+    # config_data above.
     if request is not None:
         error_details.update({
             "request_verb": str(request.method),
-            "request_url": str(request.url),
-            "request_data": str(getattr(request, "content", getattr(request, "body", None)) or "")
+            "request_url": redact_url(str(request.url)),
+            "request_data": redact_body(getattr(request, "content", getattr(request, "body", None)))
         })
-    if (response := getattr(exc, "response", None)) is not None:  # bool(response) on status errors returns False
+    if response is not None:
         error_details.update({
             "server_response_status": getattr(response, "status_code", None),
-            "server_response_body": str(getattr(response, "text", getattr(response, "content", None)) or "")
+            "server_response_body": redact_body(getattr(response, "text", getattr(response, "content", None)))
         })
 
     await publish_event(
@@ -362,6 +411,17 @@ async def _skip_invalid_config(integration_id, action_id, *, error):
                 f"(integration '{integration_id}'): {log_error}"
             )
     return {"skipped": True, "reason": "invalid_configuration"}
+
+
+async def _cancel_handler(handler_task: "asyncio.Task") -> None:
+    """Cancel a running handler and wait for it to finish unwinding, so its
+    finally blocks run before the runner reports or propagates anything (the
+    same guarantee asyncio.wait_for gave). Whatever the handler raises while
+    unwinding is the handler's business, not the runner's."""
+    handler_task.cancel()
+    # Collect the handler's exception, but let cancellation of this runner
+    # propagate. Catching CancelledError around a direct await confuses the two.
+    await asyncio.gather(handler_task, return_exceptions=True)
 
 
 async def execute_action(
@@ -511,16 +571,26 @@ async def _execute_action_impl(
     is_reference_action = isinstance(config_model, type) and issubclass(
         config_model, ReferenceActionConfiguration
     )
-    skip_missing_config = is_ephemeral or is_reference_action
+    # Internal actions (sub-actions another handler triggers, e.g. one per
+    # source in a fan-out) are never registered in Gundi, so the portal holds
+    # no row for them and everything they need arrives in config_overrides.
+    # Looking a row up anyway misses redis every time, and the reload that
+    # follows a miss writes absence sentinels only for the type's registered
+    # actions: a full portal fetch per triggered run.
+    is_internal_action = isinstance(config_model, type) and issubclass(
+        config_model, InternalActionConfiguration
+    )
+    skip_missing_config = is_ephemeral or is_reference_action or is_internal_action
 
     # Get the configuration needed to execute the action
     if is_ephemeral:
         action_config = find_config_for_action(integration.configurations, action_id)
-    elif is_reference_action:
-        # Stateless by contract, so there is no row to find. Looking one up
-        # anyway would miss redis every time, and get_action_configuration
-        # reloads the integration from the portal on a miss: a portal call on
-        # every dropdown open.
+    elif is_reference_action or is_internal_action:
+        # Neither has a row to find (reference actions are stateless by
+        # contract, internal ones unregistered). Looking one up anyway would
+        # miss redis every time, and get_action_configuration reloads the
+        # integration from the portal on a miss: a portal call on every
+        # dropdown open, or on every triggered sub-action.
         action_config = None
     else:
         action_config = await config_manager.get_action_configuration(integration_id, action_id)
@@ -591,6 +661,7 @@ async def _execute_action_impl(
             return None
         return {"configurations": [c.dict() for c in integration.configurations]}
 
+    deadline_expired = False
     try:  # Execute the action handler with a timeout
         start_time = time.monotonic()
         handler_kwargs = {
@@ -606,18 +677,25 @@ async def _execute_action_impl(
             handler_kwargs["metadata"] = metadata or {}
         elif metadata is not None:
             handler_kwargs["metadata"] = metadata
-        result = await asyncio.wait_for(
-            handler(**handler_kwargs),
-            timeout=settings.MAX_ACTION_EXECUTION_TIME
-        )
-    except asyncio.TimeoutError:
-        return await _handle_error(
-            asyncio.TimeoutError(f"Action '{action_id}' timed out"),
-            integration_id, action_id,
-            config_data=handler_error_config_data(),
-            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
-            classify_heuristics=True,
-        )
+        # Not asyncio.wait_for: it raises the same asyncio.TimeoutError for its
+        # own expired deadline and for one the handler raised (aiohttp's
+        # provider timeout), and the two must be reported differently. Waiting
+        # on the task tells them apart by whether the task finished.
+        handler_task = asyncio.ensure_future(handler(**handler_kwargs))
+        try:
+            done, _ = await asyncio.wait({handler_task}, timeout=settings.MAX_ACTION_EXECUTION_TIME)
+        except asyncio.CancelledError:
+            # Unlike wait_for, asyncio.wait leaves what it waits on running
+            # when the waiter is cancelled. The runner going away (request
+            # aborted, process shutting down) must take the handler with it,
+            # or it keeps publishing and writing state with no deadline.
+            await _cancel_handler(handler_task)
+            raise
+        if done:
+            result = handler_task.result()  # re-raises the handler's own exception unchanged
+        else:
+            deadline_expired = True
+            await _cancel_handler(handler_task)
     except Exception as e:
         # Saved-integration runs keep the historical 500; the ephemeral path
         # forwards the source system's verdict instead (_handle_error applies
@@ -626,6 +704,17 @@ async def _execute_action_impl(
             e, integration_id, action_id,
             config_data=handler_error_config_data(),
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            classify_heuristics=True,
+        )
+    if deadline_expired:
+        # The runner's own cap, not the provider failing to answer: an
+        # asyncio.TimeoutError here would classify as connectivity and send
+        # the operator to check the provider.
+        return await _handle_error(
+            ActionTimeoutError(f"exceeded the {settings.MAX_ACTION_EXECUTION_TIME} s execution limit"),
+            integration_id, action_id,
+            config_data=handler_error_config_data(),
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
             classify_heuristics=True,
         )
 

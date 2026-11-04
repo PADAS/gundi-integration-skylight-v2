@@ -3,8 +3,10 @@ import asyncio
 import aiohttp
 import httpx
 import pytest
+from gundi_client_v2.errors import AuthenticationError, GundiAPIError
 
 from app.services.errors import (
+    ActionTimeoutError,
     IntegrationError,
     IntegrationAuthError,
     IntegrationConnectionError,
@@ -14,7 +16,10 @@ from app.services.errors import (
     classify_error,
     format_classified_error,
     format_error_message,
+    is_http_failure_status,
     source_status_code,
+    GUNDI_API_ERROR_TITLE,
+    GUNDI_AUTH_ERROR_TITLE,
 )
 
 
@@ -69,6 +74,12 @@ def _http_status_error(status_code: int) -> httpx.HTTPStatusError:
     request = httpx.Request("GET", "https://api.example.com/data")
     response = httpx.Response(status_code, request=request)
     return httpx.HTTPStatusError(f"HTTP {status_code}", request=request, response=response)
+
+
+def _raised_from(exc: Exception, cause: Exception) -> Exception:
+    """`exc` as `raise exc from cause` leaves it."""
+    exc.__cause__ = cause
+    return exc
 
 
 def test_classify_explicit_integration_error_wins_over_heuristics():
@@ -197,11 +208,63 @@ def test_classify_builtin_timeout_as_connectivity():
         (_http_status_error(404), 404),
         (IntegrationAuthError("nope", status_code=401), 401),
         (IntegrationAuthError("nope"), None),
+        # gundi-client-v2 3.x wraps the Gundi API's non-2xx (no .response on it)
+        (GundiAPIError(status_code=429, detail="slow down"), 429),
+        (AuthenticationError("invalid_client", status_code=401, error="invalid_client"), 401),
+        (AuthenticationError("keycloak unreachable", transport=True), None),
         (ValueError("no response here"), None),
+        # The reader never walks the cause: the error's own status is the
+        # one the text names and the ephemeral path forwards. The retry
+        # policy walks the chain itself (test_pubsub_delivery).
+        (_raised_from(IntegrationBadResponseError("gone"), _http_status_error(404)), None),
+        (_raised_from(IntegrationBadResponseError("own", status_code=503), _http_status_error(404)), 503),
     ],
 )
 def test_source_status_code_reads_every_carrier(exc, expected):
     assert source_status_code(exc) == expected
+
+
+def test_an_auth_error_raised_from_a_400_is_still_forwarded_as_401():
+    # The connector's verdict is "credentials rejected", which the portal
+    # keys on as 401/403; the OAuth endpoint's 400 invalid_grant underneath
+    # is evidence, not the verdict.
+    from app.services.action_runner import _ephemeral_status_for
+
+    exc = _raised_from(IntegrationAuthError("rejected"), _http_status_error(400))
+
+    assert _ephemeral_status_for(exc, 500) == 401
+    assert format_error_message(exc) == f"{IntegrationAuthError.default_title} — rejected"
+
+
+@pytest.mark.parametrize(
+    "status_code,expected",
+    [(400, True), (404, True), (500, True), (599, True), (200, False), (302, False), (399, False), (600, False), (0, False)],
+)
+def test_is_http_failure_status(status_code, expected):
+    assert is_http_failure_status(status_code) is expected
+
+
+@pytest.mark.parametrize(
+    "exc,expected_title",
+    [
+        (GundiAPIError(status_code=401, detail="bad api key"), GUNDI_API_ERROR_TITLE),
+        (GundiAPIError(status_code=429), GUNDI_API_ERROR_TITLE),
+        (GundiAPIError(status_code=503), GUNDI_API_ERROR_TITLE),
+        (AuthenticationError("Token request failed: HTTP 401", status_code=401, error="invalid_client"), GUNDI_AUTH_ERROR_TITLE),
+        (AuthenticationError("keycloak unreachable", transport=True), GUNDI_AUTH_ERROR_TITLE),
+    ],
+)
+def test_classify_error_reports_gundi_client_failures_as_gundi_side(exc, expected_title):
+    """A 401 from Gundi or its identity provider is the runner's OAuth
+    configuration, not the provider's credentials: never the provider's
+    "Authentication failed" title, but the status is still carried so the
+    ephemeral path can forward it."""
+    classified = classify_error(exc)
+    assert classified is not None
+    assert classified.error_type == "gundi"
+    assert classified.title == expected_title
+    assert classified.status_code == exc.status_code
+    assert "provider" not in format_classified_error(classified).lower()
 
 
 @pytest.mark.parametrize("junk", ["401", True, 4.01, None])
@@ -238,3 +301,25 @@ def test_classify_error_reads_aiohttp_response_status(status, expected_type):
     assert classified is not None
     assert classified.error_type == expected_type
     assert classified.status_code == status
+
+
+def test_action_timeout_is_classified_as_a_runner_timeout_not_a_provider_failure():
+    # Two connectors' activity logs filled with "Could not reach the provider —
+    # Action 'x' timed out" when the runner's own MAX_ACTION_EXECUTION_TIME cap
+    # fired, sending operators to check the provider. The cap is the runner's
+    # verdict, so it gets its own category and a title that says so.
+    classified = classify_error(ActionTimeoutError("exceeded the 540 s execution limit"))
+
+    assert classified.error_type == "timeout"
+    assert classified.title == "Action timed out"
+    assert classified.status_code is None
+    assert format_error_message(ActionTimeoutError("exceeded the 540 s execution limit")) == (
+        "Action timed out — exceeded the 540 s execution limit"
+    )
+
+
+def test_action_timeout_is_not_an_integration_error():
+    # It must not inherit the "third-party failure" contract: connectors never
+    # raise it, and the ephemeral path's redaction rules key off IntegrationError.
+    assert not issubclass(ActionTimeoutError, IntegrationError)
+    assert not isinstance(ActionTimeoutError(""), asyncio.TimeoutError)
