@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import json
 import logging
@@ -18,7 +19,7 @@ from enum import Enum
 from gql import Client as GQLClient, gql
 from gql.transport.exceptions import TransportError, TransportQueryError
 from gundi_core.schemas.v2 import LogLevel
-from gql.transport.httpx import HTTPXAsyncTransport, HTTPXTransport
+from gql.transport.httpx import HTTPXAsyncTransport
 
 from app.services.activity_logger import log_action_activity
 from app.services.errors import ConfigurationNotFound
@@ -416,18 +417,38 @@ def _redact_headers(headers):
     return redacted
 
 
-def _log_skylight_error_response(response):
+def _redact_body(content: bytes) -> str:
+    """Decode a GraphQL request body with any `password` variable masked, so
+    the getToken mutation can be logged without leaking the Skylight password."""
+    text = content.decode("utf-8", "replace")
+    try:
+        body = json.loads(text)
+    except ValueError:
+        return text
+    variables = body.get("variables") if isinstance(body, dict) else None
+    if isinstance(variables, dict) and "password" in variables:
+        body["variables"] = {**variables, "password": "***redacted***"}
+        return json.dumps(body)
+    return text
+
+
+async def _log_skylight_error_response(response):
     """httpx response hook: whenever Skylight returns an error (4xx/5xx), log
     the full request and response (URL, headers, bodies) so the failure is
     fully diagnosable from the activity logs. Successful responses are not
     logged here, to avoid noise and dumping large payloads.
 
-    Note: this is a synchronous hook for HTTPXTransport (sync). If the transport
-    is ever switched to HTTPXAsyncTransport, this must become async and use
-    `await response.aread()`."""
+    The transport is HTTPXAsyncTransport, so httpx awaits this hook and the
+    body has to be read with `aread()`."""
     if response.status_code < 400:
         return
-    response.read()
+    try:
+        await response.aread()
+    except Exception as e:
+        # Never let the diagnostic log replace the Skylight error itself:
+        # gql raises the 4xx/5xx once this hook returns.
+        logger.warning(f'Could not read the Skylight error response body: {type(e).__name__}: {e}')
+        return
     request = response.request
     logger.error(
         'Skylight returned an error response.\n'
@@ -436,7 +457,7 @@ def _log_skylight_error_response(response):
         request.method,
         request.url,
         _redact_headers(request.headers),
-        request.content.decode("utf-8", "replace"),
+        _redact_body(request.content),
         response.status_code,
         dict(response.headers),
         response.text,
@@ -445,7 +466,10 @@ def _log_skylight_error_response(response):
 
 
 def build_graphql_client(transport_dict):
-    transport = HTTPXTransport(**transport_dict)
+    # The async transport means a Skylight call never blocks the event loop,
+    # so other action runs on this instance keep going while Skylight answers.
+    # gql enforces execute_timeout on every execute_async call.
+    transport = HTTPXAsyncTransport(**transport_dict)
 
     # Create a GraphQL client using the defined transport
     gql_client = GQLClient(
@@ -456,14 +480,20 @@ def build_graphql_client(transport_dict):
     return gql_client
 
 
-def build_events_client(base_transport_dict, headers):
-    """Build the authenticated events GraphQL client, with the error-logging
-    hook attached so any Skylight 4xx/5xx is fully captured."""
+def build_auth_client(base_transport_dict):
+    """Build the GraphQL client for the getToken login call, with the
+    error-logging hook attached so a refused login (for example a 429) is
+    fully captured. The password in the request body is masked in that log."""
     return build_graphql_client({
         **base_transport_dict,
-        'headers': headers.dict(),
         'event_hooks': {"response": [_log_skylight_error_response]},
     })
+
+
+def build_events_client(base_transport_dict, headers):
+    """Build the authenticated events GraphQL client: the login client's
+    error logging plus the bearer token headers."""
+    return build_auth_client({**base_transport_dict, 'headers': headers.dict()})
 
 
 def _is_token_expired(access_token: str) -> bool:
@@ -480,7 +510,18 @@ def _is_token_expired(access_token: str) -> bool:
         return True
 
 
+# One lock per (integration, username), so overlapping runs on this instance
+# wait for a single token refresh instead of each calling getToken.
+_token_locks: dict = {}
+
+
 async def build_request_header(integration, auth, gql_client):
+    lock = _token_locks.setdefault((str(integration.id), auth.username), asyncio.Lock())
+    async with lock:
+        return await _build_request_header(integration, auth, gql_client)
+
+
+async def _build_request_header(integration, auth, gql_client):
     token_dict = await state_manager.get_state(str(integration.id), "pull_events", auth.username)
 
     if token_dict and not _is_token_expired(token_dict.get("access_token", "")):
@@ -520,7 +561,7 @@ async def get_authentication_token(integration, auth, gql_client):
             "username": auth.username,
             "password": auth.password.get_secret_value()
         }
-        response = gql_client.execute(query, variable_values=params)
+        response = await gql_client.execute_async(query, variable_values=params)
 
         token_response = response['getToken']
 
@@ -570,7 +611,7 @@ def _gql_error_code(te: TransportQueryError):
 
 async def execute_gql_query(gql_client, query, params, integration, auth):
     try:
-        return gql_client.execute(query, variable_values=params)
+        return await gql_client.execute_async(query, variable_values=params)
     except TransportQueryError as te:
         code = _gql_error_code(te)
         if code in _AUTH_ERROR_CODES:
@@ -594,7 +635,7 @@ async def get_skylight_events(integration, config_data, auth):
         url=DEFAULT_SKYLIGHT_API_URL,
         verify=True,
     )
-    auth_client = build_graphql_client(default_transport_dict)
+    auth_client = build_auth_client(default_transport_dict)
     headers = await build_request_header(integration, auth, auth_client)
     gql_client = build_events_client(default_transport_dict, headers)
 
@@ -945,10 +986,11 @@ async def get_skylight_events(integration, config_data, auth):
 
                 try:
                     response = await execute_gql_query(gql_client, query, params, integration, auth)
-                except TransportError as te:
+                except (TransportError, TimeoutError) as te:
                     # Catch the TransportError base so every Skylight transport
                     # failure is logged — query errors, 500s (TransportServerError),
-                    # protocol errors, etc.
+                    # protocol errors, etc. TimeoutError is gql's execute_timeout
+                    # cap on execute_async.
                     logger.error(
                         f'"searchEventsV2" page {page_num} failed for AOI "{aoi}": '
                         f'{type(te).__name__}: {te}. '
@@ -1190,7 +1232,7 @@ async def search_aois(integration, auth) -> list:
         url=DEFAULT_SKYLIGHT_API_URL,
         verify=True,
     )
-    auth_client = build_graphql_client(default_transport_dict)
+    auth_client = build_auth_client(default_transport_dict)
     headers = await build_request_header(integration, auth, auth_client)
     gql_client = build_events_client(default_transport_dict, headers)
 
