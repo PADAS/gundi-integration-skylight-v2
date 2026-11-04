@@ -518,10 +518,38 @@ def _is_token_expired(access_token: str) -> bool:
 _token_locks: "weakref.WeakValueDictionary" = weakref.WeakValueDictionary()
 
 
+def _token_lock(integration, auth) -> asyncio.Lock:
+    return _token_locks.setdefault((str(integration.id), auth.username), asyncio.Lock())
+
+
 async def build_request_header(integration, auth, gql_client):
-    lock = _token_locks.setdefault((str(integration.id), auth.username), asyncio.Lock())
-    async with lock:
+    async with _token_lock(integration, auth):
         return await _build_request_header(integration, auth, gql_client)
+
+
+def _client_authorization(gql_client) -> Optional[str]:
+    """The Authorization header a GraphQL client sends, or None if unknown."""
+    try:
+        value = gql_client.transport.kwargs.get("headers", {}).get("Authorization")
+    except AttributeError:
+        return None
+    return value if isinstance(value, str) else None
+
+
+async def invalidate_token(integration, auth, failed_authorization: Optional[str]):
+    """Clear the cached token so the next request logs in again, but only if
+    it is still the token that failed. An overlapping run may already have
+    refreshed it, and deleting that fresh token would force another getToken.
+    The check and the delete run under the refresh lock, so they cannot
+    interleave with a refresh. When the failed token is unknown, clear it."""
+    async with _token_lock(integration, auth):
+        if isinstance(failed_authorization, str):
+            cached = await state_manager.get_state(str(integration.id), "pull_events", auth.username) or {}
+            cached_authorization = "{} {}".format(cached.get("token_type"), cached.get("access_token"))
+            if cached_authorization != failed_authorization:
+                logger.info(f"Skylight token for '{auth.username}' was already refreshed; keeping it.")
+                return
+        await state_manager.delete_state(str(integration.id), "pull_events", auth.username)
 
 
 async def _build_request_header(integration, auth, gql_client):
@@ -624,7 +652,7 @@ async def execute_gql_query(gql_client, query, params, integration, auth):
             # identically. The proactive _is_token_expired check in
             # build_request_header prevents this path in the common case.
             logger.warning(f'Skylight query returned {code}, clearing token for next run.')
-            await state_manager.delete_state(str(integration.id), "pull_events", auth.username)
+            await invalidate_token(integration, auth, _client_authorization(gql_client))
         raise
 
 
@@ -1028,7 +1056,7 @@ async def get_skylight_events(integration, config_data, auth):
                         )
                         break
                     logger.info(f'"searchEventsV2" query returned None, retrying with a new token...')
-                    await state_manager.delete_state(str(integration.id), "pull_events", auth.username)
+                    await invalidate_token(integration, auth, headers.Authorization)
                     headers = await build_request_header(integration, auth, auth_client)
                     gql_client = build_events_client(default_transport_dict, headers)
                     none_retries += 1

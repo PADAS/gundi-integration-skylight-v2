@@ -127,6 +127,41 @@ async def test_execute_gql_query_clears_token_on_unauthenticated(mocker, gql_cli
     assert state_manager.delete_state.call_count == 1
 
 
+def _client_with_token(authorization):
+    from app.actions.client import build_events_client, SkylightRequestHeader
+    return build_events_client({"url": "https://example.invalid/graphql"}, SkylightRequestHeader(Authorization=authorization))
+
+
+@pytest.mark.asyncio
+async def test_execute_gql_query_keeps_token_refreshed_by_another_run(mocker, integration, auth, state_manager):
+    # The failed request used an old token, but an overlapping run has already
+    # cached a fresh one: that fresh token must not be deleted.
+    gql_client = _client_with_token("Bearer old-token")
+    gql_client.execute_async = mocker.AsyncMock(
+        side_effect=TransportQueryError("Error", errors=[{"extensions": {"code": "UNAUTHENTICATED"}}])
+    )
+    state_manager.get_state.return_value = {"token_type": "Bearer", "access_token": "fresh-token"}
+    mocker.patch("app.actions.client.state_manager", state_manager)
+
+    with pytest.raises(TransportQueryError):
+        await execute_gql_query(gql_client, "query", {}, integration, auth)
+    state_manager.delete_state.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_execute_gql_query_clears_the_token_that_failed(mocker, integration, auth, state_manager):
+    gql_client = _client_with_token("Bearer old-token")
+    gql_client.execute_async = mocker.AsyncMock(
+        side_effect=TransportQueryError("Error", errors=[{"extensions": {"code": "UNAUTHORIZED"}}])
+    )
+    state_manager.get_state.return_value = {"token_type": "Bearer", "access_token": "old-token"}
+    mocker.patch("app.actions.client.state_manager", state_manager)
+
+    with pytest.raises(TransportQueryError):
+        await execute_gql_query(gql_client, "query", {}, integration, auth)
+    state_manager.delete_state.assert_called_once()
+
+
 @pytest.mark.asyncio
 async def test_execute_gql_query_does_not_retry_if_not_unauthorized_code(
         mocker,
